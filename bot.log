@@ -1,0 +1,594 @@
+2025-11-04 23:28:16,244 - INFO - Start polling
+2025-11-04 23:28:16,299 - INFO - Run polling for bot @dwlttbot id=8423797514 - 'DownloadTikTok'
+2025-11-04 23:29:14,074 - INFO - Update id=356683820 is handled. Duration 223 ms by bot id=8423797514
+2025-11-04 23:29:43,480 - INFO - Update id=356683821 is handled. Duration 70 ms by bot id=8423797514
+2025-11-04 23:30:07,780 - INFO - Update id=356683822 is not handled. Duration 21567 ms by bot id=8423797514
+2025-11-04 23:30:07,781 - ERROR - Cause exception while process update id=356683822 by bot id=8423797514
+DownloadError: ERROR: [download] Got error: HTTPSConnectionPool(host='v19-webapp-prime.tiktok.com', port=443): Read timed out. (read timeout=20.0)
+Traceback (most recent call last):
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\dispatcher.py", line 309, in _process_update
+    response = await self.feed_update(bot, update, **kwargs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\dispatcher.py", line 158, in feed_update
+    response = await self.update.wrap_outer_middleware(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<7 lines>...
+    )
+    ^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\middlewares\error.py", line 25, in __call__
+    return await handler(event, data)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\middlewares\user_context.py", line 56, in __call__
+    return await handler(event, data)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\fsm\middleware.py", line 42, in __call__
+    return await handler(event, data)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\event\telegram.py", line 121, in trigger
+    return await wrapped_inner(event, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\event\handler.py", line 43, in call
+    return await wrapped()
+           ^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\dispatcher.py", line 276, in _listen_update
+    return await self.propagate_event(update_type=update_type, event=event, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\router.py", line 146, in propagate_event
+    return await observer.wrap_outer_middleware(_wrapped, event=event, data=kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\router.py", line 141, in _wrapped
+    return await self._propagate_event(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        observer=observer, update_type=update_type, event=telegram_event, **data
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\router.py", line 174, in _propagate_event
+    response = await router.propagate_event(update_type=update_type, event=event, **kwargs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\router.py", line 146, in propagate_event
+    return await observer.wrap_outer_middleware(_wrapped, event=event, data=kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\router.py", line 141, in _wrapped
+    return await self._propagate_event(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        observer=observer, update_type=update_type, event=telegram_event, **data
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\router.py", line 166, in _propagate_event
+    response = await observer.trigger(event, **kwargs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\event\telegram.py", line 121, in trigger
+    return await wrapped_inner(event, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\event\handler.py", line 43, in call
+    return await wrapped()
+           ^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\handlers\link.py", line 29, in handle_tiktok_link
+    ydl.download(['https://www.tiktok.com/@rikait5/video/7568339809077447948?is_from_webapp=1&sender_device=pc'])
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3611, in download
+    self.__download_wrapper(self.extract_info)(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        url, force_generic_extractor=self.params.get('force_generic_extractor', False))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3584, in wrapper
+    res = func(*args, **kwargs)
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1634, in extract_info
+    return self.__extract_info(url, self.get_info_extractor(key), download, extra_info, process)
+           ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1645, in wrapper
+    return func(self, *args, **kwargs)
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1801, in __extract_info
+    return self.process_ie_result(ie_result, download, extra_info)
+           ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1860, in process_ie_result
+    ie_result = self.process_video_result(ie_result, download=download)
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3038, in process_video_result
+    self.process_info(new_info)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 187, in wrapper
+    return func(self, *args, **kwargs)
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3485, in process_info
+    success, real_download = self.dl(temp_filename, info_dict)
+                             ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3227, in dl
+    return fd.download(name, new_info, subtitle)
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\downloader\common.py", line 479, in download
+    ret = self.real_download(filename, info_dict)
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\downloader\http.py", line 360, in real_download
+    for retry in RetryManager(self.params.get('retries'), self.report_retry):
+                 ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\utils\_utils.py", line 5260, in __iter__
+    self.error_callback(self.error, self.attempt, self.retries)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\downloader\common.py", line 413, in report_retry
+    RetryManager.report_retry(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~^
+        err, count, retries, info=self.__to_screen,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<2 lines>...
+        sleep_func=self.params.get('retry_sleep_functions', {}).get(is_frag or 'http'),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        suffix=f'fragment{"s" if frag_index is None else f" {frag_index}"}' if is_frag else None)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\utils\_utils.py", line 5267, in report_retry
+    return error(f'{e}. Giving up after {count - 1} retries') if count > 1 else error(str(e))
+                                                                                ~~~~~^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\downloader\common.py", line 416, in <lambda>
+    error=IDENTITY if not fatal else lambda e: self.report_error(f'\r[download] Got error: {e}'),
+                                               ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1103, in report_error
+    self.trouble(f'{self._format_err("ERROR:", self.Styles.ERROR)} {message}', *args, **kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1042, in trouble
+    raise DownloadError(message, exc_info)
+yt_dlp.utils.DownloadError: ERROR: [download] Got error: HTTPSConnectionPool(host='v19-webapp-prime.tiktok.com', port=443): Read timed out. (read timeout=20.0)
+2025-11-04 23:30:08,050 - INFO - Update id=356683824 is handled. Duration 194 ms by bot id=8423797514
+2025-11-04 23:30:10,054 - INFO - Update id=356683825 is handled. Duration 2143 ms by bot id=8423797514
+2025-11-04 23:30:11,097 - INFO - Update id=356683823 is handled. Duration 3242 ms by bot id=8423797514
+2025-11-04 23:31:18,140 - INFO - Polling stopped
+2025-11-04 23:31:18,141 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ServerDisconnectedError: Server disconnected
+2025-11-04 23:31:18,141 - WARNING - Sleep for 1.000000 seconds and try again... (tryings = 0, bot id = 8423797514)
+2025-11-04 23:31:23,317 - INFO - Start polling
+2025-11-04 23:31:23,376 - INFO - Run polling for bot @dwlttbot id=8423797514 - 'DownloadTikTok'
+2025-11-04 23:31:44,324 - INFO - Update id=356683826 is handled. Duration 184 ms by bot id=8423797514
+2025-11-04 23:31:50,303 - INFO - Update id=356683827 is handled. Duration 3675 ms by bot id=8423797514
+2025-11-04 23:32:58,859 - INFO - Polling stopped
+2025-11-04 23:32:58,860 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ServerDisconnectedError: Server disconnected
+2025-11-04 23:32:58,860 - WARNING - Sleep for 1.000000 seconds and try again... (tryings = 0, bot id = 8423797514)
+2025-11-04 23:33:04,655 - INFO - Start polling
+2025-11-04 23:33:04,715 - INFO - Run polling for bot @dwlttbot id=8423797514 - 'DownloadTikTok'
+2025-11-04 23:34:11,460 - INFO - Polling stopped
+2025-11-04 23:34:11,461 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ServerDisconnectedError: Server disconnected
+2025-11-04 23:34:11,461 - WARNING - Sleep for 1.000000 seconds and try again... (tryings = 0, bot id = 8423797514)
+2025-11-04 23:34:25,138 - INFO - Start polling
+2025-11-04 23:34:25,197 - INFO - Run polling for bot @dwlttbot id=8423797514 - 'DownloadTikTok'
+2025-11-04 23:34:36,996 - INFO - Polling stopped
+2025-11-04 23:34:36,997 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ServerDisconnectedError: Server disconnected
+2025-11-04 23:34:36,997 - WARNING - Sleep for 1.000000 seconds and try again... (tryings = 0, bot id = 8423797514)
+2025-11-04 23:34:41,220 - INFO - Start polling
+2025-11-04 23:34:41,288 - INFO - Run polling for bot @dwlttbot id=8423797514 - 'DownloadTikTok'
+2025-11-04 23:34:42,792 - INFO - Update id=356683828 is handled. Duration 260 ms by bot id=8423797514
+2025-11-04 23:34:49,132 - INFO - Polling stopped
+2025-11-04 23:34:49,133 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ServerDisconnectedError: Server disconnected
+2025-11-04 23:34:49,133 - WARNING - Sleep for 1.000000 seconds and try again... (tryings = 0, bot id = 8423797514)
+2025-11-04 23:34:52,287 - INFO - Start polling
+2025-11-04 23:34:52,346 - INFO - Run polling for bot @dwlttbot id=8423797514 - 'DownloadTikTok'
+2025-11-04 23:34:58,256 - INFO - Update id=356683829 is handled. Duration 196 ms by bot id=8423797514
+2025-11-04 23:35:06,230 - INFO - Update id=356683830 is handled. Duration 6582 ms by bot id=8423797514
+2025-11-04 23:36:11,356 - INFO - Polling stopped
+2025-11-04 23:36:11,356 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ServerDisconnectedError: Server disconnected
+2025-11-04 23:36:11,357 - WARNING - Sleep for 1.000000 seconds and try again... (tryings = 0, bot id = 8423797514)
+2025-11-04 23:36:14,842 - INFO - Start polling
+2025-11-04 23:36:14,913 - INFO - Run polling for bot @dwlttbot id=8423797514 - 'DownloadTikTok'
+2025-11-04 23:36:18,097 - INFO - Update id=356683831 is handled. Duration 227 ms by bot id=8423797514
+2025-11-04 23:36:21,299 - INFO - Update id=356683832 is handled. Duration 118 ms by bot id=8423797514
+2025-11-04 23:36:24,932 - INFO - Update id=356683833 is handled. Duration 141 ms by bot id=8423797514
+2025-11-04 23:36:57,841 - INFO - Update id=356683834 is handled. Duration 75 ms by bot id=8423797514
+2025-11-04 23:37:04,154 - INFO - Update id=356683835 is handled. Duration 4077 ms by bot id=8423797514
+2025-11-04 23:37:10,018 - INFO - Update id=356683836 is handled. Duration 3520 ms by bot id=8423797514
+2025-11-04 23:37:32,944 - INFO - Polling stopped
+2025-11-04 23:37:32,945 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ServerDisconnectedError: Server disconnected
+2025-11-04 23:37:32,945 - WARNING - Sleep for 1.000000 seconds and try again... (tryings = 0, bot id = 8423797514)
+2025-11-04 23:37:38,022 - INFO - Start polling
+2025-11-04 23:37:38,087 - INFO - Run polling for bot @dwlttbot id=8423797514 - 'DownloadTikTok'
+2025-11-04 23:37:39,818 - INFO - Update id=356683837 is handled. Duration 222 ms by bot id=8423797514
+2025-11-04 23:38:57,840 - INFO - Update id=356683838 is handled. Duration 87 ms by bot id=8423797514
+2025-11-04 23:39:02,325 - INFO - Update id=356683839 is handled. Duration 182 ms by bot id=8423797514
+2025-11-04 23:39:07,139 - INFO - Update id=356683840 is handled. Duration 3807 ms by bot id=8423797514
+2025-11-04 23:39:46,454 - INFO - Update id=356683841 is handled. Duration 108 ms by bot id=8423797514
+2025-11-04 23:40:14,243 - INFO - Polling stopped
+2025-11-04 23:40:14,244 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ServerDisconnectedError: Server disconnected
+2025-11-04 23:40:14,244 - WARNING - Sleep for 1.000000 seconds and try again... (tryings = 0, bot id = 8423797514)
+2025-11-04 23:40:42,184 - INFO - Start polling
+2025-11-04 23:40:42,254 - INFO - Run polling for bot @dwlttbot id=8423797514 - 'DownloadTikTok'
+2025-11-04 23:40:43,647 - INFO - Update id=356683843 is handled. Duration 215 ms by bot id=8423797514
+2025-11-04 23:42:49,984 - INFO - Polling stopped
+2025-11-04 23:42:49,984 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ServerDisconnectedError: Server disconnected
+2025-11-04 23:42:49,985 - WARNING - Sleep for 1.000000 seconds and try again... (tryings = 0, bot id = 8423797514)
+2025-11-04 23:42:53,539 - INFO - Start polling
+2025-11-04 23:42:53,601 - INFO - Run polling for bot @dwlttbot id=8423797514 - 'DownloadTikTok'
+2025-11-04 23:42:55,605 - INFO - Update id=356683844 is handled. Duration 217 ms by bot id=8423797514
+2025-11-04 23:44:29,111 - INFO - Polling stopped
+2025-11-04 23:44:29,112 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ServerDisconnectedError: Server disconnected
+2025-11-04 23:44:29,112 - WARNING - Sleep for 1.000000 seconds and try again... (tryings = 0, bot id = 8423797514)
+2025-11-04 23:44:33,935 - INFO - Start polling
+2025-11-04 23:44:33,992 - INFO - Run polling for bot @dwlttbot id=8423797514 - 'DownloadTikTok'
+2025-11-04 23:45:06,106 - INFO - Update id=356683845 is not handled. Duration 22431 ms by bot id=8423797514
+2025-11-04 23:45:06,106 - ERROR - Cause exception while process update id=356683845 by bot id=8423797514
+DownloadError: ERROR: [download] Got error: HTTPSConnectionPool(host='v19-webapp-prime.tiktok.com', port=443): Read timed out. (read timeout=20.0)
+Traceback (most recent call last):
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\dispatcher.py", line 309, in _process_update
+    response = await self.feed_update(bot, update, **kwargs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\dispatcher.py", line 158, in feed_update
+    response = await self.update.wrap_outer_middleware(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<7 lines>...
+    )
+    ^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\middlewares\error.py", line 25, in __call__
+    return await handler(event, data)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\middlewares\user_context.py", line 56, in __call__
+    return await handler(event, data)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\fsm\middleware.py", line 42, in __call__
+    return await handler(event, data)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\event\telegram.py", line 121, in trigger
+    return await wrapped_inner(event, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\event\handler.py", line 43, in call
+    return await wrapped()
+           ^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\dispatcher.py", line 276, in _listen_update
+    return await self.propagate_event(update_type=update_type, event=event, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\router.py", line 146, in propagate_event
+    return await observer.wrap_outer_middleware(_wrapped, event=event, data=kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\router.py", line 141, in _wrapped
+    return await self._propagate_event(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        observer=observer, update_type=update_type, event=telegram_event, **data
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\router.py", line 174, in _propagate_event
+    response = await router.propagate_event(update_type=update_type, event=event, **kwargs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\router.py", line 146, in propagate_event
+    return await observer.wrap_outer_middleware(_wrapped, event=event, data=kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\router.py", line 141, in _wrapped
+    return await self._propagate_event(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        observer=observer, update_type=update_type, event=telegram_event, **data
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\router.py", line 166, in _propagate_event
+    response = await observer.trigger(event, **kwargs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\event\telegram.py", line 121, in trigger
+    return await wrapped_inner(event, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\event\handler.py", line 43, in call
+    return await wrapped()
+           ^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\handlers\link.py", line 31, in handle_tiktok_link
+    ydl.download([message.text])
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3611, in download
+    self.__download_wrapper(self.extract_info)(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        url, force_generic_extractor=self.params.get('force_generic_extractor', False))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3584, in wrapper
+    res = func(*args, **kwargs)
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1634, in extract_info
+    return self.__extract_info(url, self.get_info_extractor(key), download, extra_info, process)
+           ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1645, in wrapper
+    return func(self, *args, **kwargs)
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1801, in __extract_info
+    return self.process_ie_result(ie_result, download, extra_info)
+           ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1860, in process_ie_result
+    ie_result = self.process_video_result(ie_result, download=download)
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3038, in process_video_result
+    self.process_info(new_info)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 187, in wrapper
+    return func(self, *args, **kwargs)
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3485, in process_info
+    success, real_download = self.dl(temp_filename, info_dict)
+                             ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3227, in dl
+    return fd.download(name, new_info, subtitle)
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\downloader\common.py", line 479, in download
+    ret = self.real_download(filename, info_dict)
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\downloader\http.py", line 360, in real_download
+    for retry in RetryManager(self.params.get('retries'), self.report_retry):
+                 ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\utils\_utils.py", line 5260, in __iter__
+    self.error_callback(self.error, self.attempt, self.retries)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\downloader\common.py", line 413, in report_retry
+    RetryManager.report_retry(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~^
+        err, count, retries, info=self.__to_screen,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<2 lines>...
+        sleep_func=self.params.get('retry_sleep_functions', {}).get(is_frag or 'http'),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        suffix=f'fragment{"s" if frag_index is None else f" {frag_index}"}' if is_frag else None)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\utils\_utils.py", line 5267, in report_retry
+    return error(f'{e}. Giving up after {count - 1} retries') if count > 1 else error(str(e))
+                                                                                ~~~~~^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\downloader\common.py", line 416, in <lambda>
+    error=IDENTITY if not fatal else lambda e: self.report_error(f'\r[download] Got error: {e}'),
+                                               ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1103, in report_error
+    self.trouble(f'{self._format_err("ERROR:", self.Styles.ERROR)} {message}', *args, **kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1042, in trouble
+    raise DownloadError(message, exc_info)
+yt_dlp.utils.DownloadError: ERROR: [download] Got error: HTTPSConnectionPool(host='v19-webapp-prime.tiktok.com', port=443): Read timed out. (read timeout=20.0)
+2025-11-04 23:45:48,635 - INFO - Update id=356683846 is not handled. Duration 21500 ms by bot id=8423797514
+2025-11-04 23:45:48,635 - ERROR - Cause exception while process update id=356683846 by bot id=8423797514
+DownloadError: ERROR: [download] Got error: HTTPSConnectionPool(host='v19-webapp-prime.tiktok.com', port=443): Read timed out. (read timeout=20.0)
+Traceback (most recent call last):
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\dispatcher.py", line 309, in _process_update
+    response = await self.feed_update(bot, update, **kwargs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\dispatcher.py", line 158, in feed_update
+    response = await self.update.wrap_outer_middleware(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<7 lines>...
+    )
+    ^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\middlewares\error.py", line 25, in __call__
+    return await handler(event, data)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\middlewares\user_context.py", line 56, in __call__
+    return await handler(event, data)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\fsm\middleware.py", line 42, in __call__
+    return await handler(event, data)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\event\telegram.py", line 121, in trigger
+    return await wrapped_inner(event, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\event\handler.py", line 43, in call
+    return await wrapped()
+           ^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\dispatcher.py", line 276, in _listen_update
+    return await self.propagate_event(update_type=update_type, event=event, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\router.py", line 146, in propagate_event
+    return await observer.wrap_outer_middleware(_wrapped, event=event, data=kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\router.py", line 141, in _wrapped
+    return await self._propagate_event(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        observer=observer, update_type=update_type, event=telegram_event, **data
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\router.py", line 174, in _propagate_event
+    response = await router.propagate_event(update_type=update_type, event=event, **kwargs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\router.py", line 146, in propagate_event
+    return await observer.wrap_outer_middleware(_wrapped, event=event, data=kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\router.py", line 141, in _wrapped
+    return await self._propagate_event(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        observer=observer, update_type=update_type, event=telegram_event, **data
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\router.py", line 166, in _propagate_event
+    response = await observer.trigger(event, **kwargs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\event\telegram.py", line 121, in trigger
+    return await wrapped_inner(event, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\event\handler.py", line 43, in call
+    return await wrapped()
+           ^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\handlers\link.py", line 31, in handle_tiktok_link
+    ydl.download([message.text])
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3611, in download
+    self.__download_wrapper(self.extract_info)(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        url, force_generic_extractor=self.params.get('force_generic_extractor', False))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3584, in wrapper
+    res = func(*args, **kwargs)
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1634, in extract_info
+    return self.__extract_info(url, self.get_info_extractor(key), download, extra_info, process)
+           ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1645, in wrapper
+    return func(self, *args, **kwargs)
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1801, in __extract_info
+    return self.process_ie_result(ie_result, download, extra_info)
+           ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1860, in process_ie_result
+    ie_result = self.process_video_result(ie_result, download=download)
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3038, in process_video_result
+    self.process_info(new_info)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 187, in wrapper
+    return func(self, *args, **kwargs)
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3485, in process_info
+    success, real_download = self.dl(temp_filename, info_dict)
+                             ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3227, in dl
+    return fd.download(name, new_info, subtitle)
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\downloader\common.py", line 479, in download
+    ret = self.real_download(filename, info_dict)
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\downloader\http.py", line 360, in real_download
+    for retry in RetryManager(self.params.get('retries'), self.report_retry):
+                 ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\utils\_utils.py", line 5260, in __iter__
+    self.error_callback(self.error, self.attempt, self.retries)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\downloader\common.py", line 413, in report_retry
+    RetryManager.report_retry(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~^
+        err, count, retries, info=self.__to_screen,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<2 lines>...
+        sleep_func=self.params.get('retry_sleep_functions', {}).get(is_frag or 'http'),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        suffix=f'fragment{"s" if frag_index is None else f" {frag_index}"}' if is_frag else None)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\utils\_utils.py", line 5267, in report_retry
+    return error(f'{e}. Giving up after {count - 1} retries') if count > 1 else error(str(e))
+                                                                                ~~~~~^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\downloader\common.py", line 416, in <lambda>
+    error=IDENTITY if not fatal else lambda e: self.report_error(f'\r[download] Got error: {e}'),
+                                               ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1103, in report_error
+    self.trouble(f'{self._format_err("ERROR:", self.Styles.ERROR)} {message}', *args, **kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1042, in trouble
+    raise DownloadError(message, exc_info)
+yt_dlp.utils.DownloadError: ERROR: [download] Got error: HTTPSConnectionPool(host='v19-webapp-prime.tiktok.com', port=443): Read timed out. (read timeout=20.0)
+2025-11-04 23:45:52,277 - INFO - Update id=356683847 is handled. Duration 3573 ms by bot id=8423797514
+2025-11-04 23:46:16,067 - INFO - Update id=356683848 is handled. Duration 5875 ms by bot id=8423797514
+2025-11-04 23:46:38,284 - INFO - Update id=356683849 is not handled. Duration 22072 ms by bot id=8423797514
+2025-11-04 23:46:38,284 - ERROR - Cause exception while process update id=356683849 by bot id=8423797514
+DownloadError: ERROR: [download] Got error: HTTPSConnectionPool(host='v19-webapp-prime.tiktok.com', port=443): Read timed out. (read timeout=20.0)
+Traceback (most recent call last):
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\dispatcher.py", line 309, in _process_update
+    response = await self.feed_update(bot, update, **kwargs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\dispatcher.py", line 158, in feed_update
+    response = await self.update.wrap_outer_middleware(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<7 lines>...
+    )
+    ^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\middlewares\error.py", line 25, in __call__
+    return await handler(event, data)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\middlewares\user_context.py", line 56, in __call__
+    return await handler(event, data)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\fsm\middleware.py", line 42, in __call__
+    return await handler(event, data)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\event\telegram.py", line 121, in trigger
+    return await wrapped_inner(event, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\event\handler.py", line 43, in call
+    return await wrapped()
+           ^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\dispatcher.py", line 276, in _listen_update
+    return await self.propagate_event(update_type=update_type, event=event, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\router.py", line 146, in propagate_event
+    return await observer.wrap_outer_middleware(_wrapped, event=event, data=kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\router.py", line 141, in _wrapped
+    return await self._propagate_event(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        observer=observer, update_type=update_type, event=telegram_event, **data
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\router.py", line 174, in _propagate_event
+    response = await router.propagate_event(update_type=update_type, event=event, **kwargs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\router.py", line 146, in propagate_event
+    return await observer.wrap_outer_middleware(_wrapped, event=event, data=kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\router.py", line 141, in _wrapped
+    return await self._propagate_event(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        observer=observer, update_type=update_type, event=telegram_event, **data
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\router.py", line 166, in _propagate_event
+    response = await observer.trigger(event, **kwargs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\event\telegram.py", line 121, in trigger
+    return await wrapped_inner(event, kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\aiogram\dispatcher\event\handler.py", line 43, in call
+    return await wrapped()
+           ^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\handlers\link.py", line 31, in handle_tiktok_link
+    ydl.download([message.text])
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3611, in download
+    self.__download_wrapper(self.extract_info)(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        url, force_generic_extractor=self.params.get('force_generic_extractor', False))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3584, in wrapper
+    res = func(*args, **kwargs)
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1634, in extract_info
+    return self.__extract_info(url, self.get_info_extractor(key), download, extra_info, process)
+           ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1645, in wrapper
+    return func(self, *args, **kwargs)
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1801, in __extract_info
+    return self.process_ie_result(ie_result, download, extra_info)
+           ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1860, in process_ie_result
+    ie_result = self.process_video_result(ie_result, download=download)
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3038, in process_video_result
+    self.process_info(new_info)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 187, in wrapper
+    return func(self, *args, **kwargs)
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3485, in process_info
+    success, real_download = self.dl(temp_filename, info_dict)
+                             ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3227, in dl
+    return fd.download(name, new_info, subtitle)
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\downloader\common.py", line 479, in download
+    ret = self.real_download(filename, info_dict)
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\downloader\http.py", line 360, in real_download
+    for retry in RetryManager(self.params.get('retries'), self.report_retry):
+                 ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\utils\_utils.py", line 5260, in __iter__
+    self.error_callback(self.error, self.attempt, self.retries)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\downloader\common.py", line 413, in report_retry
+    RetryManager.report_retry(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~^
+        err, count, retries, info=self.__to_screen,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<2 lines>...
+        sleep_func=self.params.get('retry_sleep_functions', {}).get(is_frag or 'http'),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        suffix=f'fragment{"s" if frag_index is None else f" {frag_index}"}' if is_frag else None)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\utils\_utils.py", line 5267, in report_retry
+    return error(f'{e}. Giving up after {count - 1} retries') if count > 1 else error(str(e))
+                                                                                ~~~~~^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\downloader\common.py", line 416, in <lambda>
+    error=IDENTITY if not fatal else lambda e: self.report_error(f'\r[download] Got error: {e}'),
+                                               ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1103, in report_error
+    self.trouble(f'{self._format_err("ERROR:", self.Styles.ERROR)} {message}', *args, **kwargs)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\TelegramBots\DownloadTTBot\.venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1042, in trouble
+    raise DownloadError(message, exc_info)
+yt_dlp.utils.DownloadError: ERROR: [download] Got error: HTTPSConnectionPool(host='v19-webapp-prime.tiktok.com', port=443): Read timed out. (read timeout=20.0)
+2025-11-04 23:49:07,556 - INFO - Update id=356683850 is handled. Duration 243 ms by bot id=8423797514
+2025-11-04 23:49:13,334 - INFO - Update id=356683851 is handled. Duration 3422 ms by bot id=8423797514
+2025-11-04 23:49:50,730 - INFO - Update id=356683852 is handled. Duration 3778 ms by bot id=8423797514
+2025-11-04 23:52:17,310 - INFO - Polling stopped
+2025-11-04 23:52:17,311 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ServerDisconnectedError: Server disconnected
+2025-11-04 23:52:17,311 - WARNING - Sleep for 1.000000 seconds and try again... (tryings = 0, bot id = 8423797514)
+2025-11-04 23:52:21,102 - INFO - Start polling
+2025-11-04 23:52:21,162 - INFO - Run polling for bot @dwlttbot id=8423797514 - 'DownloadTikTok'
+2025-11-04 23:52:30,807 - INFO - Update id=356683853 is handled. Duration 3975 ms by bot id=8423797514
+2025-11-04 23:52:38,857 - INFO - Update id=356683854 is handled. Duration 5934 ms by bot id=8423797514
+2025-11-04 23:52:47,877 - INFO - Update id=356683856 is handled. Duration 12901 ms by bot id=8423797514
+2025-11-04 23:52:49,421 - INFO - Update id=356683855 is handled. Duration 14503 ms by bot id=8423797514
+2025-11-04 23:52:50,377 - INFO - Update id=356683857 is handled. Duration 11604 ms by bot id=8423797514
+2025-11-04 23:52:51,218 - INFO - Update id=356683860 is handled. Duration 12388 ms by bot id=8423797514
+2025-11-04 23:52:52,128 - INFO - Update id=356683858 is handled. Duration 13298 ms by bot id=8423797514
+2025-11-04 23:52:52,526 - INFO - Update id=356683859 is handled. Duration 13696 ms by bot id=8423797514
+2025-11-04 23:52:53,046 - INFO - Update id=356683861 is handled. Duration 14216 ms by bot id=8423797514
+2025-11-04 23:53:08,273 - INFO - Polling stopped
+2025-11-04 23:53:08,274 - ERROR - Failed to fetch updates - TelegramNetworkError: HTTP Client says - ServerDisconnectedError: Server disconnected
+2025-11-04 23:53:08,274 - WARNING - Sleep for 1.000000 seconds and try again... (tryings = 0, bot id = 8423797514)
+2025-11-04 23:53:08,536 - INFO - Polling stopped for bot @dwlttbot id=8423797514 - 'DownloadTikTok'
