@@ -15,16 +15,18 @@ from db.session import engine
 from handlers.link import link
 from middleware.db_session import DBSessionMiddleware
 from routers.command_router import commands_router
-# from routers.inline_router import inline_router  # отложено на будущее
+from routers.inline_router import inline_router
 from services.queue import process_queue
 
 bot = Bot(token=os.getenv('TOKEN'))  # type: ignore[arg-type]
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# Middleware для сессии БД — нужен и message-, и callback_query-хендлерам
+# Middleware для сессии БД
 dp.message.middleware(DBSessionMiddleware())
 dp.callback_query.middleware(DBSessionMiddleware())
+dp.inline_query.middleware(DBSessionMiddleware())
+dp.chosen_inline_result.middleware(DBSessionMiddleware())
 
 
 async def main():
@@ -34,20 +36,28 @@ async def main():
     dp.include_routers(
         commands_router,
         link,
-        # inline_router,  # отложено на будущее
+        inline_router,
     )
     await dp.start_polling(bot)
 
 
 async def on_startup():
     async with engine.begin() as conn:
-        # Миграция: если таблица VideoCache существует со старой схемой
-        # (колонка url вместо tiktok_id) — пересоздаём её.
+        # Миграция VideoCache: если колонка tiktok_id отсутствует — пересоздаём таблицу.
         try:
             await conn.execute(text("SELECT tiktok_id FROM VideoCache LIMIT 1"))
-        except Exception:  # noqa: BLE001 — любая ошибка означает старую/отсутствующую схему
+        except Exception:  # noqa: BLE001
             await conn.execute(text("DROP TABLE IF EXISTS VideoCache"))
             logging.info("VideoCache: старая схема обнаружена, таблица пересоздана")
+
+        # Миграция DownloadQueue: добавляем inline_message_id если ещё нет.
+        try:
+            await conn.execute(text("SELECT inline_message_id FROM BotDownloadQueue LIMIT 1"))
+        except Exception:  # noqa: BLE001
+            await conn.execute(text(
+                "ALTER TABLE BotDownloadQueue ADD COLUMN inline_message_id TEXT"
+            ))
+            logging.info("BotDownloadQueue: добавлена колонка inline_message_id")
 
         await conn.run_sync(Base.metadata.create_all)
 
@@ -61,6 +71,8 @@ if __name__ == '__main__':
             logging.StreamHandler()
         ]
     )
+    # Глушим спам SQLAlchemy (BEGIN, ROLLBACK, SELECT каждую секунду)
+    logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 
     try:
         asyncio.run(main())

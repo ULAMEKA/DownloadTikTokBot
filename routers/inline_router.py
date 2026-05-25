@@ -1,91 +1,112 @@
-# -----------------------------------------------------------------------
-# Inline-режим отложен на будущее — весь код закомментирован
-# -----------------------------------------------------------------------
+import re
+import uuid
 
-# import asyncio
-# import logging
-# import os
-# import re
-# import uuid
-#
-# import yt_dlp
-# from aiogram import Router, Bot
-# from aiogram.types import FSInputFile, InlineQuery, InlineQueryResultCachedVideo
-# from sqlalchemy import select
-# from sqlalchemy.exc import IntegrityError
-#
-# from db.models import VideoCache
-# from db.session import SessionLocal
-#
-# inline_router = Router()
-#
-# TIKTOK_RE = re.compile(r'(https?://)?(www\.|vm\.|vt\.)?tiktok\.com/\S+')
-# STORAGE_CHAT_ID = os.getenv('STORAGE_CHAT_ID')
-#
-# BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# VIDEO_DIR = os.path.join(BASE_DIR, "videos")
-# os.makedirs(VIDEO_DIR, exist_ok=True)
-#
-# _downloading: set[str] = set()
-#
-#
-# def _ydl_download(url: str, out_template: str):
-#     with yt_dlp.YoutubeDL({'outtmpl': out_template, 'quiet': True}) as ydl:
-#         ydl.download([url])
-#
-#
-# async def _preload(url: str, bot: Bot):
-#     _downloading.add(url)
-#     filename = str(uuid.uuid4())
-#     final_path = os.path.join(VIDEO_DIR, f'{filename}.mp4')
-#
-#     try:
-#         loop = asyncio.get_event_loop()
-#         await loop.run_in_executor(
-#             None, _ydl_download, url, os.path.join(VIDEO_DIR, f'{filename}.%(ext)s')
-#         )
-#
-#         video = FSInputFile(final_path)
-#         msg = await bot.send_video(chat_id=STORAGE_CHAT_ID, video=video)
-#         file_id = msg.video.file_id
-#         await bot.delete_message(chat_id=STORAGE_CHAT_ID, message_id=msg.message_id)
-#
-#         async with SessionLocal() as session:
-#             session.add(VideoCache(url=url, file_id=file_id))
-#             await session.commit()
-#     except IntegrityError:
-#         pass
-#     except Exception as e:
-#         logging.exception("Preload error for %s: %s", url, e)
-#     finally:
-#         _downloading.discard(url)
-#         if os.path.exists(final_path):
-#             os.remove(final_path)
-#
-#
-# @inline_router.inline_query()
-# async def handle_inline_query(query: InlineQuery, bot: Bot):
-#     text = query.query.strip()
-#
-#     if not TIKTOK_RE.match(text):
-#         await query.answer([], cache_time=1)
-#         return
-#
-#     async with SessionLocal() as session:
-#         result = await session.execute(select(VideoCache).where(VideoCache.url == text))
-#         cached = result.scalar()
-#
-#     if cached:
-#         await query.answer([
-#             InlineQueryResultCachedVideo(
-#                 id=str(uuid.uuid4()),
-#                 video_file_id=cached.file_id,
-#                 title='TikTok Video',
-#             )
-#         ], cache_time=300)
-#         return
-#
-#     if text not in _downloading:
-#         asyncio.create_task(_preload(text, bot))
-#
-#     await query.answer([], cache_time=1)
+from aiogram import Router, F
+from aiogram.types import (
+    InlineQuery,
+    InlineQueryResultArticle,
+    InlineQueryResultCachedVideo,
+    InputTextMessageContent,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ChosenInlineResult,
+)
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from db.models import DownloadQueue, VideoCache
+
+inline_router = Router()
+
+_TIKTOK_URL_RE = re.compile(r'(https?://)?(www\.|vm\.|vt\.)?tiktok\.com/\S+')
+_TIKTOK_ID_RE  = re.compile(r'/video/(\d+)')
+
+
+@inline_router.inline_query()
+async def handle_inline_query(query: InlineQuery, session: AsyncSession):
+    """
+    Отвечает мгновенно — никогда не ждём загрузки внутри хендлера.
+
+    Сценарий A (кеш есть):
+        → InlineQueryResultCachedVideo: Telegram сам шлёт видео в чат.
+
+    Сценарий Б (кеша нет):
+        → InlineQueryResultArticle «⏳ Загружается…» с кнопкой.
+          Кнопка нужна, чтобы Telegram вернул inline_message_id
+          в событии ChosenInlineResult — через него очередь потом
+          отредактирует сообщение и вставит видео прямо в чат.
+    """
+    text = query.query.strip()
+
+    m_url = _TIKTOK_URL_RE.search(text)
+    if not m_url:
+        await query.answer([], cache_time=5)
+        return
+
+    url = m_url.group(0)
+
+    # ── Быстрая проверка кеша (только regex, без yt-dlp) ─────────────────────
+    m_id = _TIKTOK_ID_RE.search(url)
+    if m_id:
+        cache_res = await session.execute(
+            select(VideoCache).where(VideoCache.tiktok_id == m_id.group(1))
+        )
+        cached = cache_res.scalar()
+        if cached and cached.file_id:
+            await query.answer(
+                results=[
+                    InlineQueryResultCachedVideo(
+                        id="cached",
+                        video_file_id=cached.file_id,
+                        title="TikTok видео",
+                    )
+                ],
+                cache_time=3600,
+            )
+            return
+
+    # ── Кеша нет: статья-заглушка; реальная загрузка — через chosen_inline_result ──
+    # reply_markup обязателен: только при наличии кнопки Telegram
+    # возвращает inline_message_id в ChosenInlineResult.
+    await query.answer(
+        results=[
+            InlineQueryResultArticle(
+                id="download",
+                title="📥 Загрузить видео",
+                description="Видео появится прямо в этом чате",
+                input_message_content=InputTextMessageContent(
+                    message_text="⏳ <b>Скачиваю TikTok видео…</b>",
+                    parse_mode="HTML",
+                ),
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="⏳ Загружается…", callback_data="inline_loading")
+                ]]),
+            )
+        ],
+        cache_time=0,   # не кешировать — статус может смениться
+    )
+
+
+@inline_router.chosen_inline_result(F.result_id == "download")
+async def chosen_download(result: ChosenInlineResult, session: AsyncSession):
+    """
+    Срабатывает, когда пользователь выбрал «Загрузить».
+    Сохраняем inline_message_id — очередь отредактирует это сообщение
+    и вставит видео прямо в чат.
+    chat_id = user_id нужен как fallback (например, для получения file_id
+    без Storage-канала).
+    """
+    m_url = _TIKTOK_URL_RE.search(result.query)
+    if not m_url:
+        return
+
+    url = m_url.group(0)
+
+    queue_item = DownloadQueue(
+        chat_id=str(result.from_user.id),      # PM пользователя (fallback)
+        filename=str(uuid.uuid4()),
+        tiktok_link=url,
+        inline_message_id=result.inline_message_id,  # ID сообщения в чате
+    )
+    session.add(queue_item)
+    await session.commit()

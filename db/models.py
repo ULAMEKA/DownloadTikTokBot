@@ -8,6 +8,9 @@ class DownloadQueue(Base):
     chat_id = Column(String)
     filename = Column(String)
     tiktok_link = Column(String)
+    # Для inline-режима: ID отправленного сообщения в чате.
+    # Если задан — очередь редактирует это сообщение, вставляя видео прямо в чат.
+    inline_message_id = Column(String, nullable=True)
 
 
 class VideoCache(Base):

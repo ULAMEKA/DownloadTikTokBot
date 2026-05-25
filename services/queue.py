@@ -7,7 +7,7 @@ from pathlib import Path
 import yt_dlp
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.types import FSInputFile
+from aiogram.types import FSInputFile, InputMediaVideo
 from sqlalchemy import select
 
 from db.session import SessionLocal
@@ -56,11 +56,63 @@ def _ydl_download(url: str, outtmpl: str) -> str | None:
         "outtmpl": outtmpl,  # cspell:disable-line
         "quiet": True,
         "no_warnings": True,
+        # Максимум 400p: берём лучший поток ≤400p + аудио;
+        # если TikTok отдаёт единый поток — берём лучший combined ≤400p;
+        # последний fallback «best» нужен на случай если видео изначально
+        # ниже 400p и yt-dlp не может применить фильтр по высоте.
+        "format": (
+            "bestvideo[height<=400]+bestaudio"
+            "/best[height<=400]"
+            "/best"
+        ),
     }
     with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore[arg-type]
         info = ydl.extract_info(url, download=True)
         if info and info.get("id"):
             return str(info["id"])
+    return None
+
+
+async def _deliver_video(
+    bot: Bot,
+    chat_id: str,
+    inline_message_id: str | None,
+    file_id: str | None,
+    video_path: Path | None,
+) -> str | None:
+    """
+    Доставляет видео пользователю одним из двух способов:
+
+    • Если inline_message_id задан — редактируем то самое сообщение в чате,
+      заменяя текст «⏳ Загружается…» на готовое видео.
+    • Иначе — обычный send_video в chat_id.
+
+    Возвращает Telegram file_id (для кеша) или None при ошибке.
+    """
+    # ── Inline-режим: редактируем сообщение в чате через file_id из Storage ──
+    if inline_message_id:
+        if not file_id:
+            logging.warning("inline_message_id есть, но file_id отсутствует — пропускаем")
+            return None
+        try:
+            await bot.edit_message_media(
+                inline_message_id=inline_message_id,
+                media=InputMediaVideo(media=file_id),
+            )
+        except (TelegramBadRequest, TelegramForbiddenError) as e:
+            logging.warning("edit_message_media failed: %s", e)
+        return file_id
+
+    # ── Обычный режим: send_video в чат ──────────────────────────────────────
+    if file_id:
+        await bot.send_video(chat_id=chat_id, video=file_id)
+        return file_id
+
+    if video_path:
+        msg = await bot.send_video(chat_id=chat_id, video=FSInputFile(str(video_path)))
+        if msg.video:
+            return msg.video.file_id
+
     return None
 
 
@@ -84,6 +136,7 @@ async def process_queue(bot: Bot) -> None:
             chat_id: str = item.chat_id
             filename: str = item.filename
             tiktok_link: str = item.tiktok_link
+            inline_message_id: str | None = item.inline_message_id
 
             try:
                 loop = asyncio.get_running_loop()
@@ -99,7 +152,10 @@ async def process_queue(bot: Bot) -> None:
                     cached = cache_res.scalar()
                     if cached and cached.file_id:
                         logging.info("Cache hit: tiktok_id=%s → отправляем без загрузки", tiktok_id)
-                        await bot.send_video(chat_id=chat_id, video=cached.file_id)
+                        await _deliver_video(
+                            bot, chat_id, inline_message_id,
+                            file_id=cached.file_id, video_path=None,
+                        )
                         await session.delete(item)
                         await session.commit()
                         continue
@@ -137,18 +193,13 @@ async def process_queue(bot: Bot) -> None:
                     except (TelegramBadRequest, TelegramForbiddenError) as e:
                         logging.warning("Не удалось отправить в Storage-канал: %s", e)
 
-                # ── 5. Отправляем пользователю ────────────────────────────────────
-                if file_id:
-                    # Telegram переиспользует уже загруженный файл — нового аплоада нет
-                    await bot.send_video(chat_id=chat_id, video=file_id)
-                else:
-                    # Storage-канал не настроен или недоступен — шлём файл напрямую
-                    msg = await bot.send_video(
-                        chat_id=chat_id,
-                        video=FSInputFile(str(video_path)),
-                    )
-                    if msg.video:
-                        file_id = msg.video.file_id
+                # ── 5. Доставляем видео (inline или обычный режим) ────────────────
+                result_file_id = await _deliver_video(
+                    bot, chat_id, inline_message_id,
+                    file_id=file_id, video_path=video_path,
+                )
+                if result_file_id and not file_id:
+                    file_id = result_file_id  # сохраним для кеша
 
                 # ── 6. Удаляем локальный файл и кешируем ─────────────────────────
                 os.remove(video_path)
@@ -175,13 +226,23 @@ async def process_queue(bot: Bot) -> None:
                 logging.exception("Ошибка загрузки: chat=%s url=%s", chat_id, tiktok_link)
                 for f in VIDEO_DIR.glob(f"{filename}.*"):
                     os.remove(f)
-                try:
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text="Что-то пошло не так! Попробуй ещё раз.",
-                    )
-                except (TelegramBadRequest, TelegramForbiddenError):
-                    pass
+                # При ошибке в inline-режиме — редактируем статус
+                if inline_message_id:
+                    try:
+                        await bot.edit_message_text(
+                            inline_message_id=inline_message_id,
+                            text="❌ Не удалось скачать видео. Попробуй ещё раз.",
+                        )
+                    except (TelegramBadRequest, TelegramForbiddenError):
+                        pass
+                else:
+                    try:
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text="Что-то пошло не так! Попробуй ещё раз.",
+                        )
+                    except (TelegramBadRequest, TelegramForbiddenError):
+                        pass
                 await asyncio.sleep(3)
                 await session.delete(item)
                 await session.commit()
