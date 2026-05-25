@@ -1,9 +1,18 @@
 from sqlalchemy import Column, Integer, String
 from .base import Base
 
+
 class DownloadQueue(Base):
     __tablename__ = "BotDownloadQueue"
     id = Column(Integer, primary_key=True)
-    user_id = Column(String)
+    chat_id = Column(String)
     filename = Column(String)
     tiktok_link = Column(String)
+
+
+class VideoCache(Base):
+    __tablename__ = "VideoCache"
+    id = Column(Integer, primary_key=True)
+    tiktok_id = Column(String, unique=True, index=True)   # ID видео TikTok (не URL)
+    file_id = Column(String)                               # Telegram file_id для быстрой пересылки
+    storage_message_id = Column(Integer)                   # ID сообщения в Storage-канале
