@@ -43,6 +43,13 @@ async def main():
 
 async def on_startup():
     async with engine.begin() as conn:
+        # Сначала создаём недостающие таблицы по текущим моделям. На чистой БД
+        # таблицы появятся сразу с актуальной схемой, и миграции ниже станут
+        # no-op. На существующей БД create_all не трогает уже созданные таблицы —
+        # их донастраивают миграции (теперь ALTER идёт по реально существующей
+        # таблице, а не падает с "no such table").
+        await conn.run_sync(Base.metadata.create_all)
+
         # Миграция VideoCache: если колонка tiktok_id отсутствует — пересоздаём таблицу.
         try:
             await conn.execute(text("SELECT tiktok_id FROM VideoCache LIMIT 1"))
@@ -59,6 +66,7 @@ async def on_startup():
             ))
             logging.info("BotDownloadQueue: добавлена колонка inline_message_id")
 
+        # Повторный create_all пересоздаёт VideoCache, если миграция её удалила.
         await conn.run_sync(Base.metadata.create_all)
 
 
