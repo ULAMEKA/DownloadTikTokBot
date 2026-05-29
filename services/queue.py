@@ -81,9 +81,13 @@ def _ydl_download(url: str, outtmpl: str) -> tuple[str | None, int | None, int |
         # Если мёрдж всё-таки случится — складываем в mp4, а не в .mkv:
         # Telegram криво читает метаданные mkv и ломает aspect ratio.
         "merge_output_format": "mp4",
-        # Приоритет — уже склеенный mp4 (со звуком, без ffmpeg). Затем
-        # любой готовый поток. Bestvideo+bestaudio (нужен ffmpeg) — последним.
-        "format": "best[ext=mp4]/best/bestvideo+bestaudio",
+        # Жёстко предпочитаем H.264. У TikTok самый качественный mp4 — это
+        # H.265/HEVC (bytevc1_720p), а плеер Telegram HEVC не тянет: видео
+        # идёт без звука или не проигрывается. Поэтому:
+        #   1) лучший готовый H.264 mp4 со звуком (обычно есть, ffmpeg не нужен);
+        #   2) иначе — склейка H.264-видео + аудио (нужен ffmpeg);
+        #   3) крайний случай — что есть вообще.
+        "format": "best[vcodec^=h264]/bestvideo[vcodec^=h264]+bestaudio/best",
     }
     with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore[arg-type]
         info = ydl.extract_info(url, download=True)
