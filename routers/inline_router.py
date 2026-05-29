@@ -3,6 +3,7 @@ import uuid
 
 from aiogram import Router, F
 from aiogram.types import (
+    CallbackQuery,
     InlineQuery,
     InlineQueryResultArticle,
     InlineQueryResultCachedVideo,
@@ -75,7 +76,11 @@ async def handle_inline_query(query: InlineQuery, session: AsyncSession):
                 title="📥 Загрузить видео",
                 description="Видео появится прямо в этом чате",
                 input_message_content=InputTextMessageContent(
-                    message_text="⏳ <b>Скачиваю TikTok видео…</b>",
+                    message_text=(
+                        "⏳ <b>Скачиваю TikTok видео…</b>\n\n"
+                        "💡 В любом чате введите: <code>@dwllttbot *ссылка*</code> — "
+                        "и видео отправится прямо в чат"
+                    ),
                     parse_mode="HTML",
                 ),
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
@@ -110,3 +115,13 @@ async def chosen_download(result: ChosenInlineResult, session: AsyncSession):
     )
     session.add(queue_item)
     await session.commit()
+
+
+@inline_router.callback_query(F.data == "inline_loading")
+async def _ack_inline_loading(callback: CallbackQuery):
+    """
+    Кнопка «⏳ Загружается…» в inline-плейсхолдере — фиктивная,
+    просто чтобы Telegram вернул inline_message_id в ChosenInlineResult.
+    Если пользователь нажмёт — погасим спиннер сразу, иначе он крутится 15с.
+    """
+    await callback.answer("Видео ещё загружается, подожди немного")
