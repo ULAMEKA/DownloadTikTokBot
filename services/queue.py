@@ -26,11 +26,7 @@ _TIKTOK_ID_RE = re.compile(r'/video/(\d+)')
 
 
 def _get_tiktok_id(url: str) -> str | None:
-    """
-    Извлекает ID видео TikTok.
-    Быстрый путь (regex) для полных URL вида tiktok.com/@user/video/12345.
-    Медленный путь (yt-dlp без загрузки) для коротких URL вида vm.tiktok.com/XXXX.
-    """
+    """Возвращает ID видео TikTok из ссылки (или None)."""
     m = _TIKTOK_ID_RE.search(url)
     if m:
         return m.group(1)
@@ -47,12 +43,7 @@ def _get_tiktok_id(url: str) -> str | None:
 
 
 def _extract_dimensions(info: dict[str, object]) -> tuple[int | None, int | None]:
-    """
-    Достаёт ширину/высоту видео из info-dict yt-dlp.
-    Сначала верхний уровень, затем requested_downloads (заполняется
-    после мёрджа bestvideo+bestaudio). Возвращает (None, None), если
-    размеры неизвестны — тогда отправляем без них, как раньше.
-    """
+    """Возвращает (width, height) видео из info-dict yt-dlp."""
     w, h = info.get("width"), info.get("height")
     if w and h:
         return int(w), int(h)  # type: ignore[arg-type]
@@ -66,28 +57,15 @@ def _extract_dimensions(info: dict[str, object]) -> tuple[int | None, int | None
 
 
 def _ydl_download(url: str, outtmpl: str) -> tuple[str | None, int | None, int | None]:
-    """
-    Скачивает видео TikTok и возвращает (ID, width, height).
-    Размеры берём из info-dict, чтобы передать их в send_video: иначе
-    Telegram угадывает соотношение сторон по метаданным контейнера и
-    растягивает видео (особенно при кривом rotation-флаге TikTok).
-    Запускать через run_in_executor — блокирующий вызов.
-    """
+    """Скачивает видео TikTok, возвращает (ID, width, height)."""
     # noinspection SpellCheckingInspection
     opts: dict[str, object] = {
         "outtmpl": outtmpl,  # cspell:disable-line
         "quiet": True,
         "no_warnings": True,
-        # Если мёрдж всё-таки случится — складываем в mp4, а не в .mkv:
-        # Telegram криво читает метаданные mkv и ломает aspect ratio.
-        "merge_output_format": "mp4",
-        # Жёстко предпочитаем H.264. У TikTok самый качественный mp4 — это
-        # H.265/HEVC (bytevc1_720p), а плеер Telegram HEVC не тянет: видео
-        # идёт без звука или не проигрывается. Поэтому:
-        #   1) лучший готовый H.264 mp4 со звуком (обычно есть, ffmpeg не нужен);
-        #   2) иначе — склейка H.264-видео + аудио (нужен ffmpeg);
-        #   3) крайний случай — что есть вообще.
-        "format": "best[vcodec^=h264]/bestvideo[vcodec^=h264]+bestaudio/best",
+        # Только H.264: HEVC (самый качественный mp4 у TikTok) Telegram играет
+        # без звука. Форматы TikTok — готовые muxed-файлы, ffmpeg не нужен.
+        "format": "best[vcodec^=h264]/best[vcodec!*=265][vcodec!*=hev]/best",
     }
     with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore[arg-type]
         info = ydl.extract_info(url, download=True)
@@ -107,22 +85,12 @@ async def _deliver_video(
     width: int | None = None,
     height: int | None = None,
 ) -> str | None:
-    """
-    Доставляет видео пользователю одним из двух способов:
-
-    • Если inline_message_id задан — редактируем то самое сообщение в чате,
-      заменяя текст «⏳ Загружается…» на готовое видео.
-    • Иначе — обычный send_video в chat_id.
-
-    Возвращает Telegram file_id (для кеша) или None при ошибке.
-    """
-    # ── Inline-режим: редактируем сообщение в чате через file_id из Storage ──
+    """Отправляет видео пользователю, возвращает file_id для кеша (или None)."""
+    # Inline-режим: редактируем сообщение через file_id из Storage
     if inline_message_id:
         if not file_id:
-            # Чаще всего: STORAGE_CHAT_ID не настроен, а через inline-режим
-            # отправить FSInputFile нельзя — нет chat_id с реальным правом upload.
-            # Заменяем плейсхолдер «⏳ Скачиваю…» на сообщение об ошибке,
-            # иначе он висит у пользователя вечно.
+            # Без file_id в inline-режиме залить файл нельзя — меняем
+            # плейсхолдер на ошибку, иначе он висит вечно.
             logging.warning("inline_message_id есть, но file_id отсутствует — пропускаем")
             try:
                 await bot.edit_message_text(
@@ -141,7 +109,7 @@ async def _deliver_video(
             logging.warning("edit_message_media failed: %s", e)
         return file_id
 
-    # ── Обычный режим: send_video в чат ──────────────────────────────────────
+    # Обычный режим: send_video в чат
     if file_id:
         await bot.send_video(chat_id=chat_id, video=file_id)
         return file_id
@@ -160,6 +128,7 @@ async def _deliver_video(
 
 
 async def process_queue(bot: Bot) -> None:
+    """Фоновый цикл обработки очереди загрузок."""
     while True:
         async with SessionLocal() as session:
             stmt = select(DownloadQueue).order_by(DownloadQueue.id).limit(1)
@@ -184,10 +153,10 @@ async def process_queue(bot: Bot) -> None:
             try:
                 loop = asyncio.get_running_loop()
 
-                # ── 1. Получаем ID видео TikTok ───────────────────────────────────
+                # 1. ID видео TikTok
                 tiktok_id = await loop.run_in_executor(None, _get_tiktok_id, tiktok_link)
 
-                # ── 2. Проверяем кеш ──────────────────────────────────────────────
+                # 2. Проверяем кеш
                 if tiktok_id:
                     cache_res = await session.execute(
                         select(VideoCache).where(VideoCache.tiktok_id == tiktok_id)
@@ -203,7 +172,7 @@ async def process_queue(bot: Bot) -> None:
                         await session.commit()
                         continue
 
-                # ── 3. Кеша нет — скачиваем ──────────────────────────────────────
+                # 3. Скачиваем
                 outtmpl = str(VIDEO_DIR / f"{filename}.%(ext)s")  # cspell:disable-line
                 downloaded_id, width, height = await loop.run_in_executor(
                     None, _ydl_download, tiktok_link, outtmpl
@@ -218,7 +187,7 @@ async def process_queue(bot: Bot) -> None:
                     raise FileNotFoundError(f"Файл после загрузки не найден: {filename}")
                 video_path = matches[0]
 
-                # ── 4. Отправляем в Storage-канал (если настроен) ────────────────
+                # 4. Отправляем в Storage-канал
                 file_id: str | None = None
                 storage_message_id: int | None = None
 
@@ -240,7 +209,7 @@ async def process_queue(bot: Bot) -> None:
                     except (TelegramBadRequest, TelegramForbiddenError) as e:
                         logging.warning("Не удалось отправить в Storage-канал: %s", e)
 
-                # ── 5. Доставляем видео (inline или обычный режим) ────────────────
+                # 5. Доставляем видео
                 result_file_id = await _deliver_video(
                     bot, chat_id, inline_message_id,
                     file_id=file_id, video_path=video_path,
@@ -249,7 +218,7 @@ async def process_queue(bot: Bot) -> None:
                 if result_file_id and not file_id:
                     file_id = result_file_id  # сохраним для кеша
 
-                # ── 6. Удаляем локальный файл и кешируем ─────────────────────────
+                # 6. Удаляем файл и кешируем
                 os.remove(video_path)
 
                 if final_id and file_id:
@@ -263,8 +232,7 @@ async def process_queue(bot: Bot) -> None:
                 await session.commit()
 
             except (TelegramBadRequest, TelegramForbiddenError) as e:
-                # Бот удалён из чата, сообщение недоступно, или видео слишком
-                # большое для Bot API (50 МБ лимит). Уведомляем пользователя.
+                # Чат недоступен или видео > 50 МБ (лимит Bot API).
                 logging.warning("Telegram delivery error for chat %s: %s", chat_id, e)
                 for f in VIDEO_DIR.glob(f"{filename}.*"):
                     os.remove(f)
@@ -289,10 +257,8 @@ async def process_queue(bot: Bot) -> None:
 
             except Exception:
                 logging.exception("Ошибка загрузки: chat=%s url=%s", chat_id, tiktok_link)
-                # Сбрасываем сессию: исходная ошибка могла прилететь от
-                # SQLAlchemy (например, IntegrityError на UNIQUE(tiktok_id)
-                # при гонке двух одинаковых ссылок) и инвалидировать сессию —
-                # тогда delete+commit ниже упадут с PendingRollbackError.
+                # Ошибка могла инвалидировать сессию — без rollback
+                # delete+commit ниже упадут с PendingRollbackError.
                 await session.rollback()
                 for f in VIDEO_DIR.glob(f"{filename}.*"):
                     os.remove(f)
