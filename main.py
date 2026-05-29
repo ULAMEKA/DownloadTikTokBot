@@ -5,13 +5,9 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
-from sqlalchemy import text
-
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from db.base import Base
-from db.session import engine
 from handlers.link import link
 from middleware.db_session import DBSessionMiddleware
 from routers.command_router import commands_router
@@ -30,7 +26,9 @@ dp.chosen_inline_result.middleware(DBSessionMiddleware())
 
 
 async def main():
-    await on_startup()
+    # Схему БД создаёт отдельный скрипт init_db.py — запусти его вручную
+    # перед первым стартом (или после изменения схемы). Здесь таблицы
+    # считаются уже существующими.
     await bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(process_queue(bot))
     dp.include_routers(
@@ -39,27 +37,6 @@ async def main():
         inline_router,
     )
     await dp.start_polling(bot)
-
-
-async def on_startup():
-    async with engine.begin() as conn:
-        # Миграция VideoCache: если колонка tiktok_id отсутствует — пересоздаём таблицу.
-        try:
-            await conn.execute(text("SELECT tiktok_id FROM VideoCache LIMIT 1"))
-        except Exception:  # noqa: BLE001
-            await conn.execute(text("DROP TABLE IF EXISTS VideoCache"))
-            logging.info("VideoCache: старая схема обнаружена, таблица пересоздана")
-
-        # Миграция DownloadQueue: добавляем inline_message_id если ещё нет.
-        try:
-            await conn.execute(text("SELECT inline_message_id FROM BotDownloadQueue LIMIT 1"))
-        except Exception:  # noqa: BLE001
-            await conn.execute(text(
-                "ALTER TABLE BotDownloadQueue ADD COLUMN inline_message_id TEXT"
-            ))
-            logging.info("BotDownloadQueue: добавлена колонка inline_message_id")
-
-        await conn.run_sync(Base.metadata.create_all)
 
 
 if __name__ == '__main__':
