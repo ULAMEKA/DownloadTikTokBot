@@ -5,20 +5,15 @@ import re
 from pathlib import Path
 
 import yt_dlp
-from aiogram import Bot, html
+from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.types import (
-    FSInputFile,
-    InputMediaVideo,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from aiogram.types import FSInputFile, InputMediaVideo
 from sqlalchemy import select
 
 from db.session import SessionLocal
 from db.models import DownloadQueue, VideoCache
-from promo import PROMO_MESSAGE_HTML
+from caption import build_caption, source_button
 
 BASE_DIR = Path(__file__).parent
 PARENT_DIR = BASE_DIR.parent
@@ -30,54 +25,6 @@ STORAGE_CHAT_ID: str | None = os.getenv("STORAGE_CHAT_ID")
 
 # Regex для извлечения ID видео из полного URL TikTok
 _TIKTOK_ID_RE = re.compile(r'/video/(\d+)')
-
-# Лимит длины подписи в Telegram. Держим запас под промо/ссылку и
-# особенности подсчёта (эмодзи в UTF-16, html-теги в видимую длину не входят).
-CAPTION_LIMIT = 1024
-
-
-def _normalize_url(url: str) -> str:
-    """Гарантирует схему — иначе URL-кнопка/ссылка невалидны для Telegram."""
-    url = url.strip()
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
-    return url
-
-
-def _source_link(url: str) -> str:
-    """HTML-ссылка «Ссылка на источник» на оригинальное видео в TikTok."""
-    return f'🔗 <a href="{html.quote(_normalize_url(url))}">Ссылка на источник</a>'
-
-
-def _build_caption(
-    description: str | None,
-    source_url: str | None,
-    *,
-    with_source: bool,
-) -> str:
-    """Подпись под видео: описание ролика (если есть) + [ссылка] + промо.
-
-    with_source=False для inline-режима — там источник вынесен в кнопку,
-    поэтому ссылку в текст не добавляем. Разметка — HTML.
-    """
-    tail_parts: list[str] = []
-    if with_source and source_url:
-        tail_parts.append(_source_link(source_url))
-    tail_parts.append(PROMO_MESSAGE_HTML)
-    tail = "\n\n".join(tail_parts)
-
-    desc = (description or "").strip()
-    if not desc:
-        return tail
-
-    # Бюджет под описание: лимит минус хвост и запас. Режем по сырому
-    # тексту (до html.quote), чтобы не разорвать html-сущность вроде &amp;.
-    budget = CAPTION_LIMIT - len(tail) - 30
-    if budget <= 0:
-        return tail
-    if len(desc) > budget:
-        desc = desc[:budget - 1].rstrip() + "…"
-    return f"{html.quote(desc)}\n\n{tail}"
 
 
 def _get_tiktok_id(url: str) -> str | None:
@@ -160,20 +107,13 @@ async def _deliver_video(
                 pass
             return None
         # Источник — кнопкой: остаётся под видео и ведёт на оригинал в TikTok.
-        markup = None
-        if source_url:
-            markup = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(
-                    text="🔗 Ссылка на источник",
-                    url=_normalize_url(source_url),
-                )
-            ]])
+        markup = source_button(source_url) if source_url else None
         try:
             await bot.edit_message_media(
                 inline_message_id=inline_message_id,
                 media=InputMediaVideo(
                     media=file_id,
-                    caption=_build_caption(description, source_url, with_source=False),
+                    caption=build_caption(description, source_url, with_source=False),
                     parse_mode=ParseMode.HTML,
                 ),
                 reply_markup=markup,
@@ -183,7 +123,7 @@ async def _deliver_video(
         return file_id
 
     # Обычный режим: send_video в чат. Источник — кликабельным текстом в подписи.
-    caption = _build_caption(description, source_url, with_source=True)
+    caption = build_caption(description, source_url, with_source=True)
     if file_id:
         await bot.send_video(
             chat_id=chat_id,

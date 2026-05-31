@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import DownloadQueue, VideoCache
 from promo import PROMO_MESSAGE_HTML
+from caption import build_caption, source_button
 
 inline_router = Router()
 
@@ -61,6 +62,11 @@ async def handle_inline_query(query: InlineQuery, session: AsyncSession):
                         id="cached",
                         video_file_id=cached.file_id,
                         title="TikTok видео",
+                        # Подпись и кнопка-источник — как при обычной доставке,
+                        # иначе из кеша видео уходит без ссылки на оригинал.
+                        caption=build_caption(cached.description, url, with_source=False),
+                        parse_mode="HTML",
+                        reply_markup=source_button(url),
                     )
                 ],
                 cache_time=3600,
