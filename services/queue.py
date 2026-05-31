@@ -5,13 +5,20 @@ import re
 from pathlib import Path
 
 import yt_dlp
-from aiogram import Bot
+from aiogram import Bot, html
+from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.types import FSInputFile, InputMediaVideo
+from aiogram.types import (
+    FSInputFile,
+    InputMediaVideo,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from sqlalchemy import select
 
 from db.session import SessionLocal
 from db.models import DownloadQueue, VideoCache
+from promo import PROMO_MESSAGE_HTML
 
 BASE_DIR = Path(__file__).parent
 PARENT_DIR = BASE_DIR.parent
@@ -23,6 +30,54 @@ STORAGE_CHAT_ID: str | None = os.getenv("STORAGE_CHAT_ID")
 
 # Regex для извлечения ID видео из полного URL TikTok
 _TIKTOK_ID_RE = re.compile(r'/video/(\d+)')
+
+# Лимит длины подписи в Telegram. Держим запас под промо/ссылку и
+# особенности подсчёта (эмодзи в UTF-16, html-теги в видимую длину не входят).
+CAPTION_LIMIT = 1024
+
+
+def _normalize_url(url: str) -> str:
+    """Гарантирует схему — иначе URL-кнопка/ссылка невалидны для Telegram."""
+    url = url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return url
+
+
+def _source_link(url: str) -> str:
+    """HTML-ссылка «Ссылка на источник» на оригинальное видео в TikTok."""
+    return f'🔗 <a href="{html.quote(_normalize_url(url))}">Ссылка на источник</a>'
+
+
+def _build_caption(
+    description: str | None,
+    source_url: str | None,
+    *,
+    with_source: bool,
+) -> str:
+    """Подпись под видео: описание ролика (если есть) + [ссылка] + промо.
+
+    with_source=False для inline-режима — там источник вынесен в кнопку,
+    поэтому ссылку в текст не добавляем. Разметка — HTML.
+    """
+    tail_parts: list[str] = []
+    if with_source and source_url:
+        tail_parts.append(_source_link(source_url))
+    tail_parts.append(PROMO_MESSAGE_HTML)
+    tail = "\n\n".join(tail_parts)
+
+    desc = (description or "").strip()
+    if not desc:
+        return tail
+
+    # Бюджет под описание: лимит минус хвост и запас. Режем по сырому
+    # тексту (до html.quote), чтобы не разорвать html-сущность вроде &amp;.
+    budget = CAPTION_LIMIT - len(tail) - 30
+    if budget <= 0:
+        return tail
+    if len(desc) > budget:
+        desc = desc[:budget - 1].rstrip() + "…"
+    return f"{html.quote(desc)}\n\n{tail}"
 
 
 def _get_tiktok_id(url: str) -> str | None:
@@ -56,8 +111,8 @@ def _extract_dimensions(info: dict[str, object]) -> tuple[int | None, int | None
     return None, None
 
 
-def _ydl_download(url: str, outtmpl: str) -> tuple[str | None, int | None, int | None]:
-    """Скачивает видео TikTok, возвращает (ID, width, height)."""
+def _ydl_download(url: str, outtmpl: str) -> tuple[str | None, int | None, int | None, str | None]:
+    """Скачивает видео TikTok, возвращает (ID, width, height, description)."""
     # noinspection SpellCheckingInspection
     opts: dict[str, object] = {
         "outtmpl": outtmpl,  # cspell:disable-line
@@ -70,10 +125,12 @@ def _ydl_download(url: str, outtmpl: str) -> tuple[str | None, int | None, int |
     with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore[arg-type]
         info = ydl.extract_info(url, download=True)
         if not info:
-            return None, None, None
+            return None, None, None, None
         vid = str(info["id"]) if info.get("id") else None
         width, height = _extract_dimensions(info)
-        return vid, width, height
+        raw_desc = info.get("description")
+        description = str(raw_desc) if raw_desc else None
+        return vid, width, height, description
 
 
 async def _deliver_video(
@@ -84,6 +141,8 @@ async def _deliver_video(
     video_path: Path | None,
     width: int | None = None,
     height: int | None = None,
+    description: str | None = None,
+    source_url: str | None = None,
 ) -> str | None:
     """Отправляет видео пользователю, возвращает file_id для кеша (или None)."""
     # Inline-режим: редактируем сообщение через file_id из Storage
@@ -100,18 +159,38 @@ async def _deliver_video(
             except (TelegramBadRequest, TelegramForbiddenError):
                 pass
             return None
+        # Источник — кнопкой: остаётся под видео и ведёт на оригинал в TikTok.
+        markup = None
+        if source_url:
+            markup = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="🔗 Ссылка на источник",
+                    url=_normalize_url(source_url),
+                )
+            ]])
         try:
             await bot.edit_message_media(
                 inline_message_id=inline_message_id,
-                media=InputMediaVideo(media=file_id),
+                media=InputMediaVideo(
+                    media=file_id,
+                    caption=_build_caption(description, source_url, with_source=False),
+                    parse_mode=ParseMode.HTML,
+                ),
+                reply_markup=markup,
             )
         except (TelegramBadRequest, TelegramForbiddenError) as e:
             logging.warning("edit_message_media failed: %s", e)
         return file_id
 
-    # Обычный режим: send_video в чат
+    # Обычный режим: send_video в чат. Источник — кликабельным текстом в подписи.
+    caption = _build_caption(description, source_url, with_source=True)
     if file_id:
-        await bot.send_video(chat_id=chat_id, video=file_id)
+        await bot.send_video(
+            chat_id=chat_id,
+            video=file_id,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+        )
         return file_id
 
     if video_path:
@@ -120,6 +199,8 @@ async def _deliver_video(
             video=FSInputFile(str(video_path)),
             width=width,
             height=height,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
         )
         if msg.video:
             return msg.video.file_id
@@ -167,6 +248,7 @@ async def process_queue(bot: Bot) -> None:
                         await _deliver_video(
                             bot, chat_id, inline_message_id,
                             file_id=cached.file_id, video_path=None,
+                            description=cached.description, source_url=tiktok_link,
                         )
                         await session.delete(item)
                         await session.commit()
@@ -174,7 +256,7 @@ async def process_queue(bot: Bot) -> None:
 
                 # 3. Скачиваем
                 outtmpl = str(VIDEO_DIR / f"{filename}.%(ext)s")  # cspell:disable-line
-                downloaded_id, width, height = await loop.run_in_executor(
+                downloaded_id, width, height, description = await loop.run_in_executor(
                     None, _ydl_download, tiktok_link, outtmpl
                 )
 
@@ -214,6 +296,7 @@ async def process_queue(bot: Bot) -> None:
                     bot, chat_id, inline_message_id,
                     file_id=file_id, video_path=video_path,
                     width=width, height=height,
+                    description=description, source_url=tiktok_link,
                 )
                 if result_file_id and not file_id:
                     file_id = result_file_id  # сохраним для кеша
@@ -226,6 +309,7 @@ async def process_queue(bot: Bot) -> None:
                         tiktok_id=final_id,
                         file_id=file_id,
                         storage_message_id=storage_message_id,
+                        description=description,
                     ))
 
                 await session.delete(item)

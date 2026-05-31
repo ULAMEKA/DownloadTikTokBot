@@ -48,6 +48,16 @@ async def init_db() -> None:
         # 4. Повторный create_all пересоздаёт VideoCache, если миграция её удалила.
         await conn.run_sync(Base.metadata.create_all)
 
+        # 5. Миграция VideoCache: добавляем description, если колонки ещё нет
+        #    (БД, созданная до появления подписи-описания под видео).
+        try:
+            await conn.execute(text("SELECT description FROM VideoCache LIMIT 1"))
+        except Exception:  # noqa: BLE001
+            await conn.execute(text(
+                "ALTER TABLE VideoCache ADD COLUMN description TEXT"
+            ))
+            logging.info("VideoCache: добавлена колонка description")
+
     await engine.dispose()
 
 

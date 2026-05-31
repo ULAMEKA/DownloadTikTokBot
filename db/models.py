@@ -19,3 +19,4 @@ class VideoCache(Base):
     tiktok_id = Column(String, unique=True, index=True)   # ID видео TikTok (не URL)
     file_id = Column(String)                               # Telegram file_id для быстрой пересылки
     storage_message_id = Column(Integer)                   # ID сообщения в Storage-канале
+    description = Column(String, nullable=True)            # Описание ролика для подписи под видео
