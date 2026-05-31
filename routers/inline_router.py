@@ -16,6 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import DownloadQueue, VideoCache
+from promo import PROMO_MESSAGE_HTML
 
 inline_router = Router()
 
@@ -78,8 +79,7 @@ async def handle_inline_query(query: InlineQuery, session: AsyncSession):
                 input_message_content=InputTextMessageContent(
                     message_text=(
                         "⏳ <b>Скачиваю TikTok видео…</b>\n\n"
-                        "💡 В любом чате введите: <code>@dwllttbot *ссылка*</code> — "
-                        "и видео отправится прямо в чат"
+                        f"{PROMO_MESSAGE_HTML}"
                     ),
                     parse_mode="HTML",
                 ),

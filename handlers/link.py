@@ -15,6 +15,7 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import DownloadQueue
+from promo import PROMO_MESSAGE
 
 link = Router()
 
@@ -48,8 +49,7 @@ async def handle_tiktok_link_private(message: Message, session: AsyncSession):
 
     await message.answer(
         f"Вы добавлены в очередь\\! Ваша позиция: *{position}*\n\n"
-        f"💡 В любом чате введите: `@dwllttbot *ссылка*` — "
-        f"и видео отправится прямо в чат",
+        f"{PROMO_MESSAGE}",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 
@@ -71,8 +71,7 @@ async def handle_tiktok_link_group(message: Message):
     try:
         await message.reply(
             "Нажмите кнопку, чтобы загрузить видео\\.\n\n"
-            "💡 В любом чате введите: `@dwllttbot *ссылка*` — "
-            "и видео отправится прямо в чат",
+            f"{PROMO_MESSAGE}",
             reply_markup=keyboard,
             parse_mode=ParseMode.MARKDOWN_V2,
         )
@@ -116,8 +115,7 @@ async def handle_download_callback(callback: CallbackQuery, session: AsyncSessio
     try:
         await callback.message.edit_text(
             f"✅ Добавлено в очередь\\! Позиция: *{position}*\n\n"
-            f"💡 В любом чате введите: `@dwllttbot *ссылка*` — "
-            f"и видео отправится прямо в чат",
+            f"{PROMO_MESSAGE}",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
     except TelegramBadRequest:
