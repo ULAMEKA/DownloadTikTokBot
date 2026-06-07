@@ -1,6 +1,3 @@
-import re
-import uuid
-
 from aiogram import Router, F
 from aiogram.types import (
     CallbackQuery,
@@ -8,21 +5,19 @@ from aiogram.types import (
     InlineQueryResultArticle,
     InlineQueryResultCachedVideo,
     InputTextMessageContent,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
     ChosenInlineResult,
 )
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import DownloadQueue, VideoCache
-from promo import PROMO_MESSAGE_HTML
-from caption import build_caption, source_button
+from db.models import VideoCache
+from services.queue import enqueue_download
+from ui.caption import build_caption
+from ui.keyboards import source_button, loading_placeholder
+from ui.promo import PROMO_MESSAGE_HTML
+from utils.links import find_video_url, media_key
 
 inline_router = Router()
-
-_TIKTOK_URL_RE = re.compile(r'(https?://)?(www\.|vm\.|vt\.)?tiktok\.com/\S+')
-_TIKTOK_ID_RE  = re.compile(r'/video/(\d+)')
 
 
 @inline_router.inline_query()
@@ -39,20 +34,16 @@ async def handle_inline_query(query: InlineQuery, session: AsyncSession):
           в событии ChosenInlineResult — через него очередь потом
           отредактирует сообщение и вставит видео прямо в чат.
     """
-    text = query.query.strip()
-
-    m_url = _TIKTOK_URL_RE.search(text)
-    if not m_url:
+    url = find_video_url(query.query.strip())
+    if not url:
         await query.answer([], cache_time=5)
         return
 
-    url = m_url.group(0)
-
     # ── Быстрая проверка кеша (только regex, без yt-dlp) ─────────────────────
-    m_id = _TIKTOK_ID_RE.search(url)
-    if m_id:
+    key = media_key(url)
+    if key:
         cache_res = await session.execute(
-            select(VideoCache).where(VideoCache.tiktok_id == m_id.group(1))
+            select(VideoCache).where(VideoCache.media_id == key)
         )
         cached = cache_res.scalar()
         if cached and cached.file_id:
@@ -61,7 +52,7 @@ async def handle_inline_query(query: InlineQuery, session: AsyncSession):
                     InlineQueryResultCachedVideo(
                         id="cached",
                         video_file_id=cached.file_id,
-                        title="TikTok видео",
+                        title="Видео",
                         # Подпись и кнопка-источник — как при обычной доставке,
                         # иначе из кеша видео уходит без ссылки на оригинал.
                         caption=build_caption(cached.description, url, with_source=False),
@@ -84,14 +75,12 @@ async def handle_inline_query(query: InlineQuery, session: AsyncSession):
                 description="Видео появится прямо в этом чате",
                 input_message_content=InputTextMessageContent(
                     message_text=(
-                        "⏳ <b>Скачиваю TikTok видео…</b>\n\n"
+                        "⏳ <b>Скачиваю видео…</b>\n\n"
                         f"{PROMO_MESSAGE_HTML}"
                     ),
                     parse_mode="HTML",
                 ),
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="⏳ Загружается…", callback_data="inline_loading")
-                ]]),
+                reply_markup=loading_placeholder(),
             )
         ],
         cache_time=0,   # не кешировать — статус может смениться
@@ -107,20 +96,16 @@ async def chosen_download(result: ChosenInlineResult, session: AsyncSession):
     chat_id = user_id нужен как fallback (например, для получения file_id
     без Storage-канала).
     """
-    m_url = _TIKTOK_URL_RE.search(result.query)
-    if not m_url:
+    url = find_video_url(result.query)
+    if not url:
         return
 
-    url = m_url.group(0)
-
-    queue_item = DownloadQueue(
+    await enqueue_download(
+        session,
         chat_id=str(result.from_user.id),      # PM пользователя (fallback)
-        filename=str(uuid.uuid4()),
-        tiktok_link=url,
+        source_url=url,
         inline_message_id=result.inline_message_id,  # ID сообщения в чате
     )
-    session.add(queue_item)
-    await session.commit()
 
 
 @inline_router.callback_query(F.data == "inline_loading")
