@@ -23,40 +23,31 @@ async def init_db() -> None:
     async with engine.begin() as conn:
         # 1. Создаём недостающие таблицы по текущим моделям. На чистой БД они
         #    появятся сразу с актуальной схемой, и миграции ниже станут no-op.
-        #    На существующей БД create_all не трогает уже созданные таблицы —
-        #    их донастраивают миграции (ALTER идёт по реально существующей
-        #    таблице, а не падает с "no such table").
+        #    На существующей БД create_all не трогает уже созданные таблицы.
         await conn.run_sync(Base.metadata.create_all)
 
-        # 2. Миграция VideoCache: если колонки tiktok_id нет (старая схема) —
-        #    удаляем таблицу, чтобы пересоздать её в шаге 4.
+        # 2. Миграция VideoCache: ключ кеша теперь композитный (media_id =
+        #    "<платформа>:<id>" вместо голого tiktok_id). Старые значения
+        #    несовместимы, а это просто кеш — пересоздаём таблицу, если колонки
+        #    media_id ещё нет (шаг 4 создаст её заново уже с актуальной схемой).
         try:
-            await conn.execute(text("SELECT tiktok_id FROM VideoCache LIMIT 1"))
+            await conn.execute(text("SELECT media_id FROM VideoCache LIMIT 1"))
         except Exception:  # noqa: BLE001
             await conn.execute(text("DROP TABLE IF EXISTS VideoCache"))
             logging.info("VideoCache: старая схема обнаружена, таблица удалена для пересоздания")
 
-        # 3. Миграция DownloadQueue: добавляем inline_message_id если его ещё нет.
+        # 3. Миграция DownloadQueue: переименовать tiktok_link → source_url,
+        #    сохранив записи очереди (бот теперь качает не только TikTok).
         try:
-            await conn.execute(text("SELECT inline_message_id FROM BotDownloadQueue LIMIT 1"))
+            await conn.execute(text("SELECT source_url FROM BotDownloadQueue LIMIT 1"))
         except Exception:  # noqa: BLE001
             await conn.execute(text(
-                "ALTER TABLE BotDownloadQueue ADD COLUMN inline_message_id TEXT"
+                "ALTER TABLE BotDownloadQueue RENAME COLUMN tiktok_link TO source_url"
             ))
-            logging.info("BotDownloadQueue: добавлена колонка inline_message_id")
+            logging.info("BotDownloadQueue: колонка tiktok_link переименована в source_url")
 
-        # 4. Повторный create_all пересоздаёт VideoCache, если миграция её удалила.
+        # 4. Повторный create_all пересоздаёт VideoCache, если шаг 2 её удалил.
         await conn.run_sync(Base.metadata.create_all)
-
-        # 5. Миграция VideoCache: добавляем description, если колонки ещё нет
-        #    (БД, созданная до появления подписи-описания под видео).
-        try:
-            await conn.execute(text("SELECT description FROM VideoCache LIMIT 1"))
-        except Exception:  # noqa: BLE001
-            await conn.execute(text(
-                "ALTER TABLE VideoCache ADD COLUMN description TEXT"
-            ))
-            logging.info("VideoCache: добавлена колонка description")
 
     await engine.dispose()
 

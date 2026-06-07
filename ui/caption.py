@@ -6,9 +6,8 @@ routers/inline_router.py (мгновенная отдача из кеша) ст�
 """
 
 from aiogram import html
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-from promo import PROMO_MESSAGE_HTML
+from ui.promo import PROMO_MESSAGE_HTML
 
 # Лимит длины подписи в Telegram. Держим запас под промо/ссылку и
 # особенности подсчёта (эмодзи в UTF-16, html-теги в видимую длину не входят).
@@ -24,15 +23,8 @@ def normalize_url(url: str) -> str:
 
 
 def source_link(url: str) -> str:
-    """HTML-ссылка «Ссылка на источник» на оригинальное видео в TikTok."""
+    """HTML-ссылка «Ссылка на источник» на оригинальное видео."""
     return f'🔗 <a href="{html.quote(normalize_url(url))}">Ссылка на источник</a>'
-
-
-def source_button(url: str) -> InlineKeyboardMarkup:
-    """Кнопка «Ссылка на источник» — для inline-режима (текст-ссылку не вставляем)."""
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🔗 Ссылка на источник", url=normalize_url(url))
-    ]])
 
 
 def build_caption(

@@ -1,20 +1,17 @@
 import asyncio
 import logging
-import os
-
-from dotenv import load_dotenv
-load_dotenv()
 
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
+from config import TOKEN
 from handlers.link import link
 from middleware.db_session import DBSessionMiddleware
 from routers.command_router import commands_router
 from routers.inline_router import inline_router
 from services.queue import process_queue
 
-bot = Bot(token=os.getenv('TOKEN'))  # type: ignore[arg-type]
+bot = Bot(token=TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
