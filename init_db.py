@@ -45,6 +45,14 @@ async def init_db() -> None:
             ))
             logging.info("BotDownloadQueue: добавлена колонка inline_message_id")
 
+        try:
+            await conn.execute(text("SELECT reply_to_message_id FROM BotDownloadQueue LIMIT 1"))
+        except Exception:  # noqa: BLE001
+            await conn.execute(text(
+                "ALTER TABLE BotDownloadQueue ADD COLUMN reply_to_message_id INTEGER"
+            ))
+            logging.info("BotDownloadQueue: добавлена колонка reply_to_message_id")
+
         # 4. Повторный create_all пересоздаёт VideoCache, если миграция её удалила.
         await conn.run_sync(Base.metadata.create_all)
 

@@ -1,4 +1,3 @@
-import re
 import uuid
 
 from aiogram import Router, F
@@ -6,99 +5,62 @@ from aiogram.types import (
     CallbackQuery,
     InlineQuery,
     InlineQueryResultArticle,
-    InlineQueryResultCachedVideo,
     InputTextMessageContent,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     ChosenInlineResult,
 )
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import DownloadQueue, VideoCache
+from db.models import DownloadQueue
 from promo import PROMO_MESSAGE_HTML
-from caption import build_caption, source_button
+from utils.links import SUPPORTED_URL_RE
 
 inline_router = Router()
 
-_TIKTOK_URL_RE = re.compile(r'(https?://)?(www\.|vm\.|vt\.)?tiktok\.com/\S+')
-_TIKTOK_ID_RE  = re.compile(r'/video/(\d+)')
-
 
 @inline_router.inline_query()
-async def handle_inline_query(query: InlineQuery, session: AsyncSession):
-    """
-    Отвечает мгновенно — никогда не ждём загрузки внутри хендлера.
-
-    Сценарий A (кеш есть):
-        → InlineQueryResultCachedVideo: Telegram сам шлёт видео в чат.
-
-    Сценарий Б (кеша нет):
-        → InlineQueryResultArticle «⏳ Загружается…» с кнопкой.
-          Кнопка нужна, чтобы Telegram вернул inline_message_id
-          в событии ChosenInlineResult — через него очередь потом
-          отредактирует сообщение и вставит видео прямо в чат.
-    """
+async def handle_inline_query(query: InlineQuery):
     text = query.query.strip()
 
-    m_url = _TIKTOK_URL_RE.search(text)
-    if not m_url:
+    if not SUPPORTED_URL_RE.search(text):
         await query.answer([], cache_time=5)
         return
 
-    url = m_url.group(0)
-
-    # ── Быстрая проверка кеша (только regex, без yt-dlp) ─────────────────────
-    m_id = _TIKTOK_ID_RE.search(url)
-    if m_id:
-        cache_res = await session.execute(
-            select(VideoCache).where(VideoCache.tiktok_id == m_id.group(1))
-        )
-        cached = cache_res.scalar()
-        if cached and cached.file_id:
-            await query.answer(
-                results=[
-                    InlineQueryResultCachedVideo(
-                        id="cached",
-                        video_file_id=cached.file_id,
-                        title="TikTok видео",
-                        # Подпись и кнопка-источник — как при обычной доставке,
-                        # иначе из кеша видео уходит без ссылки на оригинал.
-                        caption=build_caption(cached.description, url, with_source=False),
-                        parse_mode="HTML",
-                        reply_markup=source_button(url),
-                    )
-                ],
-                cache_time=3600,
-            )
-            return
-
-    # ── Кеша нет: статья-заглушка; реальная загрузка — через chosen_inline_result ──
-    # reply_markup обязателен: только при наличии кнопки Telegram
-    # возвращает inline_message_id в ChosenInlineResult.
+    content = InputTextMessageContent(
+        message_text=(
+            "⏳ <b>Скачиваю видео…</b>\n\n"
+            f"{PROMO_MESSAGE_HTML}"
+        ),
+        parse_mode="HTML",
+    )
+    markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="⏳ Загружается…", callback_data="inline_loading")
+    ]])
     await query.answer(
         results=[
             InlineQueryResultArticle(
                 id="download",
-                title="📥 Загрузить видео",
-                description="Видео появится прямо в этом чате",
-                input_message_content=InputTextMessageContent(
-                    message_text=(
-                        "⏳ <b>Скачиваю TikTok видео…</b>\n\n"
-                        f"{PROMO_MESSAGE_HTML}"
-                    ),
-                    parse_mode="HTML",
-                ),
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="⏳ Загружается…", callback_data="inline_loading")
-                ]]),
-            )
+                title="📤 Отправить",
+                description="Отправить видео без спойлера",
+                input_message_content=content,
+                reply_markup=markup,
+            ),
+            InlineQueryResultArticle(
+                id="download_spoiler",
+                title="🙈 Отправить под спойлером",
+                description="Скрыть видео до нажатия",
+                input_message_content=content,
+                reply_markup=markup,
+            ),
         ],
-        cache_time=0,   # не кешировать — статус может смениться
+        cache_time=0,
     )
 
 
-@inline_router.chosen_inline_result(F.result_id == "download")
+@inline_router.chosen_inline_result(
+    (F.result_id == "download") | (F.result_id == "download_spoiler")
+)
 async def chosen_download(result: ChosenInlineResult, session: AsyncSession):
     """
     Срабатывает, когда пользователь выбрал «Загрузить».
@@ -107,17 +69,20 @@ async def chosen_download(result: ChosenInlineResult, session: AsyncSession):
     chat_id = user_id нужен как fallback (например, для получения file_id
     без Storage-канала).
     """
-    m_url = _TIKTOK_URL_RE.search(result.query)
+    m_url = SUPPORTED_URL_RE.search(result.query)
     if not m_url:
         return
 
     url = m_url.group(0)
+    inline_message_id = result.inline_message_id
+    if inline_message_id and result.result_id == "download_spoiler":
+        inline_message_id = f"spoiler:{inline_message_id}"
 
     queue_item = DownloadQueue(
         chat_id=str(result.from_user.id),      # PM пользователя (fallback)
         filename=str(uuid.uuid4()),
         tiktok_link=url,
-        inline_message_id=result.inline_message_id,  # ID сообщения в чате
+        inline_message_id=inline_message_id,
     )
     session.add(queue_item)
     await session.commit()

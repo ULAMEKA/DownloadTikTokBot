@@ -5,6 +5,8 @@ routers/inline_router.py (мгновенная отдача из кеша) ст�
 кнопку одинаково и не теряли ссылку на оригинал.
 """
 
+from urllib.parse import urlsplit, urlunsplit
+
 from aiogram import html
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -20,7 +22,8 @@ def normalize_url(url: str) -> str:
     url = url.strip()
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
-    return url
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
 def source_link(url: str) -> str:
@@ -63,4 +66,4 @@ def build_caption(
         return tail
     if len(desc) > budget:
         desc = desc[:budget - 1].rstrip() + "…"
-    return f"{html.quote(desc)}\n\n{tail}"
+    return f"<blockquote expandable>{html.quote(desc)}</blockquote>\n\n{tail}"

@@ -8,6 +8,14 @@
 
 # Юзернейм бота для inline-режима.
 BOT_USERNAME = "@dwlttbot"
+TELEGRAM_PROFILE = "@polarisim"
+AD_DISPLAY_SECONDS = 5
+
+AD_PLACEHOLDER_HTML = (
+    "<i>Здесь могла бы быть ваша реклама. Заказать - "
+    f'<b><a href="https://t.me/{TELEGRAM_PROFILE.removeprefix("@")}">'
+    "ссылка на профиль телеграм</a></b></i>"
+)
 
 # MarkdownV2-версия — handlers/link.py.
 PROMO_MESSAGE = (

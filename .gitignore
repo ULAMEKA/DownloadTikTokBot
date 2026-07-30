@@ -1,5 +1,9 @@
 .env
-.venv
+.venv/
 .idea/
+.ruff_cache/
+__pycache__/
+*.pyc
 DownloadTT.db
 bot.log
+videos/
