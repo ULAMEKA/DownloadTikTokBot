@@ -47,6 +47,10 @@ async def handle_video_link_private(message: Message):
                     callback_data=f"download:spoiler:{token}",
                 ),
             ],
+            [InlineKeyboardButton(
+                text="🙈 Без описания, под спойлером",
+                callback_data=f"download:no_description_spoiler:{token}",
+            )],
         ]),
     )
     asyncio.create_task(_expire_pending(token))
@@ -64,7 +68,7 @@ async def handle_download_option(callback: CallbackQuery, session: AsyncSession)
         return
     _, mode, token = parts
     pending = _pending.get(token)
-    if mode not in ("normal", "no_description", "spoiler") or pending is None:
+    if mode not in ("normal", "no_description", "spoiler", "no_description_spoiler") or pending is None:
         await callback.answer("Ссылка устарела. Отправьте её ещё раз.", show_alert=True)
         return
     if callback.from_user.id != pending[0]:

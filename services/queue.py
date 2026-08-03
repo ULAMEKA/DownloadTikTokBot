@@ -279,11 +279,15 @@ async def _deliver_video(
                 inline_message_id=inline_message_id,
                 media=InputMediaVideo(
                     media=file_id,
-                    caption=build_caption(
-                        None if without_description else description,
-                        source_url,
-                        with_source=True,
-                        has_spoiler=has_spoiler,
+                    caption=(
+                        None
+                        if without_description
+                        else build_caption(
+                            description,
+                            source_url,
+                            with_source=True,
+                            has_spoiler=has_spoiler,
+                        )
                     ),
                     parse_mode=ParseMode.HTML,
                     has_spoiler=has_spoiler,
@@ -295,11 +299,15 @@ async def _deliver_video(
         return file_id
 
     # Обычный режим: send_video в чат. Источник — кликабельным текстом в подписи.
-    caption = build_caption(
-        None if without_description else description,
-        source_url,
-        with_source=True,
-        has_spoiler=has_spoiler,
+    caption = (
+        None
+        if without_description
+        else build_caption(
+            description,
+            source_url,
+            with_source=True,
+            has_spoiler=has_spoiler,
+        )
     )
     if placeholder_message_id:
         ready_at = _placeholder_ready_at.get((chat_id, placeholder_message_id), 0)
@@ -393,8 +401,8 @@ async def process_queue(bot: Bot) -> None:
                 if inline_message_id and inline_message_id.startswith("direct:")
                 else None
             )
-            has_spoiler = direct_mode == "spoiler"
-            without_description = direct_mode == "no_description"
+            has_spoiler = direct_mode in ("spoiler", "no_description_spoiler")
+            without_description = direct_mode in ("no_description", "no_description_spoiler")
             if direct_mode:
                 inline_message_id = None
             elif inline_message_id:

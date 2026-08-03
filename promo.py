@@ -3,7 +3,11 @@
 from pathlib import Path
 
 AD_DISPLAY_SECONDS = 15
-BOT_PROMO_HTML = "💡 Используйте @dwlttbot для загрузки видео"
+BOT_USERNAME = "@dwlttbot"
+BOT_PROMO_HTML = (
+    f"💡 В любом чате введите: <code>{BOT_USERNAME} *ссылка*</code> — "
+    "и видео отправится прямо в чат"
+)
 TELEGRAM_PROFILE = "@polarisim"
 TELEGRAM_PROFILE_LINK = '<a href="tg://resolve?domain=polarisim">@polarisim</a>'
 AD_PLACEHOLDER_HTML = f"Здесь могла быть ваша реклама. Заказать - {TELEGRAM_PROFILE_LINK}"
