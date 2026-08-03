@@ -37,11 +37,19 @@ _TIKTOK_ID_RE = re.compile(r'/(?:video|photo)/(\d+)')
 
 _IMAGE_EXTENSIONS = {".avif", ".jpeg", ".jpg", ".png", ".webp"}
 _AUDIO_EXTENSIONS = {".aac", ".m4a", ".mp3", ".ogg", ".opus", ".wav"}
+_VIDEO_EXTENSIONS = {".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 _placeholder_ready_at: dict[tuple[str, int], float] = {}
+_inline_placeholder_ready_at: dict[str, float] = {}
 
 
 def hold_placeholder(chat_id: str, message_id: int) -> None:
     _placeholder_ready_at[(chat_id, message_id)] = (
+        asyncio.get_running_loop().time() + AD_DISPLAY_SECONDS
+    )
+
+
+def hold_inline_placeholder(inline_message_id: str) -> None:
+    _inline_placeholder_ready_at[inline_message_id] = (
         asyncio.get_running_loop().time() + AD_DISPLAY_SECONDS
     )
 
@@ -132,7 +140,10 @@ def _build_slideshow(images: list[Path], audio: Path | None, output: Path) -> No
     subprocess.run(command, cwd=images[0].parent, check=True, capture_output=True)
 
 
-def _gallery_slideshow(url: str, output: Path) -> bool:
+def _gallery_download(
+    url: str,
+    output: Path,
+) -> tuple[int | None, int | None] | None:
     with tempfile.TemporaryDirectory(dir=VIDEO_DIR, prefix="slideshow_") as directory:
         work_dir = Path(directory)
         result = subprocess.run(
@@ -140,27 +151,36 @@ def _gallery_slideshow(url: str, output: Path) -> bool:
                 sys.executable, "-m", "gallery_dl", "--config-ignore", "--no-input",
                 "--no-mtime", "--directory", str(work_dir),
                 "--filename", "{num}_{type}.{extension}",
-                "--option", "extractor.tiktok.videos=false",
+                "--option", "extractor.tiktok.videos=true",
                 "--option", "extractor.tiktok.photos=true",
                 "--option", "extractor.tiktok.audio=true",
+                "--option", "extractor.instagram.videos=true",
                 url,
             ],
             capture_output=True,
             text=True,
         )
         files = [path for path in work_dir.iterdir() if path.is_file()]
+        video = next(
+            (path for path in files if path.suffix.lower() in _VIDEO_EXTENSIONS),
+            None,
+        )
+        if video:
+            video.replace(output.with_suffix(video.suffix))
+            return (None, None)
+
         images = sorted(
             (path for path in files if path.suffix.lower() in _IMAGE_EXTENSIONS),
             key=lambda path: int(path.name.partition("_")[0]),
         )
         if not images:
             if result.returncode:
-                logging.info("gallery-dl не распознал фотопост: %s", result.stderr.strip())
-            return False
+                logging.info("gallery-dl не скачал медиа: %s", result.stderr.strip())
+            return None
 
         audio = next((path for path in files if path.suffix.lower() in _AUDIO_EXTENSIONS), None)
         _build_slideshow(images, audio, output)
-        return True
+        return SLIDESHOW_WIDTH, SLIDESHOW_HEIGHT
 
 
 def _download_media(
@@ -168,9 +188,13 @@ def _download_media(
     outtmpl: str,
     slideshow_path: Path,
 ) -> tuple[str | None, int | None, int | None, str | None]:
-    if "tiktok.com/" in url.lower() and _gallery_slideshow(url, slideshow_path):
-        return _resolve_media(url)[0], SLIDESHOW_WIDTH, SLIDESHOW_HEIGHT, None
-    return _ydl_download(url, outtmpl)
+    try:
+        return _ydl_download(url, outtmpl)
+    except Exception:
+        dimensions = _gallery_download(url, slideshow_path)
+        if dimensions is not None:
+            return _resolve_media(url)[0], *dimensions, None
+        raise
 
 
 async def _deliver_video(
@@ -205,6 +229,8 @@ async def _deliver_video(
             return None
         # Источник — кнопкой: остаётся под видео и ведёт на оригинал в TikTok.
         markup = source_button(source_url) if source_url else None
+        ready_at = _inline_placeholder_ready_at.pop(inline_message_id, 0)
+        await asyncio.sleep(max(0, ready_at - asyncio.get_running_loop().time()))
         try:
             await bot.edit_message_media(
                 inline_message_id=inline_message_id,
@@ -214,6 +240,7 @@ async def _deliver_video(
                         None if without_description else description,
                         source_url,
                         with_source=False,
+                        has_spoiler=has_spoiler,
                     ),
                     parse_mode=ParseMode.HTML,
                     has_spoiler=has_spoiler,
@@ -229,6 +256,7 @@ async def _deliver_video(
         None if without_description else description,
         source_url,
         with_source=True,
+        has_spoiler=has_spoiler,
     )
     if placeholder_message_id:
         ready_at = _placeholder_ready_at.get((chat_id, placeholder_message_id), 0)
@@ -323,9 +351,16 @@ async def process_queue(bot: Bot) -> None:
             without_description = direct_mode == "no_description"
             if direct_mode:
                 inline_message_id = None
-            elif inline_message_id and inline_message_id.startswith("spoiler:"):
-                has_spoiler = True
-                inline_message_id = inline_message_id.removeprefix("spoiler:")
+            elif inline_message_id:
+                while True:
+                    if inline_message_id.startswith("spoiler:"):
+                        has_spoiler = True
+                        inline_message_id = inline_message_id.removeprefix("spoiler:")
+                    elif inline_message_id.startswith("no_description:"):
+                        without_description = True
+                        inline_message_id = inline_message_id.removeprefix("no_description:")
+                    else:
+                        break
 
             try:
                 loop = asyncio.get_running_loop()
@@ -367,7 +402,10 @@ async def process_queue(bot: Bot) -> None:
                 final_id: str | None = tiktok_id or downloaded_id
 
                 # Ищем скачанный файл (расширение может отличаться от .mp4)
-                matches = list(VIDEO_DIR.glob(f"{filename}.*"))
+                matches = [
+                    path for path in VIDEO_DIR.glob(f"{filename}.*")
+                    if path.suffix.lower() in _VIDEO_EXTENSIONS
+                ]
                 if not matches:
                     raise FileNotFoundError(f"Файл после загрузки не найден: {filename}")
                 video_path = matches[0]
@@ -494,3 +532,5 @@ async def process_queue(bot: Bot) -> None:
             finally:
                 if placeholder_message_id:
                     _placeholder_ready_at.pop((chat_id, placeholder_message_id), None)
+                if inline_message_id:
+                    _inline_placeholder_ready_at.pop(inline_message_id, None)

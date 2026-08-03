@@ -13,8 +13,8 @@ Telegram-бот на `aiogram` для загрузки видео из TikTok и
 - Загружает видео из TikTok и Instagram Reels.
 - Собирает фотопосты TikTok в MP4-слайдшоу с оригинальным звуком, если он доступен.
 - Работает в личных сообщениях, группах и inline-режиме.
-- В личном чате позволяет убрать описание или скрыть видео под спойлером;
-  спойлер также доступен в inline-режиме.
+- В личном чате и inline-режиме позволяет убрать описание, скрыть видео под
+  спойлером или применить оба варианта.
 - Обрабатывает загрузки через постоянную FIFO-очередь в SQLite.
 - Повторно использует Telegram `file_id`, чтобы не скачивать уже известные видео заново.
 
@@ -64,7 +64,6 @@ STORAGE_CHAT_ID=-1001234567890
   `@dwlttbot <ссылка>`.
 - Включите `/setinlinefeedback` на `100%`: бот получает выбранный inline-результат
   через `ChosenInlineResult` и только после этого ставит загрузку в очередь.
-- При использовании другого имени бота обновите `BOT_USERNAME` в `promo.py`.
 
 ### Запуск
 
@@ -110,8 +109,8 @@ Linux/macOS:
    `BotDownloadQueue`.
 2. Фоновый воркер последовательно читает FIFO-очередь.
 3. Для известного ID медиа бот сначала ищет сохранённый Telegram `file_id`.
-4. Новое видео загружается через `yt-dlp`; фотопост TikTok — через `gallery-dl`
-   и преобразуется в слайдшоу.
+4. Новое видео сначала загружается через `yt-dlp`; при ошибке используется
+   `gallery-dl`, а фотопост TikTok преобразуется в слайдшоу.
 5. После доставки бот сохраняет доступный `file_id`, удаляет временный файл и
    запись очереди.
 
@@ -145,8 +144,8 @@ Linux/macOS:
 - Turns TikTok photo posts into MP4 slideshows with the original audio when
   available.
 - Works in private chats, groups, and inline mode.
-- In private chats, it can omit the description or hide the video behind a
-  spoiler; spoiler delivery is also available in inline mode.
+- In private chats and inline mode, it can omit the description, hide the video
+  behind a spoiler, or apply both options.
 - Processes downloads through a persistent FIFO queue stored in SQLite.
 - Reuses Telegram `file_id` values instead of downloading known videos again.
 
@@ -195,7 +194,6 @@ channel as an administrator.
 - Enable inline mode with `/setinline` to use `@dwlttbot <link>`.
 - Set `/setinlinefeedback` to `100%`: the bot receives the selected inline result
   through `ChosenInlineResult` and only then queues the download.
-- If your bot has a different username, update `BOT_USERNAME` in `promo.py`.
 
 ### Running
 
@@ -222,8 +220,8 @@ The bot uses long polling. Stop it with `Ctrl+C`.
   without a description, or spoiler delivery.
 - **Group:** send a link. The bot creates a placeholder message and replaces it
   with the downloaded video.
-- **Inline mode:** type `@dwlttbot <link>` in any chat and choose normal or
-  spoiler delivery.
+- **Inline mode:** type `@dwlttbot <link>` in any chat and choose normal, no
+  description, spoiler, or no-description spoiler delivery.
 
 Supported links include `tiktok.com`, `vm.tiktok.com`, `vt.tiktok.com`, and
 `instagram.com/reel`/`instagram.com/reels`.
@@ -240,8 +238,8 @@ Supported links include `tiktok.com`, `vm.tiktok.com`, `vt.tiktok.com`, and
 1. A handler validates the link and inserts a job into `BotDownloadQueue`.
 2. A background worker consumes the persistent FIFO queue one job at a time.
 3. For a known media ID, the bot first looks for a cached Telegram `file_id`.
-4. New videos are downloaded with `yt-dlp`; TikTok photo posts are fetched with
-   `gallery-dl` and converted into a slideshow.
+4. New videos are downloaded with `yt-dlp` first; `gallery-dl` is used as a
+   fallback, and TikTok photo posts are converted into a slideshow.
 5. After delivery, the bot stores an available `file_id`, deletes the temporary
    file, and removes the queue entry.
 

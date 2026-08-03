@@ -9,7 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import DownloadQueue
-from promo import AD_PLACEHOLDER_HTML, PROMO_MESSAGE
+from promo import AD_PLACEHOLDER_HTML
 from services.queue import hold_placeholder
 from utils.links import SUPPORTED_URL_RE, find_video_url
 
@@ -72,10 +72,14 @@ async def handle_download_option(callback: CallbackQuery, session: AsyncSession)
         return
 
     _pending.pop(token, None)
+    placeholder_message_id = callback.message.message_id if callback.message else None
+    if placeholder_message_id:
+        hold_placeholder(str(callback.from_user.id), placeholder_message_id)
     queue_item = DownloadQueue(
         chat_id=str(callback.from_user.id),
         filename=str(uuid.uuid4()),
         tiktok_link=pending[1],
+        reply_to_message_id=-placeholder_message_id if placeholder_message_id else None,
         inline_message_id=f"direct:{mode}" if mode != "normal" else None,
     )
     session.add(queue_item)
@@ -85,9 +89,9 @@ async def handle_download_option(callback: CallbackQuery, session: AsyncSession)
     position = (await session.execute(stmt)).scalar()
     if callback.message:
         await callback.message.edit_text(
-            f"Вы добавлены в очередь\\! Ваша позиция: *{position}*\n\n"
-            f"{PROMO_MESSAGE}",
-            parse_mode=ParseMode.MARKDOWN_V2,
+            f"Вы добавлены в очередь! Ваша позиция: <b>{position}</b>\n\n"
+            f"{AD_PLACEHOLDER_HTML}",
+            parse_mode=ParseMode.HTML,
         )
     await callback.answer()
 

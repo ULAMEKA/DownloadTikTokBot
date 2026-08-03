@@ -13,7 +13,8 @@ from aiogram.types import (
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import DownloadQueue
-from promo import PROMO_MESSAGE_HTML
+from promo import AD_PLACEHOLDER_HTML
+from services.queue import hold_inline_placeholder
 from utils.links import SUPPORTED_URL_RE
 
 inline_router = Router()
@@ -30,7 +31,7 @@ async def handle_inline_query(query: InlineQuery):
     content = InputTextMessageContent(
         message_text=(
             "⏳ <b>Скачиваю видео…</b>\n\n"
-            f"{PROMO_MESSAGE_HTML}"
+            f"{AD_PLACEHOLDER_HTML}"
         ),
         parse_mode="HTML",
     )
@@ -42,13 +43,27 @@ async def handle_inline_query(query: InlineQuery):
             InlineQueryResultArticle(
                 id="download",
                 title="📤 Отправить",
-                description="Отправить видео без спойлера",
+                description="Отправить видео с описанием",
                 input_message_content=content,
                 reply_markup=markup,
             ),
             InlineQueryResultArticle(
                 id="download_spoiler",
                 title="🙈 Отправить под спойлером",
+                description="Скрыть видео и описание до нажатия",
+                input_message_content=content,
+                reply_markup=markup,
+            ),
+            InlineQueryResultArticle(
+                id="download_no_description",
+                title="🧹 Без описания",
+                description="Отправить видео без описания",
+                input_message_content=content,
+                reply_markup=markup,
+            ),
+            InlineQueryResultArticle(
+                id="download_no_description_spoiler",
+                title="🙈 Без описания, под спойлером",
                 description="Скрыть видео до нажатия",
                 input_message_content=content,
                 reply_markup=markup,
@@ -59,7 +74,10 @@ async def handle_inline_query(query: InlineQuery):
 
 
 @inline_router.chosen_inline_result(
-    (F.result_id == "download") | (F.result_id == "download_spoiler")
+    (F.result_id == "download")
+    | (F.result_id == "download_spoiler")
+    | (F.result_id == "download_no_description")
+    | (F.result_id == "download_no_description_spoiler")
 )
 async def chosen_download(result: ChosenInlineResult, session: AsyncSession):
     """
@@ -75,8 +93,14 @@ async def chosen_download(result: ChosenInlineResult, session: AsyncSession):
 
     url = m_url.group(0)
     inline_message_id = result.inline_message_id
-    if inline_message_id and result.result_id == "download_spoiler":
-        inline_message_id = f"spoiler:{inline_message_id}"
+    if inline_message_id:
+        hold_inline_placeholder(inline_message_id)
+        prefix = {
+            "download_spoiler": "spoiler:",
+            "download_no_description": "no_description:",
+            "download_no_description_spoiler": "spoiler:no_description:",
+        }.get(result.result_id, "")
+        inline_message_id = f"{prefix}{inline_message_id}"
 
     queue_item = DownloadQueue(
         chat_id=str(result.from_user.id),      # PM пользователя (fallback)

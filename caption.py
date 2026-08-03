@@ -10,9 +10,7 @@ from urllib.parse import urlsplit, urlunsplit
 from aiogram import html
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-from promo import PROMO_MESSAGE_HTML
-
-# Лимит длины подписи в Telegram. Держим запас под промо/ссылку и
+# Лимит длины подписи в Telegram. Держим запас под ссылку и
 # особенности подсчёта (эмодзи в UTF-16, html-теги в видимую длину не входят).
 CAPTION_LIMIT = 1024
 
@@ -43,27 +41,29 @@ def build_caption(
     source_url: str | None,
     *,
     with_source: bool,
+    has_spoiler: bool = False,
 ) -> str:
-    """Подпись под видео: описание ролика (если есть) + [ссылка] + промо.
+    """Подпись под видео: описание ролика (если есть) + [ссылка].
 
     with_source=False для inline-режима — там источник вынесен в кнопку,
-    поэтому ссылку в текст не добавляем. Разметка — HTML.
+    поэтому ссылку в текст не добавляем. Разметка — HTML; при has_spoiler
+    подпись целиком скрывается тегом tg-spoiler.
     """
     tail_parts: list[str] = []
     if with_source and source_url:
         tail_parts.append(source_link(source_url))
-    tail_parts.append(PROMO_MESSAGE_HTML)
     tail = "\n\n".join(tail_parts)
 
     desc = (description or "").strip()
-    if not desc:
-        return tail
+    if desc:
+        # Бюджет под описание: лимит минус хвост и запас. Режем по сырому
+        # тексту (до html.quote), чтобы не разорвать html-сущность вроде &amp;.
+        budget = CAPTION_LIMIT - len(tail) - 30
+        if budget > 0:
+            if len(desc) > budget:
+                desc = desc[:budget - 1].rstrip() + "…"
+            tail = f"<blockquote expandable>{html.quote(desc)}</blockquote>\n\n{tail}"
 
-    # Бюджет под описание: лимит минус хвост и запас. Режем по сырому
-    # тексту (до html.quote), чтобы не разорвать html-сущность вроде &amp;.
-    budget = CAPTION_LIMIT - len(tail) - 30
-    if budget <= 0:
-        return tail
-    if len(desc) > budget:
-        desc = desc[:budget - 1].rstrip() + "…"
-    return f"<blockquote expandable>{html.quote(desc)}</blockquote>\n\n{tail}"
+    if not tail:
+        return ""
+    return f"<tg-spoiler>{tail}</tg-spoiler>" if has_spoiler else tail
