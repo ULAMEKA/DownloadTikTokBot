@@ -26,14 +26,31 @@ def normalize_url(url: str) -> str:
 
 def source_link(url: str) -> str:
     """HTML-ссылка «Ссылка на источник» на оригинальное видео в TikTok."""
-    return f'🔗 <a href="{html.quote(normalize_url(url))}">Ссылка на источник</a>'
+    return f'🔗 <a href="{html.quote(normalize_url(url))}">Source</a>'
 
 
-def source_button(url: str) -> InlineKeyboardMarkup:
-    """Кнопка «Ссылка на источник» — для inline-режима (текст-ссылку не вставляем)."""
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🔗 Ссылка на источник", url=normalize_url(url))
-    ]])
+def _format_count(value: int) -> str:
+    return f"{value:,}".replace(",", " ")
+
+
+def stats_keyboard(
+    stats: tuple[int | None, int | None, int | None] = (None, None, None),
+) -> InlineKeyboardMarkup | None:
+    """Клавиатура под видео со статистикой."""
+    likes, comments, views = stats
+    stats_buttons = [
+        InlineKeyboardButton(text=f"❤️ {_format_count(likes)}", callback_data="video_stats")
+        if likes is not None else None,
+        InlineKeyboardButton(text=f"💬 {_format_count(comments)}", callback_data="video_stats")
+        if comments is not None else None,
+        InlineKeyboardButton(text=f"👁 {_format_count(views)}", callback_data="video_stats")
+        if views is not None else None,
+    ]
+    stats_row = [button for button in stats_buttons if button]
+    rows: list[list[InlineKeyboardButton]] = []
+    if stats_row:
+        rows.append(stats_row)
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
 def build_caption(
@@ -45,25 +62,25 @@ def build_caption(
 ) -> str:
     """Подпись под видео: описание ролика (если есть) + [ссылка].
 
-    with_source=False для inline-режима — там источник вынесен в кнопку,
-    поэтому ссылку в текст не добавляем. Разметка — HTML; при has_spoiler
-    подпись целиком скрывается тегом tg-spoiler.
+    with_source управляет строкой с источником внизу подписи. Разметка — HTML;
+    при has_spoiler под спойлером тегом tg-spoiler скрывается только описание видео.
     """
-    tail_parts: list[str] = []
-    if with_source and source_url:
-        tail_parts.append(source_link(source_url))
-    tail = "\n\n".join(tail_parts)
+    source_tail = source_link(source_url) if with_source and source_url else ""
 
     desc = (description or "").strip()
+    description_block = ""
     if desc:
         # Бюджет под описание: лимит минус хвост и запас. Режем по сырому
         # тексту (до html.quote), чтобы не разорвать html-сущность вроде &amp;.
-        budget = CAPTION_LIMIT - len(tail) - 30
+        budget = CAPTION_LIMIT - len(source_tail) - 30
         if budget > 0:
             if len(desc) > budget:
                 desc = desc[:budget - 1].rstrip() + "…"
-            tail = f"<blockquote expandable>{html.quote(desc)}</blockquote>\n\n{tail}"
+            description_block = f"<blockquote expandable>{html.quote(desc)}</blockquote>"
+            if has_spoiler:
+                description_block = f"<tg-spoiler>{description_block}</tg-spoiler>"
 
-    if not tail:
+    parts = [part for part in (description_block, source_tail) if part]
+    if not parts:
         return ""
-    return f"<tg-spoiler>{tail}</tg-spoiler>" if has_spoiler else tail
+    return "\n\n".join(parts)

@@ -6,6 +6,7 @@ class DownloadQueue(Base):
     __tablename__ = "BotDownloadQueue"
     id = Column(Integer, primary_key=True)
     chat_id = Column(String)
+    user_id = Column(String, nullable=True)
     filename = Column(String)
     tiktok_link = Column(String)
     reply_to_message_id = Column(Integer, nullable=True)

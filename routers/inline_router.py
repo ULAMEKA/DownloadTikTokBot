@@ -1,10 +1,12 @@
 import uuid
 
-from aiogram import Router, F
+from aiogram import Bot, Router, F
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import (
     CallbackQuery,
     InlineQuery,
     InlineQueryResultArticle,
+    InputMediaPhoto,
     InputTextMessageContent,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
@@ -13,11 +15,43 @@ from aiogram.types import (
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import DownloadQueue
-from promo import AD_PLACEHOLDER_HTML
-from services.queue import hold_inline_placeholder
+from promo import (
+    AD_PLACEHOLDER_HTML,
+    AD_PLACEHOLDER_PHOTO_FILE_ID,
+)
+from services.queue import QUEUE_LIMIT_MESSAGE, enqueue_download, hold_inline_placeholder
 from utils.links import SUPPORTED_URL_RE
 
 inline_router = Router()
+
+
+def _inline_result(
+    result_id: str,
+    title: str,
+    description: str,
+    caption: str,
+    markup: InlineKeyboardMarkup,
+):
+    return InlineQueryResultArticle(
+        id=result_id,
+        title=title,
+        description=description,
+        input_message_content=InputTextMessageContent(
+            message_text=caption,
+            parse_mode="HTML",
+        ),
+        reply_markup=markup,
+    )
+
+
+def _placeholder_caption() -> str:
+    return f"⏳ <b>Скачиваю видео…</b>\n\n{AD_PLACEHOLDER_HTML}"
+
+
+def _placeholder_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="⏳ Загружается…", callback_data="inline_loading")
+    ]])
 
 
 @inline_router.inline_query()
@@ -28,46 +62,14 @@ async def handle_inline_query(query: InlineQuery):
         await query.answer([], cache_time=5)
         return
 
-    content = InputTextMessageContent(
-        message_text=(
-            "⏳ <b>Скачиваю видео…</b>\n\n"
-            f"{AD_PLACEHOLDER_HTML}"
-        ),
-        parse_mode="HTML",
-    )
-    markup = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="⏳ Загружается…", callback_data="inline_loading")
-    ]])
+    caption = _placeholder_caption()
+    markup = _placeholder_markup()
     await query.answer(
         results=[
-            InlineQueryResultArticle(
-                id="download",
-                title="📤 Отправить",
-                description="Отправить видео с описанием",
-                input_message_content=content,
-                reply_markup=markup,
-            ),
-            InlineQueryResultArticle(
-                id="download_spoiler",
-                title="🙈 Отправить под спойлером",
-                description="Скрыть видео и описание до нажатия",
-                input_message_content=content,
-                reply_markup=markup,
-            ),
-            InlineQueryResultArticle(
-                id="download_no_description",
-                title="🧹 Без описания",
-                description="Отправить видео без описания",
-                input_message_content=content,
-                reply_markup=markup,
-            ),
-            InlineQueryResultArticle(
-                id="download_no_description_spoiler",
-                title="🙈 Без описания, под спойлером",
-                description="Скрыть видео до нажатия",
-                input_message_content=content,
-                reply_markup=markup,
-            ),
+            _inline_result("download", "📤 Отправить", "Отправить видео с описанием", caption, markup),
+            _inline_result("download_spoiler", "🙈 Отправить под спойлером", "Скрыть видео и описание до нажатия", caption, markup),
+            _inline_result("download_no_description", "🧹 Без описания", "Отправить видео без описания", caption, markup),
+            _inline_result("download_no_description_spoiler", "🙈 Без описания, под спойлером", "Скрыть видео до нажатия", caption, markup),
         ],
         cache_time=0,
     )
@@ -79,7 +81,7 @@ async def handle_inline_query(query: InlineQuery):
     | (F.result_id == "download_no_description")
     | (F.result_id == "download_no_description_spoiler")
 )
-async def chosen_download(result: ChosenInlineResult, session: AsyncSession):
+async def chosen_download(result: ChosenInlineResult, session: AsyncSession, bot: Bot):
     """
     Срабатывает, когда пользователь выбрал «Загрузить».
     Сохраняем inline_message_id — очередь отредактирует это сообщение
@@ -92,9 +94,9 @@ async def chosen_download(result: ChosenInlineResult, session: AsyncSession):
         return
 
     url = m_url.group(0)
-    inline_message_id = result.inline_message_id
+    raw_inline_message_id = result.inline_message_id
+    inline_message_id = raw_inline_message_id
     if inline_message_id:
-        hold_inline_placeholder(inline_message_id)
         prefix = {
             "download_spoiler": "spoiler:",
             "download_no_description": "no_description:",
@@ -108,8 +110,42 @@ async def chosen_download(result: ChosenInlineResult, session: AsyncSession):
         tiktok_link=url,
         inline_message_id=inline_message_id,
     )
-    session.add(queue_item)
-    await session.commit()
+
+    if raw_inline_message_id and AD_PLACEHOLDER_PHOTO_FILE_ID:
+        try:
+            await bot.edit_message_media(
+                inline_message_id=raw_inline_message_id,
+                media=InputMediaPhoto(
+                    media=AD_PLACEHOLDER_PHOTO_FILE_ID,
+                    caption=_placeholder_caption(),
+                    parse_mode="HTML",
+                    show_caption_above_media=True,
+                ),
+                reply_markup=_placeholder_markup(),
+            )
+        except (TelegramBadRequest, TelegramForbiddenError):
+            pass
+
+    if not await enqueue_download(session, queue_item, str(result.from_user.id)):
+        if raw_inline_message_id:
+            try:
+                await bot.edit_message_caption(
+                    inline_message_id=raw_inline_message_id,
+                    caption=QUEUE_LIMIT_MESSAGE,
+                    reply_markup=None,
+                )
+            except (TelegramBadRequest, TelegramForbiddenError):
+                try:
+                    await bot.edit_message_text(
+                        inline_message_id=raw_inline_message_id,
+                        text=QUEUE_LIMIT_MESSAGE,
+                        reply_markup=None,
+                    )
+                except (TelegramBadRequest, TelegramForbiddenError):
+                    pass
+        return
+    if raw_inline_message_id:
+        hold_inline_placeholder(raw_inline_message_id)
 
 
 @inline_router.callback_query(F.data == "inline_loading")

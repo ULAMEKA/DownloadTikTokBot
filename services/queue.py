@@ -13,11 +13,12 @@ from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import FSInputFile, InputMediaVideo
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.session import SessionLocal
 from db.models import DownloadQueue, VideoCache
-from caption import build_caption, source_button
+from caption import build_caption, stats_keyboard
 from promo import AD_DISPLAY_SECONDS
 
 BASE_DIR = Path(__file__).parent
@@ -38,8 +39,36 @@ _TIKTOK_ID_RE = re.compile(r'/(?:video|photo)/(\d+)')
 _IMAGE_EXTENSIONS = {".avif", ".jpeg", ".jpg", ".png", ".webp"}
 _AUDIO_EXTENSIONS = {".aac", ".m4a", ".mp3", ".ogg", ".opus", ".wav"}
 _VIDEO_EXTENSIONS = {".m4v", ".mkv", ".mov", ".mp4", ".webm"}
+MediaStats = tuple[int | None, int | None, int | None]
+EMPTY_STATS: MediaStats = (None, None, None)
+MAX_ACTIVE_DOWNLOADS_PER_USER = 2
+QUEUE_LIMIT_MESSAGE = (
+    "Можно поставить в очередь не больше 2 видео одновременно. "
+    "Дождись завершения текущих загрузок."
+)
 _placeholder_ready_at: dict[tuple[str, int], float] = {}
 _inline_placeholder_ready_at: dict[str, float] = {}
+_enqueue_lock = asyncio.Lock()
+
+
+async def enqueue_download(
+    session: AsyncSession,
+    item: DownloadQueue,
+    user_id: str,
+) -> bool:
+    async with _enqueue_lock:
+        result = await session.execute(
+            select(func.count())
+            .select_from(DownloadQueue)
+            .where(DownloadQueue.user_id == user_id)
+        )
+        if result.scalar_one() >= MAX_ACTIVE_DOWNLOADS_PER_USER:
+            return False
+
+        item.user_id = user_id
+        session.add(item)
+        await session.commit()
+        return True
 
 
 def hold_placeholder(chat_id: str, message_id: int) -> None:
@@ -54,24 +83,36 @@ def hold_inline_placeholder(inline_message_id: str) -> None:
     )
 
 
-def _resolve_media(url: str) -> tuple[str | None, str]:
+def _to_int(value: object) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_media(url: str) -> tuple[str | None, str, MediaStats]:
     m = _TIKTOK_ID_RE.search(url)
-    if m:
-        return m.group(1), url
+    fallback_id = m.group(1) if m else None
     try:
         opts: dict[str, object] = {"quiet": True, "no_warnings": True}
         with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore[arg-type]
             info = ydl.extract_info(url, download=False)
-            if info and info.get("id"):
+            if info:
                 source_url = (
                     str(info.get("webpage_url") or url)
                     if "tiktok.com/" in url.lower()
                     else url
                 )
-                return str(info["id"]), source_url
+                media_id = str(info["id"]) if info.get("id") else fallback_id
+                stats = (
+                    _to_int(info.get("like_count")),
+                    _to_int(info.get("comment_count")),
+                    _to_int(info.get("view_count")),
+                )
+                return media_id, source_url, stats
     except Exception:
         pass
-    return None, url
+    return fallback_id, url, EMPTY_STATS
 
 
 def _extract_dimensions(info: dict[str, object]) -> tuple[int | None, int | None]:
@@ -207,12 +248,15 @@ async def _deliver_video(
     height: int | None = None,
     description: str | None = None,
     source_url: str | None = None,
+    stats: MediaStats = EMPTY_STATS,
     reply_to_message_id: int | None = None,
     placeholder_message_id: int | None = None,
     has_spoiler: bool = False,
     without_description: bool = False,
 ) -> str | None:
     """Отправляет видео пользователю, возвращает file_id для кеша (или None)."""
+    markup = stats_keyboard(stats)
+
     # Inline-режим: редактируем сообщение через file_id из Storage
     if inline_message_id:
         if not file_id:
@@ -228,7 +272,6 @@ async def _deliver_video(
                 pass
             return None
         # Источник — кнопкой: остаётся под видео и ведёт на оригинал в TikTok.
-        markup = source_button(source_url) if source_url else None
         ready_at = _inline_placeholder_ready_at.pop(inline_message_id, 0)
         await asyncio.sleep(max(0, ready_at - asyncio.get_running_loop().time()))
         try:
@@ -239,7 +282,7 @@ async def _deliver_video(
                     caption=build_caption(
                         None if without_description else description,
                         source_url,
-                        with_source=False,
+                        with_source=True,
                         has_spoiler=has_spoiler,
                     ),
                     parse_mode=ParseMode.HTML,
@@ -275,6 +318,7 @@ async def _deliver_video(
                 parse_mode=ParseMode.HTML,
                 has_spoiler=has_spoiler,
             ),
+            reply_markup=markup,
         )
         if file_id:
             return file_id
@@ -291,6 +335,7 @@ async def _deliver_video(
             reply_to_message_id=reply_to_message_id,
             allow_sending_without_reply=True,
             has_spoiler=has_spoiler,
+            reply_markup=markup,
         )
         return file_id
 
@@ -305,6 +350,7 @@ async def _deliver_video(
             reply_to_message_id=reply_to_message_id,
             allow_sending_without_reply=True,
             has_spoiler=has_spoiler,
+            reply_markup=markup,
         )
         if msg.video:
             return msg.video.file_id
@@ -366,7 +412,7 @@ async def process_queue(bot: Bot) -> None:
                 loop = asyncio.get_running_loop()
 
                 # 1. ID видео TikTok
-                tiktok_id, source_url = await loop.run_in_executor(
+                tiktok_id, source_url, stats = await loop.run_in_executor(
                     None, _resolve_media, tiktok_link
                 )
 
@@ -382,6 +428,7 @@ async def process_queue(bot: Bot) -> None:
                             bot, chat_id, inline_message_id,
                             file_id=cached.file_id, video_path=None,
                             description=cached.description, source_url=source_url,
+                            stats=stats,
                             reply_to_message_id=reply_to_message_id,
                             placeholder_message_id=placeholder_message_id,
                             has_spoiler=has_spoiler,
@@ -438,6 +485,7 @@ async def process_queue(bot: Bot) -> None:
                     file_id=file_id, video_path=video_path,
                     width=width, height=height,
                     description=description, source_url=source_url,
+                    stats=stats,
                     reply_to_message_id=reply_to_message_id,
                     placeholder_message_id=placeholder_message_id,
                     has_spoiler=has_spoiler,

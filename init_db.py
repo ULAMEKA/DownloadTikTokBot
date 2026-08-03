@@ -36,7 +36,7 @@ async def init_db() -> None:
             await conn.execute(text("DROP TABLE IF EXISTS VideoCache"))
             logging.info("VideoCache: старая схема обнаружена, таблица удалена для пересоздания")
 
-        # 3. Миграция DownloadQueue: добавляем inline_message_id если его ещё нет.
+        # 3. Миграция DownloadQueue: добавляем новые колонки, если их ещё нет.
         try:
             await conn.execute(text("SELECT inline_message_id FROM BotDownloadQueue LIMIT 1"))
         except Exception:  # noqa: BLE001
@@ -52,6 +52,14 @@ async def init_db() -> None:
                 "ALTER TABLE BotDownloadQueue ADD COLUMN reply_to_message_id INTEGER"
             ))
             logging.info("BotDownloadQueue: добавлена колонка reply_to_message_id")
+
+        try:
+            await conn.execute(text("SELECT user_id FROM BotDownloadQueue LIMIT 1"))
+        except Exception:  # noqa: BLE001
+            await conn.execute(text(
+                "ALTER TABLE BotDownloadQueue ADD COLUMN user_id TEXT"
+            ))
+            logging.info("BotDownloadQueue: добавлена колонка user_id")
 
         # 4. Повторный create_all пересоздаёт VideoCache, если миграция её удалила.
         await conn.run_sync(Base.metadata.create_all)

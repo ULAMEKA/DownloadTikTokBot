@@ -4,13 +4,13 @@ import uuid
 from aiogram import F, Router
 from aiogram.enums import ChatType, ParseMode
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import DownloadQueue
-from promo import AD_PLACEHOLDER_HTML
-from services.queue import hold_placeholder
+from promo import AD_PLACEHOLDER_HTML, AD_PLACEHOLDER_IMAGE
+from services.queue import QUEUE_LIMIT_MESSAGE, enqueue_download, hold_placeholder
 from utils.links import SUPPORTED_URL_RE, find_video_url
 
 link = Router()
@@ -72,28 +72,45 @@ async def handle_download_option(callback: CallbackQuery, session: AsyncSession)
         return
 
     _pending.pop(token, None)
-    placeholder_message_id = callback.message.message_id if callback.message else None
-    if placeholder_message_id:
-        hold_placeholder(str(callback.from_user.id), placeholder_message_id)
+    placeholder = None
+    if callback.message:
+        placeholder = await callback.message.answer_photo(
+            photo=FSInputFile(str(AD_PLACEHOLDER_IMAGE)),
+            caption=AD_PLACEHOLDER_HTML,
+            parse_mode=ParseMode.HTML,
+        )
+        await callback.message.delete()
     queue_item = DownloadQueue(
         chat_id=str(callback.from_user.id),
         filename=str(uuid.uuid4()),
         tiktok_link=pending[1],
-        reply_to_message_id=-placeholder_message_id if placeholder_message_id else None,
+        reply_to_message_id=-placeholder.message_id if placeholder else None,
         inline_message_id=f"direct:{mode}" if mode != "normal" else None,
     )
-    session.add(queue_item)
-    await session.commit()
+    if not await enqueue_download(session, queue_item, str(callback.from_user.id)):
+        if placeholder:
+            await placeholder.delete()
+        await callback.answer(QUEUE_LIMIT_MESSAGE, show_alert=True)
+        return
+    if placeholder:
+        hold_placeholder(str(callback.from_user.id), placeholder.message_id)
 
     stmt = select(func.count()).select_from(DownloadQueue).where(DownloadQueue.id <= queue_item.id)
     position = (await session.execute(stmt)).scalar()
-    if callback.message:
-        await callback.message.edit_text(
-            f"Вы добавлены в очередь! Ваша позиция: <b>{position}</b>\n\n"
-            f"{AD_PLACEHOLDER_HTML}",
+    if placeholder:
+        await placeholder.edit_caption(
+            caption=(
+                f"Вы добавлены в очередь! Ваша позиция: <b>{position}</b>\n\n"
+                f"{AD_PLACEHOLDER_HTML}"
+            ),
             parse_mode=ParseMode.HTML,
         )
     await callback.answer()
+
+
+@link.callback_query(F.data == "video_stats")
+async def handle_video_stats(callback: CallbackQuery):
+    await callback.answer("Статистика показана на момент загрузки")
 
 
 @link.message(F.text.regexp(SUPPORTED_URL_RE.pattern))
@@ -102,15 +119,23 @@ async def handle_video_link_group(message: Message, session: AsyncSession):
     if url is None:
         return
 
-    placeholder = await message.reply(AD_PLACEHOLDER_HTML, parse_mode=ParseMode.HTML)
-    hold_placeholder(str(message.chat.id), placeholder.message_id)
-    session.add(DownloadQueue(
+    placeholder = await message.reply_photo(
+        photo=FSInputFile(str(AD_PLACEHOLDER_IMAGE)),
+        caption=AD_PLACEHOLDER_HTML,
+        parse_mode=ParseMode.HTML,
+    )
+    queue_item = DownloadQueue(
         chat_id=str(message.chat.id),
         filename=str(uuid.uuid4()),
         tiktok_link=url,
         reply_to_message_id=-placeholder.message_id,
-    ))
-    await session.commit()
+    )
+    user_id = str(message.from_user.id if message.from_user else message.chat.id)
+    if not await enqueue_download(session, queue_item, user_id):
+        await placeholder.delete()
+        await message.reply(QUEUE_LIMIT_MESSAGE)
+        return
+    hold_placeholder(str(message.chat.id), placeholder.message_id)
 
 
 @link.message(F.chat.type == ChatType.PRIVATE)

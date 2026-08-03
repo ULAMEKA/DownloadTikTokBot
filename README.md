@@ -16,6 +16,7 @@ Telegram-бот на `aiogram` для загрузки видео из TikTok и
 - В личном чате и inline-режиме позволяет убрать описание, скрыть видео под
   спойлером или применить оба варианта.
 - Обрабатывает загрузки через постоянную FIFO-очередь в SQLite.
+- Не принимает больше двух незавершённых загрузок от одного пользователя.
 - Повторно использует Telegram `file_id`, чтобы не скачивать уже известные видео заново.
 
 ### Требования
@@ -55,6 +56,10 @@ STORAGE_CHAT_ID=-1001234567890
 `TOKEN` обязателен. `STORAGE_CHAT_ID` необязателен для обычных сообщений, но
 обязателен для доставки незакешированных видео в inline-режиме. Добавьте бота
 администратором указанного канала.
+
+После копирования проекта на сервер один раз выполните `.venv/bin/python
+upload_ad_placeholder.py`. Скрипт отправит картинку-заглушку в storage-канал и
+сохранит Telegram `file_id` локально для inline-режима.
 
 ### Настройка BotFather
 
@@ -147,6 +152,7 @@ Linux/macOS:
 - In private chats and inline mode, it can omit the description, hide the video
   behind a spoiler, or apply both options.
 - Processes downloads through a persistent FIFO queue stored in SQLite.
+- Limits each user to two unfinished downloads in the queue.
 - Reuses Telegram `file_id` values instead of downloading known videos again.
 
 ### Requirements
@@ -186,6 +192,10 @@ STORAGE_CHAT_ID=-1001234567890
 `TOKEN` is required. `STORAGE_CHAT_ID` is optional for regular messages, but it
 is required to deliver uncached videos in inline mode. Add the bot to that
 channel as an administrator.
+
+After copying the project to the server, run `.venv/bin/python
+upload_ad_placeholder.py` once. The script sends the placeholder image to the
+storage channel and saves its Telegram `file_id` locally for inline mode.
 
 ### BotFather setup
 
