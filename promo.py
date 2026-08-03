@@ -3,6 +3,7 @@
 from pathlib import Path
 
 AD_DISPLAY_SECONDS = 15
+BOT_PROMO_HTML = "💡 Используйте @dwlttbot для загрузки видео"
 TELEGRAM_PROFILE = "@polarisim"
 TELEGRAM_PROFILE_LINK = '<a href="tg://resolve?domain=polarisim">@polarisim</a>'
 AD_PLACEHOLDER_HTML = f"Здесь могла быть ваша реклама. Заказать - {TELEGRAM_PROFILE_LINK}"
@@ -17,3 +18,15 @@ try:
     )
 except FileNotFoundError:
     AD_PLACEHOLDER_PHOTO_FILE_ID = None
+
+
+def loading_placeholder_caption(position: int | None = None) -> str:
+    queue_position = (
+        f"\nВаша позиция в очереди: <b>{position}</b>"
+        if position is not None
+        else ""
+    )
+    return (
+        f"⏳ <b>Скачиваю видео…</b>{queue_position}\n\n"
+        f"{AD_PLACEHOLDER_HTML}\n\n{BOT_PROMO_HTML}"
+    )

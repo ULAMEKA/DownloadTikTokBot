@@ -9,7 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import DownloadQueue
-from promo import AD_PLACEHOLDER_HTML, AD_PLACEHOLDER_IMAGE
+from promo import AD_PLACEHOLDER_IMAGE, loading_placeholder_caption
 from services.queue import QUEUE_LIMIT_MESSAGE, enqueue_download, hold_placeholder
 from utils.links import SUPPORTED_URL_RE, find_video_url
 
@@ -76,7 +76,7 @@ async def handle_download_option(callback: CallbackQuery, session: AsyncSession)
     if callback.message:
         placeholder = await callback.message.answer_photo(
             photo=FSInputFile(str(AD_PLACEHOLDER_IMAGE)),
-            caption=AD_PLACEHOLDER_HTML,
+            caption=loading_placeholder_caption(),
             parse_mode=ParseMode.HTML,
         )
         await callback.message.delete()
@@ -99,10 +99,7 @@ async def handle_download_option(callback: CallbackQuery, session: AsyncSession)
     position = (await session.execute(stmt)).scalar()
     if placeholder:
         await placeholder.edit_caption(
-            caption=(
-                f"Вы добавлены в очередь! Ваша позиция: <b>{position}</b>\n\n"
-                f"{AD_PLACEHOLDER_HTML}"
-            ),
+            caption=loading_placeholder_caption(position),
             parse_mode=ParseMode.HTML,
         )
     await callback.answer()
@@ -121,7 +118,7 @@ async def handle_video_link_group(message: Message, session: AsyncSession):
 
     placeholder = await message.reply_photo(
         photo=FSInputFile(str(AD_PLACEHOLDER_IMAGE)),
-        caption=AD_PLACEHOLDER_HTML,
+        caption=loading_placeholder_caption(),
         parse_mode=ParseMode.HTML,
     )
     queue_item = DownloadQueue(
@@ -135,6 +132,12 @@ async def handle_video_link_group(message: Message, session: AsyncSession):
         await placeholder.delete()
         await message.reply(QUEUE_LIMIT_MESSAGE)
         return
+    stmt = select(func.count()).select_from(DownloadQueue).where(DownloadQueue.id <= queue_item.id)
+    position = (await session.execute(stmt)).scalar_one()
+    await placeholder.edit_caption(
+        caption=loading_placeholder_caption(position),
+        parse_mode=ParseMode.HTML,
+    )
     hold_placeholder(str(message.chat.id), placeholder.message_id)
 
 

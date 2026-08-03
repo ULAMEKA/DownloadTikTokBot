@@ -10,6 +10,8 @@ from urllib.parse import urlsplit, urlunsplit
 from aiogram import html
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+from promo import BOT_PROMO_HTML
+
 # Лимит длины подписи в Telegram. Держим запас под ссылку и
 # особенности подсчёта (эмодзи в UTF-16, html-теги в видимую длину не входят).
 CAPTION_LIMIT = 1024
@@ -66,13 +68,14 @@ def build_caption(
     при has_spoiler под спойлером тегом tg-spoiler скрывается только описание видео.
     """
     source_tail = source_link(source_url) if with_source and source_url else ""
+    promo_tail = BOT_PROMO_HTML
 
     desc = (description or "").strip()
     description_block = ""
     if desc:
         # Бюджет под описание: лимит минус хвост и запас. Режем по сырому
         # тексту (до html.quote), чтобы не разорвать html-сущность вроде &amp;.
-        budget = CAPTION_LIMIT - len(source_tail) - 30
+        budget = CAPTION_LIMIT - len(source_tail) - len(promo_tail) - 30
         if budget > 0:
             if len(desc) > budget:
                 desc = desc[:budget - 1].rstrip() + "…"
@@ -80,7 +83,7 @@ def build_caption(
             if has_spoiler:
                 description_block = f"<tg-spoiler>{description_block}</tg-spoiler>"
 
-    parts = [part for part in (description_block, source_tail) if part]
+    parts = [part for part in (description_block, source_tail, promo_tail) if part]
     if not parts:
         return ""
     return "\n\n".join(parts)

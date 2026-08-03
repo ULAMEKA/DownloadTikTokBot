@@ -12,13 +12,11 @@ from aiogram.types import (
     InlineKeyboardButton,
     ChosenInlineResult,
 )
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import DownloadQueue
-from promo import (
-    AD_PLACEHOLDER_HTML,
-    AD_PLACEHOLDER_PHOTO_FILE_ID,
-)
+from promo import AD_PLACEHOLDER_PHOTO_FILE_ID, loading_placeholder_caption
 from services.queue import QUEUE_LIMIT_MESSAGE, enqueue_download, hold_inline_placeholder
 from utils.links import SUPPORTED_URL_RE
 
@@ -44,10 +42,6 @@ def _inline_result(
     )
 
 
-def _placeholder_caption() -> str:
-    return f"⏳ <b>Скачиваю видео…</b>\n\n{AD_PLACEHOLDER_HTML}"
-
-
 def _placeholder_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="⏳ Загружается…", callback_data="inline_loading")
@@ -62,7 +56,7 @@ async def handle_inline_query(query: InlineQuery):
         await query.answer([], cache_time=5)
         return
 
-    caption = _placeholder_caption()
+    caption = loading_placeholder_caption()
     markup = _placeholder_markup()
     await query.answer(
         results=[
@@ -117,7 +111,7 @@ async def chosen_download(result: ChosenInlineResult, session: AsyncSession, bot
                 inline_message_id=raw_inline_message_id,
                 media=InputMediaPhoto(
                     media=AD_PLACEHOLDER_PHOTO_FILE_ID,
-                    caption=_placeholder_caption(),
+                    caption=loading_placeholder_caption(),
                     parse_mode="HTML",
                     show_caption_above_media=True,
                 ),
@@ -144,6 +138,27 @@ async def chosen_download(result: ChosenInlineResult, session: AsyncSession, bot
                 except (TelegramBadRequest, TelegramForbiddenError):
                     pass
         return
+    stmt = select(func.count()).select_from(DownloadQueue).where(DownloadQueue.id <= queue_item.id)
+    position = (await session.execute(stmt)).scalar_one()
+    if raw_inline_message_id:
+        caption = loading_placeholder_caption(position)
+        try:
+            await bot.edit_message_caption(
+                inline_message_id=raw_inline_message_id,
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=_placeholder_markup(),
+            )
+        except (TelegramBadRequest, TelegramForbiddenError):
+            try:
+                await bot.edit_message_text(
+                    inline_message_id=raw_inline_message_id,
+                    text=caption,
+                    parse_mode="HTML",
+                    reply_markup=_placeholder_markup(),
+                )
+            except (TelegramBadRequest, TelegramForbiddenError):
+                pass
     if raw_inline_message_id:
         hold_inline_placeholder(raw_inline_message_id)
 
