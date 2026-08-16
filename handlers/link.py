@@ -9,6 +9,7 @@ from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, Inli
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from caption import source_link
 from db.models import DownloadQueue, MusicRequest
 from promo import AD_PLACEHOLDER_IMAGE, loading_placeholder_caption
 from services.queue import (
@@ -115,7 +116,8 @@ async def handle_video_link_private(message: Message):
     token = uuid.uuid4().hex
     _pending[token] = PendingDownload(message.chat.id, url)
     await message.answer(
-        "Как загрузить видео?",
+        f"Как загрузить видео?\n\n{source_link(url)}",
+        parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(
                 text="⬇️ Загрузить",
@@ -134,6 +136,10 @@ async def handle_video_link_private(message: Message):
             [InlineKeyboardButton(
                 text="🙈 Без описания, под спойлером",
                 callback_data=f"download:no_description_spoiler:{token}",
+            )],
+            [InlineKeyboardButton(
+                text="🎵 Распознать музыку",
+                callback_data=f"{MUSIC_JOB_PREFIX}{token}",
             )],
         ]),
     )
@@ -240,8 +246,34 @@ async def handle_music_recognition(
 
     request = await session.get(MusicRequest, token)
     if request is None:
-        await callback.answer("Кнопка устарела.", show_alert=True)
-        return
+        pending = _pending.get(token)
+        if (
+            pending is None
+            or pending.user_id != callback.from_user.id
+            or callback.message is None
+        ):
+            await callback.answer("Кнопка устарела.", show_alert=True)
+            return
+        pending = _pending.pop(token, None)
+        if pending is None:
+            await callback.answer("Ссылка уже обрабатывается.")
+            return
+        request = MusicRequest(
+            token=token,
+            user_id=str(callback.from_user.id),
+            chat_id=str(callback.message.chat.id),
+            status_message_id=callback.message.message_id,
+            tiktok_link=pending.url,
+            state="ready",
+        )
+        session.add(request)
+        try:
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            _pending[token] = pending
+            await callback.answer("Не удалось запустить распознавание.", show_alert=True)
+            return
     if str(callback.from_user.id) != request.user_id:
         await callback.answer("Эта кнопка предназначена другому пользователю.", show_alert=True)
         return

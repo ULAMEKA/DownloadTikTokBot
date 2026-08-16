@@ -188,6 +188,7 @@ async def chosen_music(result: ChosenInlineResult, session: AsyncSession, bot: B
         return
 
     token = uuid.uuid4().hex
+    source = source_link(m_url.group(0))
     try:
         session.add(MusicRequest(
             token=token,
@@ -200,7 +201,8 @@ async def chosen_music(result: ChosenInlineResult, session: AsyncSession, bot: B
         await session.commit()
         await bot.edit_message_text(
             inline_message_id=result.inline_message_id,
-            text="🎵 Нажмите кнопку ниже, чтобы распознать музыку.",
+            text=f"🎵 Нажмите кнопку ниже, чтобы распознать музыку.\n\n{source}",
+            parse_mode="HTML",
             reply_markup=music_button_markup(token),
         )
     except Exception:
@@ -208,7 +210,8 @@ async def chosen_music(result: ChosenInlineResult, session: AsyncSession, bot: B
         try:
             await bot.edit_message_text(
                 inline_message_id=result.inline_message_id,
-                text="❌ Не удалось подготовить распознавание. Попробуйте ещё раз.",
+                text=f"❌ Не удалось подготовить распознавание. Попробуйте ещё раз.\n\n{source}",
+                parse_mode="HTML",
                 reply_markup=None,
             )
         except Exception:

@@ -20,9 +20,10 @@ Telegram-бот на `aiogram` для загрузки видео из TikTok и
 - Повторно использует Telegram `file_id`, чтобы не скачивать уже известные видео заново.
 - Показывает выбор качества только для больших исходников и отправляет их частями
   примерно по 50 МБ.
-- Под обычным видео добавляет кнопку `🎵 Распознать музыку`: после нажатия её
-  сообщение меняется на «Идёт распознавание», а затем — на список найденных
-  треков из последовательных 15-секундных фрагментов. В inline-режиме есть
+- После отправки ссылки в личном чате кнопку `🎵 Распознать музыку` можно
+  нажать сразу или использовать карточку под уже загруженным видео. После
+  нажатия сообщение меняется на «Идёт распознавание», а затем — на список
+  найденных треков из последовательных 15-секундных фрагментов. В inline-режиме есть
   отдельный текстовый результат `🎵 Распознать музыку` с тем же сценарием;
   длинный список в нём листается стрелками.
   Режим «без описания» остаётся без дополнительного сообщения.
@@ -166,9 +167,10 @@ Linux/macOS:
 - Reuses Telegram `file_id` values instead of downloading known videos again.
 - Shows quality choices only for large source files and sends them in parts of
   about 50 MB.
-- Regular downloads include a `🎵 Recognize music` card below the video. After
-  it is pressed, the card changes to "Recognizing" and then to the tracks found
-  in sequential 15-second chunks. Inline mode has a separate text-only
+- In private chat, `🎵 Recognize music` is available immediately after sending
+  the link and also below a downloaded video. After it is pressed, the message
+  changes to "Recognizing" and then to the tracks found in sequential
+  15-second chunks. Inline mode has a separate text-only
   `🎵 Recognize music` result with the same flow; long lists use arrow buttons
   for pagination. No-description mode stays free of the extra message.
 - Recognition uses the unofficial ShazamIO client on a best-effort basis: some

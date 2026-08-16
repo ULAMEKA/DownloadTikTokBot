@@ -13,7 +13,7 @@ from pathlib import Path
 
 import imageio_ffmpeg
 import yt_dlp
-from aiogram import Bot
+from aiogram import Bot, html
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaVideo
@@ -655,7 +655,7 @@ def _format_music_tracks(tracks: list[MusicTrack]) -> str | None:
         return None
     lines = ["🎵 Найденные треки:"]
     lines.extend(
-        f"• {_format_music_timestamp(start)} — {artist} — {title}"
+        f"• {_format_music_timestamp(start)} — {html.quote(artist)} — {html.quote(title)}"
         for start, artist, title in tracks
     )
     return "\n".join(lines)
@@ -681,8 +681,10 @@ def _truncate_telegram_text(text: str, limit: int) -> str:
     return "".join(result) + "…"
 
 
-def _music_message_parts(text: str) -> list[str]:
+def _music_message_parts(text: str, suffix: str | None = None) -> list[str]:
     """Split a long result at line boundaries while repeating its heading."""
+    suffix_text = f"\n\n{suffix}" if suffix else ""
+    message_limit = MUSIC_MESSAGE_LIMIT - _telegram_text_length(suffix_text)
     heading, *lines = text.splitlines()
     parts: list[str] = []
     current = [heading]
@@ -691,18 +693,22 @@ def _music_message_parts(text: str) -> list[str]:
     for line in lines:
         line = _truncate_telegram_text(
             line,
-            MUSIC_MESSAGE_LIMIT - heading_length - 1,
+            message_limit - heading_length - 1,
         )
         added_length = _telegram_text_length(line) + 1
-        if len(current) > 1 and current_length + added_length > MUSIC_MESSAGE_LIMIT:
-            parts.append("\n".join(current))
+        if len(current) > 1 and current_length + added_length > message_limit:
+            parts.append("\n".join(current) + suffix_text)
             current = [heading, line]
-            current_length = len(heading) + added_length
+            current_length = heading_length + added_length
         else:
             current.append(line)
             current_length += added_length
-    parts.append("\n".join(current))
+    parts.append("\n".join(current) + suffix_text)
     return parts
+
+
+def _music_status_text(text: str, source_url: str | None) -> str:
+    return f"{text}\n\n{source_link(source_url)}" if source_url else text
 
 
 def _probe_duration(video_path: Path) -> float | None:
@@ -796,14 +802,18 @@ async def update_music_request_message(
     text: str,
     retry: bool = False,
     reply_markup: InlineKeyboardMarkup | None = None,
+    include_source: bool = True,
 ) -> None:
     """Update the requested music card instead of sending an unsolicited message."""
     markup = music_button_markup(request.token) if retry else reply_markup
+    if include_source:
+        text = _music_status_text(text, request.tiktok_link)
     try:
         if request.inline_message_id:
             await bot.edit_message_text(
                 inline_message_id=request.inline_message_id,
                 text=text,
+                parse_mode=ParseMode.HTML,
                 reply_markup=markup,
             )
         elif request.status_message_id:
@@ -811,6 +821,7 @@ async def update_music_request_message(
                 chat_id=request.chat_id,
                 message_id=request.status_message_id,
                 text=text,
+                parse_mode=ParseMode.HTML,
                 reply_markup=markup,
             )
     except Exception as error:
@@ -828,12 +839,14 @@ async def show_music_request_page(
         await update_music_request_message(bot, request, "🎵 Музыка в ролике не найдена.")
         return
 
-    parts = _music_message_parts(music_tracks)
+    source = source_link(request.tiktok_link) if request.tiktok_link else None
+    parts = _music_message_parts(music_tracks, source)
     page = min(max(page, 0), len(parts) - 1)
     await update_music_request_message(
         bot,
         request,
         parts[page],
+        include_source=False,
         reply_markup=_music_result_markup(request.token, page, len(parts)),
     )
 
@@ -851,11 +864,12 @@ async def show_music_request_result(
         await show_music_request_page(bot, request, 0)
         return
 
-    parts = _music_message_parts(music_tracks)
-    await update_music_request_message(bot, request, parts[0])
+    source = source_link(request.tiktok_link) if request.tiktok_link else None
+    parts = _music_message_parts(music_tracks, source)
+    await update_music_request_message(bot, request, parts[0], include_source=False)
     for part in parts[1:]:
         try:
-            await bot.send_message(request.chat_id, part)
+            await bot.send_message(request.chat_id, part, parse_mode=ParseMode.HTML)
         except Exception as error:
             logging.warning("Не удалось отправить продолжение списка треков: %s", error)
             return
@@ -997,7 +1011,11 @@ async def create_music_status(
         )
         message = await bot.send_message(
             chat_id,
-            "🎵 Нажмите кнопку ниже, чтобы распознать музыку.",
+            _music_status_text(
+                "🎵 Нажмите кнопку ниже, чтобы распознать музыку.",
+                tiktok_link,
+            ),
+            parse_mode=ParseMode.HTML,
             reply_markup=music_button_markup(request.token),
         )
         request.status_message_id = message.message_id

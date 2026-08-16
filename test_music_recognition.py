@@ -7,6 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 import init_db
+from caption import source_link
 from services.queue import (
     MUSIC_PAGE_PREFIX,
     _add_music_track,
@@ -14,6 +15,7 @@ from services.queue import (
     _music_chunk_starts,
     _music_message_parts,
     _music_result_markup,
+    _music_status_text,
     _telegram_text_length,
     can_offer_music,
 )
@@ -58,6 +60,16 @@ class MusicRecognitionTests(unittest.TestCase):
     def test_music_result_respects_telegram_utf16_limit(self) -> None:
         parts = _music_message_parts("🎵 Найденные треки:\n" + "😀" * 3000)
 
+        self.assertTrue(all(_telegram_text_length(part) <= 4096 for part in parts))
+
+    def test_music_status_and_result_parts_keep_the_source_link(self) -> None:
+        url = "https://www.tiktok.com/@author/video/123?share=1"
+        source = source_link(url)
+
+        self.assertIn(source, _music_status_text("🎵 Идёт распознавание…", url))
+        parts = _music_message_parts("🎵 Найденные треки:\n" + "Song\n" * 1000, source)
+
+        self.assertTrue(all(source in part for part in parts))
         self.assertTrue(all(_telegram_text_length(part) <= 4096 for part in parts))
 
     def test_migrates_existing_cache_and_creates_music_request_table(self) -> None:
