@@ -18,9 +18,14 @@ Telegram-бот на `aiogram` для загрузки видео из TikTok и
 - Обрабатывает загрузки через постоянную FIFO-очередь в SQLite.
 - Не принимает больше двух незавершённых загрузок от одного пользователя.
 - Повторно использует Telegram `file_id`, чтобы не скачивать уже известные видео заново.
-- Для обычных загрузок распознаёт последовательные треки по 15-секундным
-  фрагментам и присылает список найденного. Режим «без описания» и inline-режим
-  не дополняет отдельными сообщениями.
+- Показывает выбор качества только для больших исходников и отправляет их частями
+  примерно по 50 МБ.
+- Под обычным видео добавляет кнопку `🎵 Распознать музыку`: после нажатия её
+  сообщение меняется на «Идёт распознавание», а затем — на список найденных
+  треков из последовательных 15-секундных фрагментов. В inline-режиме есть
+  отдельный текстовый результат `🎵 Распознать музыку` с тем же сценарием;
+  длинный список в нём листается стрелками.
+  Режим «без описания» остаётся без дополнительного сообщения.
 - Распознавание использует неофициальный ShazamIO, поэтому работает в режиме
   best effort: часть треков может не найтись, а сервис может быть временно недоступен.
 
@@ -159,9 +164,13 @@ Linux/macOS:
 - Processes downloads through a persistent FIFO queue stored in SQLite.
 - Limits each user to two unfinished downloads in the queue.
 - Reuses Telegram `file_id` values instead of downloading known videos again.
-- For normal downloads, identifies sequential tracks from 15-second chunks and
-  sends a list of matches. It does not add a companion message in no-description
-  or inline mode.
+- Shows quality choices only for large source files and sends them in parts of
+  about 50 MB.
+- Regular downloads include a `🎵 Recognize music` card below the video. After
+  it is pressed, the card changes to "Recognizing" and then to the tracks found
+  in sequential 15-second chunks. Inline mode has a separate text-only
+  `🎵 Recognize music` result with the same flow; long lists use arrow buttons
+  for pagination. No-description mode stays free of the extra message.
 - Recognition uses the unofficial ShazamIO client on a best-effort basis: some
   tracks may not be found and the service can be temporarily unavailable.
 

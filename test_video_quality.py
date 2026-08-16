@@ -3,8 +3,11 @@ import unittest
 from services.queue import (
     MAX_SOURCE_VIDEO_BYTES,
     MAX_TELEGRAM_PART_BYTES,
+    VideoQuality,
+    _next_segment_time_seconds,
     _quality_options,
     _segment_time_seconds,
+    needs_quality_choice,
 )
 
 
@@ -59,12 +62,25 @@ class VideoQualityTests(unittest.TestCase):
 
         self.assertEqual([option.format_id for option in options], ["high", "low"])
 
-    def test_segment_time_uses_a_safe_fraction_of_the_target_size(self):
+    def test_quality_menu_is_only_needed_for_large_sources(self):
+        self.assertFalse(needs_quality_choice([
+            VideoQuality("small", "small", MAX_TELEGRAM_PART_BYTES),
+            VideoQuality("unknown", "unknown", None),
+        ]))
+        self.assertTrue(needs_quality_choice([
+            VideoQuality("large", "large", MAX_TELEGRAM_PART_BYTES + 1),
+        ]))
+
+    def test_segment_time_targets_about_fifty_megabytes_and_retries_proportionally(self):
         self.assertEqual(
             _segment_time_seconds(MAX_TELEGRAM_PART_BYTES * 4, 120),
-            25,
+            29,
         )
         self.assertEqual(_segment_time_seconds(MAX_TELEGRAM_PART_BYTES * 2, None), 30)
+        self.assertEqual(
+            _next_segment_time_seconds(60, MAX_TELEGRAM_PART_BYTES * 2),
+            28,
+        )
 
 
 if __name__ == "__main__":

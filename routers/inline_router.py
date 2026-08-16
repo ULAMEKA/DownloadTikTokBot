@@ -15,10 +15,15 @@ from aiogram.types import (
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import DownloadQueue
+from db.models import DownloadQueue, MusicRequest
 from caption import source_link
 from promo import AD_PLACEHOLDER_PHOTO_FILE_ID, loading_placeholder_caption
-from services.queue import QUEUE_LIMIT_MESSAGE, enqueue_download, hold_inline_placeholder
+from services.queue import (
+    QUEUE_LIMIT_MESSAGE,
+    enqueue_download,
+    hold_inline_placeholder,
+    music_button_markup,
+)
 from utils.links import SUPPORTED_URL_RE
 
 inline_router = Router()
@@ -65,6 +70,7 @@ async def handle_inline_query(query: InlineQuery):
             _inline_result("download_spoiler", "🙈 Отправить под спойлером", "Скрыть видео и описание до нажатия", caption, markup),
             _inline_result("download_no_description", "🧹 Без описания", "Отправить видео без описания", caption, markup),
             _inline_result("download_no_description_spoiler", "🙈 Без описания, под спойлером", "Скрыть видео до нажатия", caption, markup),
+            _inline_result("recognize_music", "🎵 Распознать музыку", "Показать список треков текстом", "🎵 Подготавливаю распознавание…", markup),
         ],
         cache_time=0,
     )
@@ -174,6 +180,48 @@ async def chosen_download(result: ChosenInlineResult, session: AsyncSession, bot
         hold_inline_placeholder(raw_inline_message_id)
 
 
+@inline_router.chosen_inline_result(F.result_id == "recognize_music")
+async def chosen_music(result: ChosenInlineResult, session: AsyncSession, bot: Bot):
+    """Create a text-only inline card that the user explicitly starts with a button."""
+    m_url = SUPPORTED_URL_RE.search(result.query)
+    if not m_url or not result.inline_message_id:
+        return
+
+    token = uuid.uuid4().hex
+    try:
+        session.add(MusicRequest(
+            token=token,
+            user_id=str(result.from_user.id),
+            chat_id=str(result.from_user.id),
+            inline_message_id=result.inline_message_id,
+            tiktok_link=m_url.group(0),
+            state="ready",
+        ))
+        await session.commit()
+        await bot.edit_message_text(
+            inline_message_id=result.inline_message_id,
+            text="🎵 Нажмите кнопку ниже, чтобы распознать музыку.",
+            reply_markup=music_button_markup(token),
+        )
+    except Exception:
+        await session.rollback()
+        try:
+            await bot.edit_message_text(
+                inline_message_id=result.inline_message_id,
+                text="❌ Не удалось подготовить распознавание. Попробуйте ещё раз.",
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+        try:
+            request = await session.get(MusicRequest, token)
+            if request is not None:
+                await session.delete(request)
+                await session.commit()
+        except Exception:
+            await session.rollback()
+
+
 @inline_router.callback_query(F.data == "inline_loading")
 async def _ack_inline_loading(callback: CallbackQuery):
     """
@@ -181,4 +229,4 @@ async def _ack_inline_loading(callback: CallbackQuery):
     просто чтобы Telegram вернул inline_message_id в ChosenInlineResult.
     Если пользователь нажмёт — погасим спиннер сразу, иначе он крутится 15с.
     """
-    await callback.answer("Видео ещё загружается, подожди немного")
+    await callback.answer("Подожди немного")

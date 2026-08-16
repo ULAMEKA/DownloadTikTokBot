@@ -24,3 +24,16 @@ class VideoCache(Base):
     storage_message_id = Column(Integer)                   # ID сообщения в Storage-канале
     description = Column(String, nullable=True)            # Описание ролика для подписи под видео
     music_tracks = Column(String, nullable=True)           # Найденные треки для повторной отправки из кеша
+
+
+class MusicRequest(Base):
+    __tablename__ = "MusicRequest"
+    token = Column(String, primary_key=True)
+    user_id = Column(String, nullable=False)
+    chat_id = Column(String, nullable=False)
+    status_message_id = Column(Integer, nullable=True)
+    inline_message_id = Column(String, nullable=True)
+    tiktok_link = Column(String, nullable=False)
+    format_id = Column(String, nullable=True)
+    state = Column(String, nullable=False)
+    music_tracks = Column(String, nullable=True)

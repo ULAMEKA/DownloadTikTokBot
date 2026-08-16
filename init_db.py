@@ -91,6 +91,24 @@ async def init_db() -> None:
             ))
             logging.info("VideoCache: добавлена колонка music_tracks")
 
+        # 7. MusicRequest: add UI message references for installations that
+        #    already created the table before manual recognition was refined.
+        try:
+            await conn.execute(text("SELECT status_message_id FROM MusicRequest LIMIT 1"))
+        except Exception:  # noqa: BLE001
+            await conn.execute(text(
+                "ALTER TABLE MusicRequest ADD COLUMN status_message_id INTEGER"
+            ))
+            logging.info("MusicRequest: добавлена колонка status_message_id")
+
+        try:
+            await conn.execute(text("SELECT inline_message_id FROM MusicRequest LIMIT 1"))
+        except Exception:  # noqa: BLE001
+            await conn.execute(text(
+                "ALTER TABLE MusicRequest ADD COLUMN inline_message_id TEXT"
+            ))
+            logging.info("MusicRequest: добавлена колонка inline_message_id")
+
     await engine.dispose()
 
 

@@ -8,11 +8,14 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 import init_db
 from services.queue import (
+    MUSIC_PAGE_PREFIX,
     _add_music_track,
     _format_music_tracks,
     _music_chunk_starts,
-    _should_refresh_cached_music,
-    _should_send_music_tracks,
+    _music_message_parts,
+    _music_result_markup,
+    _telegram_text_length,
+    can_offer_music,
 )
 
 
@@ -36,16 +39,29 @@ class MusicRecognitionTests(unittest.TestCase):
             [(0, "Artist", "Song"), (30, "Artist", "Another"), (45, "Artist", "Song")],
         )
 
-    def test_formats_timestamps_and_keeps_no_description_and_inline_clean(self) -> None:
+    def test_formats_timestamps_and_keeps_video_inline_and_no_description_button_free(self) -> None:
         self.assertIn("00:15 — Artist — Song", _format_music_tracks([(15, "Artist", "Song")]) or "")
-        self.assertTrue(_should_send_music_tracks(False, None))
-        self.assertFalse(_should_send_music_tracks(True, None))
-        self.assertFalse(_should_send_music_tracks(False, "inline-message-id"))
-        self.assertTrue(_should_refresh_cached_music(None, True))
-        self.assertFalse(_should_refresh_cached_music("", True))
+        self.assertTrue(can_offer_music(False, None))
+        self.assertFalse(can_offer_music(True, None))
+        self.assertFalse(can_offer_music(False, "inline-message-id"))
 
-    def test_migrates_existing_cache_with_music_tracks_column(self) -> None:
-        async def check_migration() -> list[str]:
+    def test_inline_result_pages_keep_the_remaining_tracks_reachable(self) -> None:
+        token = "a" * 32
+        markup = _music_result_markup(token, 0, 2)
+
+        self.assertIsNotNone(markup)
+        self.assertEqual(
+            markup.inline_keyboard[0][0].callback_data,
+            f"{MUSIC_PAGE_PREFIX}{token}:1",
+        )
+
+    def test_music_result_respects_telegram_utf16_limit(self) -> None:
+        parts = _music_message_parts("🎵 Найденные треки:\n" + "😀" * 3000)
+
+        self.assertTrue(all(_telegram_text_length(part) <= 4096 for part in parts))
+
+    def test_migrates_existing_cache_and_creates_music_request_table(self) -> None:
+        async def check_migration() -> tuple[list[str], list[str], list[str]]:
             with tempfile.TemporaryDirectory() as temp_dir:
                 database_path = Path(temp_dir) / "legacy.db"
                 engine = create_async_engine(f"sqlite+aiosqlite:///{database_path.as_posix()}")
@@ -55,6 +71,12 @@ class MusicRecognitionTests(unittest.TestCase):
                         "id INTEGER PRIMARY KEY, tiktok_id TEXT UNIQUE, file_id TEXT, "
                         "storage_message_id INTEGER, description TEXT)"
                     ))
+                    await conn.execute(text(
+                        "CREATE TABLE MusicRequest ("
+                        "token TEXT PRIMARY KEY, user_id TEXT NOT NULL, chat_id TEXT NOT NULL, "
+                        "tiktok_link TEXT NOT NULL, format_id TEXT, state TEXT NOT NULL, "
+                        "music_tracks TEXT)"
+                    ))
 
                 original_engine = init_db.engine
                 init_db.engine = engine
@@ -62,12 +84,24 @@ class MusicRecognitionTests(unittest.TestCase):
                     await init_db.init_db()
                     async with engine.connect() as conn:
                         result = await conn.execute(text("PRAGMA table_info(VideoCache)"))
-                        return [row[1] for row in result]
+                        music_result = await conn.execute(text("PRAGMA table_info(MusicRequest)"))
+                        tables = await conn.execute(text(
+                            "SELECT name FROM sqlite_master WHERE type='table'"
+                        ))
+                        return (
+                            [row[1] for row in result],
+                            [row[1] for row in music_result],
+                            [row[0] for row in tables],
+                        )
                 finally:
                     init_db.engine = original_engine
                     await engine.dispose()
 
-        self.assertIn("music_tracks", asyncio.run(check_migration()))
+        columns, music_columns, tables = asyncio.run(check_migration())
+        self.assertIn("music_tracks", columns)
+        self.assertIn("MusicRequest", tables)
+        self.assertIn("status_message_id", music_columns)
+        self.assertIn("inline_message_id", music_columns)
 
 
 if __name__ == "__main__":

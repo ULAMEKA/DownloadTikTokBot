@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,12 +16,12 @@ import yt_dlp
 from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
-from aiogram.types import FSInputFile, InlineKeyboardMarkup, InputMediaVideo
+from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaVideo
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.session import SessionLocal
-from db.models import DownloadQueue, VideoCache
+from db.models import DownloadQueue, MusicRequest, VideoCache
 from caption import build_caption, source_link
 from promo import AD_DISPLAY_SECONDS
 
@@ -44,12 +45,14 @@ _AUDIO_EXTENSIONS = {".aac", ".m4a", ".mp3", ".ogg", ".opus", ".wav"}
 _VIDEO_EXTENSIONS = {".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 DEFAULT_FORMAT = "best[vcodec^=h264]/best[vcodec!*=265][vcodec!*=hev]/best"
 MAX_SOURCE_VIDEO_BYTES = 1_000_000_000
-MAX_TELEGRAM_PART_BYTES = 45 * 1024 * 1024
+MAX_TELEGRAM_PART_BYTES = 48_000_000
 MAX_QUALITY_OPTIONS = 6
 MAX_ACTIVE_DOWNLOADS_PER_USER = 2
 MUSIC_CHUNK_SECONDS = 15
 MUSIC_RECOGNITION_TIMEOUT_SECONDS = 15
 MUSIC_MESSAGE_LIMIT = 4096
+MUSIC_JOB_PREFIX = "music:"
+MUSIC_PAGE_PREFIX = "music_page:"
 QUEUE_LIMIT_MESSAGE = (
     "Можно поставить в очередь не больше 2 видео одновременно. "
     "Дождись завершения текущих загрузок."
@@ -175,6 +178,14 @@ def list_video_qualities(url: str) -> list[VideoQuality]:
     with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore[arg-type]
         info = ydl.extract_info(url, download=False)
     return _quality_options(info.get("formats") if info else None)
+
+
+def needs_quality_choice(qualities: list[VideoQuality]) -> bool:
+    """Only ask when the available source is too large for one Telegram video."""
+    return any(
+        quality.filesize is not None and quality.filesize > MAX_TELEGRAM_PART_BYTES
+        for quality in qualities
+    )
 
 
 def _resolve_media(url: str) -> tuple[str | None, str, int | None]:
@@ -342,7 +353,17 @@ def _download_media(
 def _segment_time_seconds(size: int, duration: float | None) -> int:
     if duration is None or duration <= 0:
         return 30
-    return max(1, int(duration * MAX_TELEGRAM_PART_BYTES / size * 0.85))
+    return max(1, int(duration * MAX_TELEGRAM_PART_BYTES / size * 0.97))
+
+
+def _next_segment_time_seconds(part_seconds: int, largest_size: int) -> int:
+    """Shrink the retry proportionally, keeping stream-copy splits near 48 MB."""
+    if part_seconds <= 1:
+        return 1
+    if largest_size <= 0:
+        return max(1, part_seconds // 2)
+    estimate = int(part_seconds * MAX_TELEGRAM_PART_BYTES / largest_size * 0.95)
+    return min(part_seconds - 1, max(1, estimate))
 
 
 def _split_video(video_path: Path, duration: float | None) -> tuple[list[Path], Path | None]:
@@ -374,7 +395,8 @@ def _split_video(video_path: Path, duration: float | None) -> tuple[list[Path], 
             parts = sorted(part_dir.glob(f"part_*{suffix}"))
             if parts and all(part.stat().st_size <= MAX_TELEGRAM_PART_BYTES for part in parts):
                 return parts, part_dir
-            part_seconds = max(1, part_seconds // 2)
+            largest_size = max((part.stat().st_size for part in parts), default=0)
+            part_seconds = _next_segment_time_seconds(part_seconds, largest_size)
     except Exception:
         shutil.rmtree(part_dir, ignore_errors=True)
         raise
@@ -429,6 +451,28 @@ async def _show_download_error(
         await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
     except (TelegramBadRequest, TelegramForbiddenError):
         pass
+
+
+def music_button_markup(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="🎵 Распознать музыку",
+            callback_data=f"{MUSIC_JOB_PREFIX}{token}",
+        )
+    ]])
+
+
+def _music_result_markup(token: str, page: int, pages: int) -> InlineKeyboardMarkup | None:
+    buttons: list[InlineKeyboardButton] = []
+    if page:
+        buttons.append(InlineKeyboardButton(
+            text="◀️", callback_data=f"{MUSIC_PAGE_PREFIX}{token}:{page - 1}"
+        ))
+    if page + 1 < pages:
+        buttons.append(InlineKeyboardButton(
+            text="▶️", callback_data=f"{MUSIC_PAGE_PREFIX}{token}:{page + 1}"
+        ))
+    return InlineKeyboardMarkup(inline_keyboard=[buttons]) if buttons else None
 
 
 async def _deliver_video(
@@ -565,14 +609,9 @@ def _remove_download_files(filename: str) -> None:
             path.unlink(missing_ok=True)
 
 
-def _should_send_music_tracks(without_description: bool, inline_message_id: str | None) -> bool:
-    """Inline results and the literal-video mode cannot receive a companion message."""
+def can_offer_music(without_description: bool, inline_message_id: str | None) -> bool:
+    """Literal-video and video-inline modes stay free of the extra status message."""
     return not without_description and not inline_message_id
-
-
-def _should_refresh_cached_music(music_tracks: str | None, send_music_tracks: bool) -> bool:
-    """NULL means this cache entry predates recognition or was not scanned successfully."""
-    return send_music_tracks and music_tracks is None
 
 
 def _music_chunk_starts(duration: float) -> range:
@@ -622,16 +661,39 @@ def _format_music_tracks(tracks: list[MusicTrack]) -> str | None:
     return "\n".join(lines)
 
 
+def _telegram_text_length(text: str) -> int:
+    """Telegram measures text limits in UTF-16 code units, not Python characters."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _truncate_telegram_text(text: str, limit: int) -> str:
+    if _telegram_text_length(text) <= limit:
+        return text
+
+    result: list[str] = []
+    used = 0
+    for character in text:
+        character_length = 2 if ord(character) > 0xFFFF else 1
+        if used + character_length > limit - 1:
+            break
+        result.append(character)
+        used += character_length
+    return "".join(result) + "…"
+
+
 def _music_message_parts(text: str) -> list[str]:
     """Split a long result at line boundaries while repeating its heading."""
     heading, *lines = text.splitlines()
     parts: list[str] = []
     current = [heading]
-    current_length = len(heading)
+    heading_length = _telegram_text_length(heading)
+    current_length = heading_length
     for line in lines:
-        if len(line) > MUSIC_MESSAGE_LIMIT - len(heading) - 1:
-            line = f"{line[:MUSIC_MESSAGE_LIMIT - len(heading) - 2]}…"
-        added_length = len(line) + 1
+        line = _truncate_telegram_text(
+            line,
+            MUSIC_MESSAGE_LIMIT - heading_length - 1,
+        )
+        added_length = _telegram_text_length(line) + 1
         if len(current) > 1 and current_length + added_length > MUSIC_MESSAGE_LIMIT:
             parts.append("\n".join(current))
             current = [heading, line]
@@ -643,7 +705,7 @@ def _music_message_parts(text: str) -> list[str]:
     return parts
 
 
-def _probe_music_duration(video_path: Path) -> float | None:
+def _probe_duration(video_path: Path) -> float | None:
     result = subprocess.run(
         [FFMPEG_EXE, "-hide_banner", "-i", str(video_path)],
         check=False,
@@ -682,7 +744,7 @@ async def _recognize_music_tracks(video_path: Path, duration: float | None) -> s
             or duration <= 0
         ):
             loop = asyncio.get_running_loop()
-            duration = await loop.run_in_executor(None, _probe_music_duration, video_path)
+            duration = await loop.run_in_executor(None, _probe_duration, video_path)
         if duration is None or duration <= 0:
             logging.info("Не удалось определить длительность для распознавания музыки: %s", video_path)
             return None
@@ -728,39 +790,229 @@ async def _recognize_music_tracks(video_path: Path, duration: float | None) -> s
         return None
 
 
-async def _send_music_tracks(bot: Bot, chat_id: str, music_tracks: str | None) -> None:
+async def update_music_request_message(
+    bot: Bot,
+    request: MusicRequest,
+    text: str,
+    retry: bool = False,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    """Update the requested music card instead of sending an unsolicited message."""
+    markup = music_button_markup(request.token) if retry else reply_markup
+    try:
+        if request.inline_message_id:
+            await bot.edit_message_text(
+                inline_message_id=request.inline_message_id,
+                text=text,
+                reply_markup=markup,
+            )
+        elif request.status_message_id:
+            await bot.edit_message_text(
+                chat_id=request.chat_id,
+                message_id=request.status_message_id,
+                text=text,
+                reply_markup=markup,
+            )
+    except Exception as error:
+        logging.warning("Не удалось обновить карточку распознавания: %s", error)
+
+
+async def show_music_request_page(
+    bot: Bot,
+    request: MusicRequest,
+    page: int,
+) -> None:
+    """Show one inline page so a long result remains fully accessible."""
+    music_tracks = request.music_tracks
     if not music_tracks:
+        await update_music_request_message(bot, request, "🎵 Музыка в ролике не найдена.")
         return
-    for part in _music_message_parts(music_tracks):
+
+    parts = _music_message_parts(music_tracks)
+    page = min(max(page, 0), len(parts) - 1)
+    await update_music_request_message(
+        bot,
+        request,
+        parts[page],
+        reply_markup=_music_result_markup(request.token, page, len(parts)),
+    )
+
+
+async def show_music_request_result(
+    bot: Bot,
+    request: MusicRequest,
+    music_tracks: str | None,
+) -> None:
+    if not music_tracks:
+        await update_music_request_message(bot, request, "🎵 Музыка в ролике не найдена.")
+        return
+
+    if request.inline_message_id:
+        await show_music_request_page(bot, request, 0)
+        return
+
+    parts = _music_message_parts(music_tracks)
+    await update_music_request_message(bot, request, parts[0])
+    for part in parts[1:]:
         try:
-            await bot.send_message(chat_id, part)
-        except Exception as error:  # A companion message must not fail the completed download.
-            logging.warning("Не удалось отправить список треков в chat=%s: %s", chat_id, error)
+            await bot.send_message(request.chat_id, part)
+        except Exception as error:
+            logging.warning("Не удалось отправить продолжение списка треков: %s", error)
             return
 
 
-async def _refresh_cached_music_tracks(tiktok_link: str, filename: str) -> str | None:
-    """Re-download only to enrich an old cache entry after its video was delivered."""
-    refresh_filename = f"{filename}_music"
-    outtmpl = str(VIDEO_DIR / f"{refresh_filename}.%(ext)s")  # cspell:disable-line
-    slideshow_path = VIDEO_DIR / f"{refresh_filename}.mp4"
+async def _recognize_music_from_source(
+    tiktok_link: str,
+    filename: str,
+    format_id: str | None,
+) -> str | None:
+    """Download only after a button press, then clean the temporary source file."""
+    outtmpl = str(VIDEO_DIR / f"{filename}.%(ext)s")  # cspell:disable-line
+    slideshow_path = VIDEO_DIR / f"{filename}.mp4"
     try:
         loop = asyncio.get_running_loop()
         _, _, _, _, duration = await loop.run_in_executor(
-            None, _download_media, tiktok_link, outtmpl, slideshow_path, None
+            None, _download_media, tiktok_link, outtmpl, slideshow_path, format_id
         )
         matches = [
-            path for path in VIDEO_DIR.glob(f"{refresh_filename}.*")
+            path for path in VIDEO_DIR.glob(f"{filename}.*")
             if path.suffix.lower() in _VIDEO_EXTENSIONS
         ]
         if not matches:
             return None
         return await _recognize_music_tracks(matches[0], duration)
-    except Exception as error:  # The cached video has already reached the user.
-        logging.info("Не удалось обновить список треков из кеша: %s", error)
+    except Exception as error:
+        logging.info("Не удалось скачать ролик для распознавания музыки: %s", error)
         return None
     finally:
-        _remove_download_files(refresh_filename)
+        _remove_download_files(filename)
+
+
+async def _process_music_job(
+    bot: Bot,
+    session: AsyncSession,
+    item: DownloadQueue,
+    token: str,
+) -> None:
+    """Run one requested recognition in the existing FIFO worker."""
+    request: MusicRequest | None = None
+    music_tracks: str | None = None
+    retry = False
+    try:
+        request = await session.get(MusicRequest, token)
+        if request is None or request.state != "queued":
+            await session.delete(item)
+            await session.commit()
+            return
+
+        music_tracks = await _recognize_music_from_source(
+            request.tiktok_link,
+            item.filename,
+            request.format_id,
+        )
+        if music_tracks is None:
+            request.state = "ready"
+            result_text = "❌ Не удалось распознать музыку. Попробуйте ещё раз."
+            retry = True
+        elif music_tracks:
+            request.music_tracks = music_tracks
+            request.state = "done"
+            result_text = ""
+        else:
+            request.music_tracks = ""
+            request.state = "done"
+            result_text = ""
+
+        await session.delete(item)
+        await session.commit()
+    except Exception:
+        logging.exception("Ошибка распознавания музыки: token=%s", token)
+        await session.rollback()
+        try:
+            request = await session.get(MusicRequest, token)
+            if request is not None:
+                request.state = "ready"
+            queued_item = await session.get(DownloadQueue, item.id)
+            if queued_item is not None:
+                await session.delete(queued_item)
+            await session.commit()
+        except Exception:
+            logging.exception("Не удалось очистить задачу распознавания: token=%s", token)
+            await session.rollback()
+        result_text = "❌ Не удалось распознать музыку. Попробуйте ещё раз."
+        music_tracks = None
+        retry = True
+
+    if request is None:
+        return
+    if retry:
+        await update_music_request_message(bot, request, result_text, retry=True)
+    else:
+        await show_music_request_result(bot, request, music_tracks)
+
+
+async def _create_music_request(
+    session: AsyncSession,
+    user_id: str,
+    chat_id: str,
+    tiktok_link: str,
+    format_id: str | None,
+    music_tracks: str | None = None,
+    inline_message_id: str | None = None,
+) -> MusicRequest:
+    request = MusicRequest(
+        token=uuid.uuid4().hex,
+        user_id=user_id,
+        chat_id=chat_id,
+        inline_message_id=inline_message_id,
+        tiktok_link=tiktok_link,
+        format_id=format_id,
+        state="done" if music_tracks is not None else "ready",
+        music_tracks=music_tracks,
+    )
+    session.add(request)
+    # The row must be visible before Telegram receives the callback button.
+    await session.commit()
+    return request
+
+
+async def create_music_status(
+    bot: Bot,
+    session: AsyncSession,
+    user_id: str,
+    chat_id: str,
+    tiktok_link: str,
+    format_id: str | None,
+    music_tracks: str | None = None,
+) -> None:
+    request: MusicRequest | None = None
+    try:
+        request = await _create_music_request(
+            session,
+            user_id,
+            chat_id,
+            tiktok_link,
+            format_id,
+            music_tracks,
+        )
+        message = await bot.send_message(
+            chat_id,
+            "🎵 Нажмите кнопку ниже, чтобы распознать музыку.",
+            reply_markup=music_button_markup(request.token),
+        )
+        request.status_message_id = message.message_id
+        await session.commit()
+    except Exception as error:
+        logging.warning("Не удалось создать карточку распознавания: %s", error)
+        await session.rollback()
+        if request is not None:
+            try:
+                request = await session.get(MusicRequest, request.token)
+                if request is not None:
+                    await session.delete(request)
+                    await session.commit()
+            except Exception:
+                await session.rollback()
 
 
 async def process_queue(bot: Bot) -> None:
@@ -779,6 +1031,18 @@ async def process_queue(bot: Bot) -> None:
             if item.chat_id is None or item.filename is None or item.tiktok_link is None:
                 await session.delete(item)
                 await session.commit()
+                continue
+
+            if (
+                item.inline_message_id
+                and item.inline_message_id.startswith(MUSIC_JOB_PREFIX)
+            ):
+                await _process_music_job(
+                    bot,
+                    session,
+                    item,
+                    item.inline_message_id.removeprefix(MUSIC_JOB_PREFIX),
+                )
                 continue
 
             chat_id: str = item.chat_id
@@ -816,8 +1080,6 @@ async def process_queue(bot: Bot) -> None:
                         inline_message_id = inline_message_id.removeprefix("no_description:")
                     else:
                         break
-            send_music_tracks = _should_send_music_tracks(without_description, inline_message_id)
-
             try:
                 loop = asyncio.get_running_loop()
 
@@ -835,7 +1097,7 @@ async def process_queue(bot: Bot) -> None:
                     cached = cache_res.scalar()
                     if cached and cached.file_id:
                         logging.info("Cache hit: tiktok_id=%s → отправляем без загрузки", tiktok_id)
-                        await _deliver_video(
+                        delivered_file_id = await _deliver_video(
                             bot, chat_id, inline_message_id,
                             file_id=cached.file_id, video_path=None,
                             description=cached.description, source_url=source_url,
@@ -845,14 +1107,20 @@ async def process_queue(bot: Bot) -> None:
                             has_spoiler=has_spoiler,
                             without_description=without_description,
                         )
-                        if _should_refresh_cached_music(cached.music_tracks, send_music_tracks):
-                            logging.info("Cache hit without music data: tiktok_id=%s → обновляем", tiktok_id)
-                            music_tracks = await _refresh_cached_music_tracks(tiktok_link, filename)
-                            if music_tracks is not None:
-                                cached.music_tracks = music_tracks
-                                await _send_music_tracks(bot, chat_id, music_tracks)
-                        elif send_music_tracks:
-                            await _send_music_tracks(bot, chat_id, cached.music_tracks)
+                        if (
+                            delivered_file_id
+                            and can_offer_music(without_description, inline_message_id)
+                            and item.user_id
+                        ):
+                            await create_music_status(
+                                bot,
+                                session,
+                                item.user_id,
+                                chat_id,
+                                source_url,
+                                format_id,
+                                cached.music_tracks,
+                            )
                         await session.delete(item)
                         await session.commit()
                         continue
@@ -878,6 +1146,12 @@ async def process_queue(bot: Bot) -> None:
                 if video_path.stat().st_size > MAX_SOURCE_VIDEO_BYTES:
                     raise VideoTooLargeError
 
+                if (
+                    not isinstance(duration, (int, float))
+                    or not math.isfinite(duration)
+                    or duration <= 0
+                ):
+                    duration = await loop.run_in_executor(None, _probe_duration, video_path)
                 parts, part_dir = await loop.run_in_executor(None, _split_video, video_path, duration)
                 if len(parts) > 1:
                     if inline_message_id:
@@ -906,10 +1180,16 @@ async def process_queue(bot: Bot) -> None:
                                 await asyncio.sleep(error.retry_after)
                         placeholder_message_id = None
                         part.unlink(missing_ok=True)
-                    if send_music_tracks:
-                        music_tracks = await _recognize_music_tracks(video_path, duration)
-                        await _send_music_tracks(bot, chat_id, music_tracks)
                     video_path.unlink(missing_ok=True)
+                    if can_offer_music(without_description, inline_message_id) and item.user_id:
+                        await create_music_status(
+                            bot,
+                            session,
+                            item.user_id,
+                            chat_id,
+                            source_url,
+                            format_id,
+                        )
                     await session.delete(item)
                     await session.commit()
                     continue
@@ -950,12 +1230,19 @@ async def process_queue(bot: Bot) -> None:
                 )
                 if result_file_id and not file_id:
                     file_id = result_file_id  # сохраним для кеша
-
-                music_tracks = None
-                if send_music_tracks or (format_id is None and final_id and file_id):
-                    music_tracks = await _recognize_music_tracks(video_path, duration)
-                if send_music_tracks:
-                    await _send_music_tracks(bot, chat_id, music_tracks)
+                if (
+                    result_file_id
+                    and can_offer_music(without_description, inline_message_id)
+                    and item.user_id
+                ):
+                    await create_music_status(
+                        bot,
+                        session,
+                        item.user_id,
+                        chat_id,
+                        source_url,
+                        format_id,
+                    )
 
                 # 6. Удаляем файл и кешируем
                 os.remove(video_path)
@@ -965,14 +1252,13 @@ async def process_queue(bot: Bot) -> None:
                         cached.file_id = file_id
                         cached.storage_message_id = storage_message_id
                         cached.description = description
-                        cached.music_tracks = music_tracks
                     else:
                         session.add(VideoCache(
                             tiktok_id=final_id,
                             file_id=file_id,
                             storage_message_id=storage_message_id,
                             description=description,
-                            music_tracks=music_tracks,
+                            music_tracks=None,
                         ))
 
                 await session.delete(item)
