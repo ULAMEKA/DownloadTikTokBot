@@ -16,6 +16,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import DownloadQueue
+from caption import source_link
 from promo import AD_PLACEHOLDER_PHOTO_FILE_ID, loading_placeholder_caption
 from services.queue import QUEUE_LIMIT_MESSAGE, enqueue_download, hold_inline_placeholder
 from utils.links import SUPPORTED_URL_RE
@@ -122,21 +123,31 @@ async def chosen_download(result: ChosenInlineResult, session: AsyncSession, bot
 
     if not await enqueue_download(session, queue_item, str(result.from_user.id)):
         if raw_inline_message_id:
+            error_text = f"{QUEUE_LIMIT_MESSAGE}\n\n{source_link(url)}"
             try:
                 await bot.edit_message_caption(
                     inline_message_id=raw_inline_message_id,
-                    caption=QUEUE_LIMIT_MESSAGE,
+                    caption=error_text,
+                    parse_mode="HTML",
                     reply_markup=None,
                 )
             except (TelegramBadRequest, TelegramForbiddenError):
                 try:
                     await bot.edit_message_text(
                         inline_message_id=raw_inline_message_id,
-                        text=QUEUE_LIMIT_MESSAGE,
+                        text=error_text,
+                        parse_mode="HTML",
                         reply_markup=None,
                     )
                 except (TelegramBadRequest, TelegramForbiddenError):
-                    pass
+                    try:
+                        await bot.send_message(
+                            chat_id=result.from_user.id,
+                            text=error_text,
+                            parse_mode="HTML",
+                        )
+                    except (TelegramBadRequest, TelegramForbiddenError):
+                        pass
         return
     stmt = select(func.count()).select_from(DownloadQueue).where(DownloadQueue.id <= queue_item.id)
     position = (await session.execute(stmt)).scalar_one()

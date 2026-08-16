@@ -9,6 +9,7 @@ class DownloadQueue(Base):
     user_id = Column(String, nullable=True)
     filename = Column(String)
     tiktok_link = Column(String)
+    format_id = Column(String, nullable=True)
     reply_to_message_id = Column(Integer, nullable=True)
     # Для inline-режима: ID отправленного сообщения в чате.
     # Если задан — очередь редактирует это сообщение, вставляя видео прямо в чат.
@@ -22,3 +23,4 @@ class VideoCache(Base):
     file_id = Column(String)                               # Telegram file_id для быстрой пересылки
     storage_message_id = Column(Integer)                   # ID сообщения в Storage-канале
     description = Column(String, nullable=True)            # Описание ролика для подписи под видео
+    music_tracks = Column(String, nullable=True)           # Найденные треки для повторной отправки из кеша

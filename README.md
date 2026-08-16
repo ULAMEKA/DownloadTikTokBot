@@ -18,6 +18,11 @@ Telegram-бот на `aiogram` для загрузки видео из TikTok и
 - Обрабатывает загрузки через постоянную FIFO-очередь в SQLite.
 - Не принимает больше двух незавершённых загрузок от одного пользователя.
 - Повторно использует Telegram `file_id`, чтобы не скачивать уже известные видео заново.
+- Для обычных загрузок распознаёт последовательные треки по 15-секундным
+  фрагментам и присылает список найденного. Режим «без описания» и inline-режим
+  не дополняет отдельными сообщениями.
+- Распознавание использует неофициальный ShazamIO, поэтому работает в режиме
+  best effort: часть треков может не найтись, а сервис может быть временно недоступен.
 
 ### Требования
 
@@ -154,6 +159,11 @@ Linux/macOS:
 - Processes downloads through a persistent FIFO queue stored in SQLite.
 - Limits each user to two unfinished downloads in the queue.
 - Reuses Telegram `file_id` values instead of downloading known videos again.
+- For normal downloads, identifies sequential tracks from 15-second chunks and
+  sends a list of matches. It does not add a companion message in no-description
+  or inline mode.
+- Recognition uses the unofficial ShazamIO client on a best-effort basis: some
+  tracks may not be found and the service can be temporarily unavailable.
 
 ### Requirements
 

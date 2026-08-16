@@ -61,6 +61,14 @@ async def init_db() -> None:
             ))
             logging.info("BotDownloadQueue: добавлена колонка user_id")
 
+        try:
+            await conn.execute(text("SELECT format_id FROM BotDownloadQueue LIMIT 1"))
+        except Exception:  # noqa: BLE001
+            await conn.execute(text(
+                "ALTER TABLE BotDownloadQueue ADD COLUMN format_id TEXT"
+            ))
+            logging.info("BotDownloadQueue: добавлена колонка format_id")
+
         # 4. Повторный create_all пересоздаёт VideoCache, если миграция её удалила.
         await conn.run_sync(Base.metadata.create_all)
 
@@ -73,6 +81,15 @@ async def init_db() -> None:
                 "ALTER TABLE VideoCache ADD COLUMN description TEXT"
             ))
             logging.info("VideoCache: добавлена колонка description")
+
+        # 6. Миграция VideoCache: сохраняем список распознанных треков в кеше.
+        try:
+            await conn.execute(text("SELECT music_tracks FROM VideoCache LIMIT 1"))
+        except Exception:  # noqa: BLE001
+            await conn.execute(text(
+                "ALTER TABLE VideoCache ADD COLUMN music_tracks TEXT"
+            ))
+            logging.info("VideoCache: добавлена колонка music_tracks")
 
     await engine.dispose()
 
