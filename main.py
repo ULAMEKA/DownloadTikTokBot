@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 
 from dotenv import load_dotenv
@@ -44,12 +45,14 @@ if __name__ == '__main__':
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler("bot.log"),
-            logging.StreamHandler()
+            RotatingFileHandler(
+                "bot.log",
+                maxBytes=45_000_000,
+                backupCount=1,
+                encoding="utf-8",
+            ),
         ]
     )
-    # Глушим спам SQLAlchemy (BEGIN, ROLLBACK, SELECT каждую секунду)
-    logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 
     try:
         asyncio.run(main())
