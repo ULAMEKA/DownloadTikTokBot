@@ -22,6 +22,10 @@ _SUPPORTED_HOSTS = {
     "www.instagram.com",
     "www.tiktok.com",
 }
+_TIKTOK_CACHE_MEDIA_PATH_RE = re.compile(
+    r"^/@[^/]+/(?:video|photo)/([^/]+)/?$",
+)
+_INSTAGRAM_CACHE_MEDIA_PATH_RE = re.compile(r"^/reels?/([^/]+)/?$")
 
 
 def clean_video_url(url: str) -> str:
@@ -70,6 +74,19 @@ def canonicalize_video_url(url: str) -> str:
         }:
             return current
     return cleaned
+
+
+def cache_media_id(url: str) -> str | None:
+    """Возвращает стабильный ID медиа для канонической ссылки без сети."""
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    if host in {"tiktok.com", "www.tiktok.com"}:
+        match = _TIKTOK_CACHE_MEDIA_PATH_RE.fullmatch(parts.path)
+    elif host in {"instagram.com", "www.instagram.com"}:
+        match = _INSTAGRAM_CACHE_MEDIA_PATH_RE.fullmatch(parts.path)
+    else:
+        return None
+    return match.group(1) if match else None
 
 
 def find_video_url(text: str) -> str | None:

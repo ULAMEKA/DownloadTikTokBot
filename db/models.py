@@ -25,6 +25,8 @@ class VideoCache(Base):
     storage_message_id = Column(Integer)                   # ID сообщения в Storage-канале
     description = Column(String, nullable=True)            # Описание ролика для подписи под видео
     music_tracks = Column(String, nullable=True)           # Найденные треки для повторной отправки из кеша
+    source_url = Column(String, nullable=True)             # Каноническая ссылка на источник при записи в кеш
+    likes = Column(Integer, nullable=True)                 # Снимок количества лайков при записи в кеш
 
 
 class MusicRequest(Base):

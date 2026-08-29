@@ -73,7 +73,7 @@ class MusicRecognitionTests(unittest.TestCase):
         self.assertTrue(all(_telegram_text_length(part) <= 4096 for part in parts))
 
     def test_migrates_existing_cache_and_creates_music_request_table(self) -> None:
-        async def check_migration() -> tuple[list[str], list[str], list[str]]:
+        async def check_migration() -> tuple[list[str], list[str], list[str], list[str]]:
             with tempfile.TemporaryDirectory() as temp_dir:
                 database_path = Path(temp_dir) / "legacy.db"
                 engine = create_async_engine(f"sqlite+aiosqlite:///{database_path.as_posix()}")
@@ -89,6 +89,11 @@ class MusicRecognitionTests(unittest.TestCase):
                         "tiktok_link TEXT NOT NULL, format_id TEXT, state TEXT NOT NULL, "
                         "music_tracks TEXT)"
                     ))
+                    await conn.execute(text(
+                        "INSERT INTO VideoCache "
+                        "(id, tiktok_id, file_id, storage_message_id, description) "
+                        "VALUES (1, 'legacy', 'file-id', 100, 'description')"
+                    ))
 
                 original_engine = init_db.engine
                 init_db.engine = engine
@@ -100,20 +105,25 @@ class MusicRecognitionTests(unittest.TestCase):
                         tables = await conn.execute(text(
                             "SELECT name FROM sqlite_master WHERE type='table'"
                         ))
+                        rows = await conn.execute(text("SELECT file_id FROM VideoCache"))
                         return (
                             [row[1] for row in result],
                             [row[1] for row in music_result],
                             [row[0] for row in tables],
+                            [row[0] for row in rows],
                         )
                 finally:
                     init_db.engine = original_engine
                     await engine.dispose()
 
-        columns, music_columns, tables = asyncio.run(check_migration())
+        columns, music_columns, tables, cached_file_ids = asyncio.run(check_migration())
         self.assertIn("music_tracks", columns)
+        self.assertIn("source_url", columns)
+        self.assertIn("likes", columns)
         self.assertIn("MusicRequest", tables)
         self.assertIn("status_message_id", music_columns)
         self.assertIn("inline_message_id", music_columns)
+        self.assertEqual(cached_file_ids, ["file-id"])
 
 
 if __name__ == "__main__":

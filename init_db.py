@@ -91,7 +91,25 @@ async def init_db() -> None:
             ))
             logging.info("VideoCache: добавлена колонка music_tracks")
 
-        # 7. MusicRequest: add UI message references for installations that
+        # 7. Миграция VideoCache: сохраняем исходную ссылку как snapshot кеша.
+        try:
+            await conn.execute(text("SELECT source_url FROM VideoCache LIMIT 1"))
+        except Exception:  # noqa: BLE001
+            await conn.execute(text(
+                "ALTER TABLE VideoCache ADD COLUMN source_url TEXT"
+            ))
+            logging.info("VideoCache: добавлена колонка source_url")
+
+        # 8. Миграция VideoCache: сохраняем число лайков как snapshot кеша.
+        try:
+            await conn.execute(text("SELECT likes FROM VideoCache LIMIT 1"))
+        except Exception:  # noqa: BLE001
+            await conn.execute(text(
+                "ALTER TABLE VideoCache ADD COLUMN likes INTEGER"
+            ))
+            logging.info("VideoCache: добавлена колонка likes")
+
+        # 9. MusicRequest: add UI message references for installations that
         #    already created the table before manual recognition was refined.
         try:
             await conn.execute(text("SELECT status_message_id FROM MusicRequest LIMIT 1"))

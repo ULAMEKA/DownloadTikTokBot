@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 from gallery_dl.extractor.message import Message as GalleryMessage
 
-from utils.links import canonicalize_video_url, clean_video_url, find_video_url
+from utils.links import cache_media_id, canonicalize_video_url, clean_video_url, find_video_url
 
 
 class LinkCleanupTests(unittest.TestCase):
@@ -49,6 +49,9 @@ class LinkCleanupTests(unittest.TestCase):
                 canonicalize_video_url("https://vt.tiktok.com/ABC123/"),
                 "https://www.tiktok.com/@creator/video/123",
             )
+
+    def test_cache_media_id_rejects_unrelated_supported_urls(self):
+        self.assertIsNone(cache_media_id("https://www.tiktok.com/@creator/live"))
 
 
 if __name__ == "__main__":
