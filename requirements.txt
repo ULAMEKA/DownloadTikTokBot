@@ -8,7 +8,9 @@ annotated-types==0.7.0
 attrs==25.4.0
 beautifulsoup4==4.14.2
 certifi==2025.10.5
+cffi==2.1.1
 charset-normalizer==3.4.4
+curl-cffi==0.16.2
 frozenlist==1.8.0
 gallery-dl==1.32.7
 greenlet==3.2.4
@@ -19,6 +21,7 @@ multidict==6.7.0
 propcache==0.4.0
 pydantic==2.11.10
 pydantic_core==2.33.2
+pycparser==3.0
 python-dotenv==1.1.1
 requests==2.32.5
 soupsieve==2.8
@@ -28,4 +31,4 @@ typing-inspection==0.4.2
 typing_extensions==4.15.0
 urllib3==2.5.0
 yarl==1.22.0
-yt-dlp==2026.7.4
+yt-dlp==2026.8.19

@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 
 from aiogram import Bot, Router, F
@@ -24,9 +25,23 @@ from services.queue import (
     hold_inline_placeholder,
     music_button_markup,
 )
-from utils.links import SUPPORTED_URL_RE
+from utils.links import canonicalize_video_url, find_video_url
 
 inline_router = Router()
+
+
+async def _canonical_url(text: str) -> str | None:
+    url = find_video_url(text)
+    if url is None:
+        return None
+    try:
+        return await asyncio.get_running_loop().run_in_executor(
+            None,
+            canonicalize_video_url,
+            url,
+        )
+    except Exception:
+        return url
 
 
 def _inline_result(
@@ -58,7 +73,7 @@ def _placeholder_markup() -> InlineKeyboardMarkup:
 async def handle_inline_query(query: InlineQuery):
     text = query.query.strip()
 
-    if not SUPPORTED_URL_RE.search(text):
+    if find_video_url(text) is None:
         await query.answer([], cache_time=5)
         return
 
@@ -90,11 +105,9 @@ async def chosen_download(result: ChosenInlineResult, session: AsyncSession, bot
     chat_id = user_id нужен как fallback (например, для получения file_id
     без Storage-канала).
     """
-    m_url = SUPPORTED_URL_RE.search(result.query)
-    if not m_url:
+    url = await _canonical_url(result.query)
+    if url is None:
         return
-
-    url = m_url.group(0)
     raw_inline_message_id = result.inline_message_id
     inline_message_id = raw_inline_message_id
     if inline_message_id:
@@ -183,19 +196,19 @@ async def chosen_download(result: ChosenInlineResult, session: AsyncSession, bot
 @inline_router.chosen_inline_result(F.result_id == "recognize_music")
 async def chosen_music(result: ChosenInlineResult, session: AsyncSession, bot: Bot):
     """Create a text-only inline card that the user explicitly starts with a button."""
-    m_url = SUPPORTED_URL_RE.search(result.query)
-    if not m_url or not result.inline_message_id:
+    url = await _canonical_url(result.query)
+    if url is None or not result.inline_message_id:
         return
 
     token = uuid.uuid4().hex
-    source = source_link(m_url.group(0))
+    source = source_link(url)
     try:
         session.add(MusicRequest(
             token=token,
             user_id=str(result.from_user.id),
             chat_id=str(result.from_user.id),
             inline_message_id=result.inline_message_id,
-            tiktok_link=m_url.group(0),
+            tiktok_link=url,
             state="ready",
         ))
         await session.commit()

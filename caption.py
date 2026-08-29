@@ -40,6 +40,7 @@ def build_caption(
     with_source: bool,
     likes: int | None = None,
     has_spoiler: bool = False,
+    music_deep_link: str | None = None,
 ) -> str:
     """Подпись под видео: описание ролика (если есть) + [ссылка].
 
@@ -47,13 +48,20 @@ def build_caption(
     при has_spoiler под спойлером тегом tg-spoiler скрывается только описание видео.
     """
     source_tail = source_link(source_url, likes) if with_source and source_url else ""
+    music_tail = (
+        '🎵 <a href="{}"><i>Распознать музыку из видео</i></a>'.format(
+            html.quote(music_deep_link),
+        )
+        if music_deep_link
+        else ""
+    )
 
     desc = (description or "").strip()
     description_block = ""
     if desc:
         # Бюджет под описание: лимит минус хвост и запас. Режем по сырому
         # тексту (до html.quote), чтобы не разорвать html-сущность вроде &amp;.
-        budget = CAPTION_LIMIT - len(source_tail) - 30
+        budget = CAPTION_LIMIT - len(source_tail) - len(music_tail) - 36
         if budget > 0:
             if len(desc) > budget:
                 desc = desc[:budget - 1].rstrip() + "…"
@@ -61,7 +69,7 @@ def build_caption(
             if has_spoiler:
                 description_block = f"<tg-spoiler>{description_block}</tg-spoiler>"
 
-    parts = [part for part in (description_block, source_tail) if part]
+    parts = [part for part in (description_block, source_tail, music_tail) if part]
     if not parts:
         return ""
     return "\n\n".join(parts)

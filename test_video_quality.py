@@ -7,45 +7,55 @@ from services.queue import (
     _next_segment_time_seconds,
     _quality_options,
     _segment_time_seconds,
+    _tiktok_audio_urls,
+    _tiktok_video_candidates,
+    _ydl_base_options,
     needs_quality_choice,
 )
 
 
 class VideoQualityTests(unittest.TestCase):
-    def test_quality_options_keep_unique_h264_formats_under_limit(self):
+    def test_ytdlp_prioritizes_source_fps_before_resolution(self):
+        self.assertEqual(_ydl_base_options()["format_sort"], ["fps", "res", "br"])
+
+    def test_quality_options_keep_best_video_and_attach_best_audio(self):
         options = _quality_options([
             {
-                "format_id": "low",
-                "vcodec": "h264",
+                "format_id": "audio",
+                "vcodec": "none",
                 "acodec": "aac",
-                "width": 576,
-                "height": 1024,
-                "tbr": 500,
-                "filesize": 20_000_000,
+                "abr": 192,
+                "filesize": 2_000_000,
             },
             {
-                "format_id": "low-duplicate",
+                "format_id": "combined",
                 "vcodec": "h264",
                 "acodec": "aac",
-                "width": 576,
-                "height": 1024,
-                "tbr": 500,
-                "filesize": 20_000_000,
-            },
-            {
-                "format_id": "high",
-                "vcodec": "h264",
-                "acodec": "aac",
-                "width": 576,
-                "height": 1024,
+                "width": 720,
+                "height": 1280,
+                "fps": 30,
                 "tbr": 900,
+                "filesize": 20_000_000,
+            },
+            {
+                "format_id": "best-video",
+                "vcodec": "h265",
+                "acodec": "none",
+                "width": 1080,
+                "height": 1920,
+                "fps": 60,
+                "tbr": 1800,
                 "filesize": 30_000_000,
             },
             {
-                "format_id": "hevc",
+                "format_id": "best-video-duplicate",
                 "vcodec": "h265",
-                "acodec": "aac",
-                "filesize": 10_000_000,
+                "acodec": "none",
+                "width": 1080,
+                "height": 1920,
+                "fps": 60,
+                "tbr": 1800,
+                "filesize": 30_000_000,
             },
             {
                 "format_id": "too-large",
@@ -53,14 +63,118 @@ class VideoQualityTests(unittest.TestCase):
                 "acodec": "aac",
                 "filesize": MAX_SOURCE_VIDEO_BYTES + 1,
             },
-            {
-                "format_id": "unknown-size",
-                "vcodec": "h264",
-                "acodec": "aac",
-            },
         ])
 
-        self.assertEqual([option.format_id for option in options], ["high", "low"])
+        self.assertEqual(
+            [option.format_id for option in options],
+            ["best-video+audio", "combined"],
+        )
+        self.assertIn("60 FPS", options[0].label)
+        self.assertEqual(options[0].filesize, 32_000_000)
+
+    def test_tiktok_fallback_prefers_fps_then_resolution_and_matching_audio(self):
+        post = {
+            "video": {
+                "bitrateInfo": [
+                    {
+                        "Bitrate": 900,
+                        "BitrateFPS": 60,
+                        "CodecType": "h264",
+                        "PlayAddr": {
+                            "Width": 720,
+                            "Height": 1280,
+                            "DataSize": 10,
+                            "UrlList": ["https://cdn/720"],
+                        },
+                        "VideoExtra": '{"audio_file_id":"audio-low"}',
+                    },
+                    {
+                        "Bitrate": 1600,
+                        "BitrateFPS": 30,
+                        "CodecType": "h265_hvc1",
+                        "PlayAddr": {
+                            "Width": 1080,
+                            "Height": 1920,
+                            "DataSize": 20,
+                            "UrlList": ["https://cdn/1080"],
+                        },
+                        "VideoExtra": '{"audio_file_id":"audio-high"}',
+                    },
+                    {
+                        "Bitrate": 1500,
+                        "BitrateFPS": 60,
+                        "CodecType": "h265_hvc1",
+                        "PlayAddr": {
+                            "Width": 1080,
+                            "Height": 1920,
+                            "DataSize": 21,
+                            "UrlList": ["https://cdn/1080-60"],
+                        },
+                        "VideoExtra": '{"audio_file_id":"audio-60"}',
+                    },
+                ],
+                "bitrateAudioInfo": [
+                    {
+                        "FileId": "audio-low",
+                        "Bitrate": 64,
+                        "UrlList": {"MainUrl": "https://cdn/audio-low"},
+                    },
+                    {
+                        "FileId": "audio-high",
+                        "Bitrate": 128,
+                        "UrlList": {"MainUrl": "https://cdn/audio-high"},
+                    },
+                    {
+                        "FileId": "audio-60",
+                        "Bitrate": 128,
+                        "UrlList": {"MainUrl": "https://cdn/audio-60"},
+                    },
+                ],
+            },
+        }
+
+        candidates = _tiktok_video_candidates(post)
+
+        self.assertEqual(candidates[0]["urls"], ["https://cdn/1080-60"])
+        self.assertEqual(candidates[0]["fps"], 60)
+        self.assertEqual(candidates[0]["audio_id"], "audio-60")
+        self.assertEqual(
+            _tiktok_audio_urls(post["video"], candidates[0]["audio_id"]),
+            ["https://cdn/audio-60"],
+        )
+
+    def test_tiktok_fallback_does_not_trade_sixty_fps_for_resolution(self):
+        post = {
+            "video": {
+                "bitrateInfo": [
+                    {
+                        "Bitrate": 2000,
+                        "BitrateFPS": 30,
+                        "CodecType": "h265_hvc1",
+                        "PlayAddr": {
+                            "Width": 1080,
+                            "Height": 1920,
+                            "UrlList": ["https://cdn/1080-30"],
+                        },
+                    },
+                    {
+                        "Bitrate": 1200,
+                        "BitrateFPS": 60,
+                        "CodecType": "h264",
+                        "PlayAddr": {
+                            "Width": 720,
+                            "Height": 1280,
+                            "UrlList": ["https://cdn/720-60"],
+                        },
+                    },
+                ],
+            },
+        }
+
+        candidates = _tiktok_video_candidates(post)
+
+        self.assertEqual(candidates[0]["urls"], ["https://cdn/720-60"])
+        self.assertEqual(candidates[0]["fps"], 60)
 
     def test_quality_menu_is_only_needed_for_large_sources(self):
         self.assertFalse(needs_quality_choice([

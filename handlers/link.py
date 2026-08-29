@@ -25,7 +25,7 @@ from services.queue import (
     show_music_request_result,
     update_music_request_message,
 )
-from utils.links import SUPPORTED_URL_RE, find_video_url
+from utils.links import SUPPORTED_URL_RE, canonicalize_video_url, find_video_url
 
 link = Router()
 
@@ -39,6 +39,20 @@ class PendingDownload:
 
 
 _pending: dict[str, PendingDownload] = {}
+
+
+async def _video_url_from_text(text: str) -> str | None:
+    url = find_video_url(text)
+    if url is None:
+        return None
+    try:
+        return await asyncio.get_running_loop().run_in_executor(
+            None,
+            canonicalize_video_url,
+            url,
+        )
+    except Exception:
+        return url
 
 
 async def _expire_pending(token: str) -> None:
@@ -109,7 +123,7 @@ async def _start_pending_download(
 
 @link.message(F.text.regexp(SUPPORTED_URL_RE.pattern), F.chat.type == ChatType.PRIVATE)
 async def handle_video_link_private(message: Message):
-    url = find_video_url(message.text or "")
+    url = await _video_url_from_text(message.text or "")
     if url is None:
         return
 
@@ -369,7 +383,7 @@ async def handle_video_stats(callback: CallbackQuery):
 
 @link.message(F.text.regexp(SUPPORTED_URL_RE.pattern))
 async def handle_video_link_group(message: Message, session: AsyncSession):
-    url = find_video_url(message.text or "")
+    url = await _video_url_from_text(message.text or "")
     if url is None:
         return
 

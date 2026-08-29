@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import math
 import os
@@ -7,7 +8,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,13 +20,17 @@ from aiogram import Bot, html
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaVideo
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from gallery_dl.extractor.message import Message as GalleryMessage
+from gallery_dl.extractor.tiktok import TiktokPostExtractor, TiktokVmpostExtractor
 
 from db.session import SessionLocal
 from db.models import DownloadQueue, MusicRequest, VideoCache
 from caption import build_caption, source_link
 from promo import AD_DISPLAY_SECONDS
+from utils.media_cookies import cookie_files_for_url
 
 BASE_DIR = Path(__file__).parent
 PARENT_DIR = BASE_DIR.parent
@@ -33,6 +40,7 @@ PHOTO_DURATION = 2.5
 SLIDESHOW_WIDTH = 720
 SLIDESHOW_HEIGHT = 1280
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+FFPROBE_EXE = shutil.which("ffprobe")
 
 # ID канала-хранилища (отрицательное число для каналов, например -1001234567890)
 STORAGE_CHAT_ID: str | None = os.getenv("STORAGE_CHAT_ID")
@@ -43,7 +51,7 @@ _TIKTOK_ID_RE = re.compile(r'/(?:video|photo)/(\d+)')
 _IMAGE_EXTENSIONS = {".avif", ".jpeg", ".jpg", ".png", ".webp"}
 _AUDIO_EXTENSIONS = {".aac", ".m4a", ".mp3", ".ogg", ".opus", ".wav"}
 _VIDEO_EXTENSIONS = {".m4v", ".mkv", ".mov", ".mp4", ".webm"}
-DEFAULT_FORMAT = "best[vcodec^=h264]/best[vcodec!*=265][vcodec!*=hev]/best"
+DEFAULT_FORMAT = "bestvideo*+bestaudio/best"
 MAX_SOURCE_VIDEO_BYTES = 1_000_000_000
 MAX_TELEGRAM_PART_BYTES = 48_000_000
 MAX_QUALITY_OPTIONS = 6
@@ -53,6 +61,9 @@ MUSIC_RECOGNITION_TIMEOUT_SECONDS = 15
 MUSIC_MESSAGE_LIMIT = 4096
 MUSIC_JOB_PREFIX = "music:"
 MUSIC_PAGE_PREFIX = "music_page:"
+MUSIC_START_PREFIX = "music_"
+MEDIA_CACHE_PROFILE = "h264-aac-v2"
+VIDEO_TRANSCODE_CRF = 18
 QUEUE_LIMIT_MESSAGE = (
     "Можно поставить в очередь не больше 2 видео одновременно. "
     "Дождись завершения текущих загрузок."
@@ -60,6 +71,9 @@ QUEUE_LIMIT_MESSAGE = (
 _placeholder_ready_at: dict[tuple[str, int], float] = {}
 _inline_placeholder_ready_at: dict[str, float] = {}
 _enqueue_lock = asyncio.Lock()
+_ydl_lock = threading.Lock()
+_music_bot_username_cache: str | None = None
+_music_bot_username_lock = asyncio.Lock()
 
 
 @dataclass(frozen=True)
@@ -67,6 +81,21 @@ class VideoQuality:
     format_id: str | None
     label: str
     filesize: int | None
+
+
+@dataclass(frozen=True)
+class MediaProbe:
+    has_video: bool
+    has_audio: bool
+    video_codec: str | None = None
+    audio_codec: str | None = None
+    width: int | None = None
+    height: int | None = None
+    fps: float | None = None
+    duration: float | None = None
+    pixel_format: str | None = None
+    sample_aspect_ratio: str | None = None
+    rotation: int = 0
 
 
 MusicTrack = tuple[int, str, str]
@@ -81,6 +110,14 @@ class VideoSplitError(Exception):
 
 
 class InlineSplitError(Exception):
+    pass
+
+
+class MissingAudioError(Exception):
+    pass
+
+
+class MediaPreparationError(Exception):
     pass
 
 
@@ -138,46 +175,117 @@ def _is_h264(vcodec: object) -> bool:
     return isinstance(vcodec, str) and vcodec.lower().startswith(("h264", "avc"))
 
 
+def _has_video(item: dict[str, object]) -> bool:
+    return item.get("vcodec") not in (None, "none")
+
+
+def _has_audio(item: dict[str, object]) -> bool:
+    return item.get("acodec") not in (None, "none")
+
+
+def _audio_quality_key(item: dict[str, object]) -> tuple[int, int, int]:
+    return (
+        _to_int(item.get("abr")) or 0,
+        _to_int(item.get("tbr")) or 0,
+        _to_int(item.get("filesize") or item.get("filesize_approx")) or 0,
+    )
+
+
+def _codec_label(codec: object) -> str | None:
+    if not isinstance(codec, str):
+        return None
+    value = codec.lower()
+    if value.startswith(("h264", "avc")):
+        return "H.264"
+    if value.startswith(("h265", "hev", "hvc")):
+        return "H.265"
+    return codec.split(".", 1)[0].upper()
+
+
 def _quality_options(formats: object) -> list[VideoQuality]:
     if not isinstance(formats, list):
         return []
 
-    options: list[VideoQuality] = []
-    seen: set[tuple[object, object, object, int | None]] = set()
+    typed_formats = [item for item in formats if isinstance(item, dict)]
+    audio_formats = [
+        item
+        for item in typed_formats
+        if not _has_video(item) and _has_audio(item) and isinstance(item.get("format_id"), str)
+    ]
+    best_audio = max(audio_formats, key=_audio_quality_key, default=None)
+
+    ranked_options: list[tuple[tuple[float, int, int, int], VideoQuality]] = []
+    seen: set[tuple[object, object, object, object, int | None]] = set()
     for item in formats:
-        if not isinstance(item, dict) or not _is_h264(item.get("vcodec")):
-            continue
-        if item.get("acodec") in (None, "none"):
+        if not isinstance(item, dict) or not _has_video(item):
             continue
         format_id = item.get("format_id")
         if not isinstance(format_id, str):
             continue
+
+        audio_size = 0
+        if not _has_audio(item):
+            if best_audio is None:
+                continue
+            audio_format_id = best_audio.get("format_id")
+            if not isinstance(audio_format_id, str):
+                continue
+            format_id = f"{format_id}+{audio_format_id}"
+            audio_size = _to_int(
+                best_audio.get("filesize") or best_audio.get("filesize_approx")
+            ) or 0
+
         filesize = _to_int(item.get("filesize") or item.get("filesize_approx"))
-        if filesize is None or filesize > MAX_SOURCE_VIDEO_BYTES:
+        if filesize is not None:
+            filesize += audio_size
+        if filesize is not None and filesize > MAX_SOURCE_VIDEO_BYTES:
             continue
         width = _to_int(item.get("width"))
         height = _to_int(item.get("height"))
         bitrate = _to_int(item.get("tbr"))
-        key = (width, height, bitrate, filesize)
+        fps = _to_float(item.get("fps"))
+        key = (width, height, fps, bitrate, filesize)
         if key in seen:
             continue
         seen.add(key)
         resolution = f"{width}×{height}" if width and height else "Видео"
+        fps_label = f"{fps:g} FPS" if fps else None
+        codec_label = _codec_label(item.get("vcodec"))
         bitrate_label = f"{bitrate} кбит/с" if bitrate else None
         label = " · ".join(part for part in (
-            resolution, bitrate_label, _format_megabytes(filesize),
+            resolution,
+            fps_label,
+            codec_label,
+            bitrate_label,
+            _format_megabytes(filesize),
         ) if part)
-        options.append(VideoQuality(format_id, label, filesize))
+        rank = (
+            fps or 0.0,
+            (width or 0) * (height or 0),
+            bitrate or 0,
+            filesize or 0,
+        )
+        ranked_options.append((rank, VideoQuality(format_id, label[:64], filesize)))
 
-    options.sort(key=lambda option: option.filesize or -1, reverse=True)
-    return options[:MAX_QUALITY_OPTIONS]
+    ranked_options.sort(key=lambda option: option[0], reverse=True)
+    return [option for _, option in ranked_options[:MAX_QUALITY_OPTIONS]]
 
 
 def list_video_qualities(url: str) -> list[VideoQuality]:
-    opts: dict[str, object] = {"quiet": True, "no_warnings": True}
-    with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore[arg-type]
-        info = ydl.extract_info(url, download=False)
-    return _quality_options(info.get("formats") if info else None)
+    last_error: Exception | None = None
+    with _ydl_option_variants(url) as variants:
+        for index, opts in enumerate(variants):
+            try:
+                with _ydl_lock, yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore[arg-type]
+                    info = ydl.extract_info(url, download=False)
+                return _quality_options(info.get("formats") if info else None)
+            except Exception as error:
+                last_error = error
+                if index + 1 < len(variants):
+                    logging.info("yt-dlp: повторяем получение форматов с cookies")
+    if last_error is not None:
+        raise last_error
+    return []
 
 
 def needs_quality_choice(qualities: list[VideoQuality]) -> bool:
@@ -188,23 +296,89 @@ def needs_quality_choice(qualities: list[VideoQuality]) -> bool:
     )
 
 
+class _YtdlpLogger:
+    def debug(self, message: str) -> None:
+        logging.debug("yt-dlp: %s", message)
+
+    def info(self, message: str) -> None:
+        logging.debug("yt-dlp: %s", message)
+
+    def warning(self, message: str) -> None:
+        logging.info("yt-dlp: %s", message)
+
+    def error(self, message: str) -> None:
+        logging.debug("yt-dlp: %s", message)
+
+
+def _ydl_base_options(cookie_file: Path | None = None) -> dict[str, object]:
+    options: dict[str, object] = {
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "logger": _YtdlpLogger(),
+        "noplaylist": True,
+        "retries": 5,
+        "fragment_retries": 5,
+        "extractor_retries": 3,
+        "socket_timeout": 30,
+        "ffmpeg_location": FFMPEG_EXE,
+        # Не меняем 60 FPS на 30 ради разрешения; затем берём максимум детализации.
+        "format_sort": ["fps", "res", "br"],
+    }
+    if cookie_file is not None:
+        options["cookiefile"] = str(cookie_file)
+    return options
+
+
+@contextmanager
+def _ydl_option_variants(url: str):
+    variants = [_ydl_base_options()]
+    cookie_copies: list[Path] = []
+    for cookie_file in cookie_files_for_url(url):
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=VIDEO_DIR,
+            prefix="media_cookies_",
+            suffix=".txt",
+        )
+        os.close(descriptor)
+        cookie_copy = Path(temporary_name)
+        try:
+            shutil.copyfile(cookie_file, cookie_copy)
+            variants.append(_ydl_base_options(cookie_copy))
+            cookie_copies.append(cookie_copy)
+        except OSError as error:
+            logging.warning("Не удалось подготовить cookie-файл: %s", error)
+            cookie_copy.unlink(missing_ok=True)
+    try:
+        yield variants
+    finally:
+        for cookie_copy in cookie_copies:
+            cookie_copy.unlink(missing_ok=True)
+
+
+def _media_cache_key(media_id: str) -> str:
+    return f"{MEDIA_CACHE_PROFILE}:{media_id}"
+
+
 def _resolve_media(url: str) -> tuple[str | None, str, int | None]:
     m = _TIKTOK_ID_RE.search(url)
     fallback_id = m.group(1) if m else None
-    try:
-        opts: dict[str, object] = {"quiet": True, "no_warnings": True}
-        with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore[arg-type]
-            info = ydl.extract_info(url, download=False)
-            if info:
-                source_url = (
-                    str(info.get("webpage_url") or url)
-                    if "tiktok.com/" in url.lower()
-                    else url
-                )
-                media_id = str(info["id"]) if info.get("id") else fallback_id
-                return media_id, source_url, _to_int(info.get("like_count"))
-    except Exception:
-        pass
+    with _ydl_option_variants(url) as variants:
+        for index, opts in enumerate(variants):
+            try:
+                with _ydl_lock, yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore[arg-type]
+                    info = ydl.extract_info(url, download=False)
+                    if info:
+                        source_url = (
+                            str(info.get("webpage_url") or url)
+                            if "tiktok.com/" in url.lower()
+                            else url
+                        )
+                        media_id = str(info["id"]) if info.get("id") else fallback_id
+                        return media_id, source_url, _to_int(info.get("like_count"))
+            except Exception:
+                if index + 1 < len(variants):
+                    logging.info("yt-dlp: повторяем получение метаданных с cookies")
     return fallback_id, url, None
 
 
@@ -227,30 +401,546 @@ def _ydl_download(
     outtmpl: str,
     format_id: str | None = None,
 ) -> tuple[str | None, int | None, int | None, str | None, float | None]:
-    """Скачивает выбранный H.264-вариант и возвращает его метаданные."""
+    """Скачивает лучший вариант с аудио и возвращает метаданные источника."""
     # noinspection SpellCheckingInspection
-    opts: dict[str, object] = {
-        "outtmpl": outtmpl,  # cspell:disable-line
-        "quiet": True,
-        "no_warnings": True,
-        "format": format_id or DEFAULT_FORMAT,
-        "max_filesize": MAX_SOURCE_VIDEO_BYTES,
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore[arg-type]
-        info = ydl.extract_info(url, download=False)
-        if not info:
-            return None, None, None, None, None
-        expected_size = _to_int(info.get("filesize") or info.get("filesize_approx"))
-        if expected_size is not None and expected_size > MAX_SOURCE_VIDEO_BYTES:
+    last_error: Exception | None = None
+    with _ydl_option_variants(url) as variants:
+        for index, base_options in enumerate(variants):
+            opts = {
+                **base_options,
+                "outtmpl": outtmpl,  # cspell:disable-line
+                "format": format_id or DEFAULT_FORMAT,
+                "max_filesize": MAX_SOURCE_VIDEO_BYTES,
+            }
+            try:
+                with _ydl_lock, yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore[arg-type]
+                    info = ydl.extract_info(url, download=True)
+                if not info:
+                    raise MediaPreparationError("yt-dlp не вернул метаданные")
+                expected_size = _to_int(info.get("filesize") or info.get("filesize_approx"))
+                if expected_size is not None and expected_size > MAX_SOURCE_VIDEO_BYTES:
+                    raise VideoTooLargeError
+                vid = str(info["id"]) if info.get("id") else None
+                width, height = _extract_dimensions(info)
+                raw_desc = info.get("description")
+                description = str(raw_desc) if raw_desc else None
+                return vid, width, height, description, _to_float(info.get("duration"))
+            except VideoTooLargeError:
+                raise
+            except Exception as error:
+                last_error = error
+                if index + 1 < len(variants):
+                    logging.info("yt-dlp: повторяем загрузку с cookies")
+    raise MediaPreparationError("yt-dlp не смог скачать медиа") from last_error
+
+
+def _parse_frame_rate(value: object) -> float | None:
+    if not isinstance(value, str) or not value or value in {"0/0", "N/A"}:
+        return None
+    try:
+        numerator, separator, denominator = value.partition("/")
+        if separator:
+            denominator_value = float(denominator)
+            return float(numerator) / denominator_value if denominator_value else None
+        return float(value)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def _probe_media_with_ffprobe(path: Path) -> MediaProbe | None:
+    if not FFPROBE_EXE:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                FFPROBE_EXE,
+                "-v", "error",
+                "-show_streams",
+                "-show_format",
+                "-of", "json",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        data = json.loads(result.stdout)
+    except Exception:
+        return None
+
+    streams = data.get("streams") if isinstance(data, dict) else None
+    if not isinstance(streams, list):
+        streams = []
+    video = next(
+        (
+            stream
+            for stream in streams
+            if isinstance(stream, dict)
+            and stream.get("codec_type") == "video"
+            and not (
+                isinstance(stream.get("disposition"), dict)
+                and stream["disposition"].get("attached_pic") == 1
+            )
+        ),
+        None,
+    )
+    audio = next(
+        (
+            stream
+            for stream in streams
+            if isinstance(stream, dict) and stream.get("codec_type") == "audio"
+        ),
+        None,
+    )
+
+    rotation = 0
+    if isinstance(video, dict):
+        tags = video.get("tags")
+        if isinstance(tags, dict):
+            rotation = _to_int(tags.get("rotate")) or 0
+        side_data = video.get("side_data_list")
+        if isinstance(side_data, list):
+            for item in side_data:
+                if isinstance(item, dict) and item.get("rotation") is not None:
+                    rotation = _to_int(item.get("rotation")) or rotation
+                    break
+
+    format_data = data.get("format") if isinstance(data, dict) else None
+    duration = None
+    if isinstance(format_data, dict):
+        duration = _to_float(format_data.get("duration"))
+    if duration is None and isinstance(video, dict):
+        duration = _to_float(video.get("duration"))
+
+    return MediaProbe(
+        has_video=isinstance(video, dict),
+        has_audio=isinstance(audio, dict),
+        video_codec=str(video.get("codec_name")) if isinstance(video, dict) else None,
+        audio_codec=str(audio.get("codec_name")) if isinstance(audio, dict) else None,
+        width=_to_int(video.get("width")) if isinstance(video, dict) else None,
+        height=_to_int(video.get("height")) if isinstance(video, dict) else None,
+        fps=(
+            _parse_frame_rate(video.get("avg_frame_rate"))
+            or _parse_frame_rate(video.get("r_frame_rate"))
+            if isinstance(video, dict)
+            else None
+        ),
+        duration=duration,
+        pixel_format=(
+            str(video.get("pix_fmt"))
+            if isinstance(video, dict) and video.get("pix_fmt")
+            else None
+        ),
+        sample_aspect_ratio=(
+            str(video.get("sample_aspect_ratio"))
+            if isinstance(video, dict) and video.get("sample_aspect_ratio") not in (None, "N/A")
+            else None
+        ),
+        rotation=rotation,
+    )
+
+
+def _probe_media(path: Path) -> MediaProbe:
+    probe = _probe_media_with_ffprobe(path)
+    if probe is not None:
+        return probe
+
+    result = subprocess.run(
+        [FFMPEG_EXE, "-hide_banner", "-i", str(path)],
+        capture_output=True,
+        text=True,
+    )
+    output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+    duration_match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", output)
+    duration = None
+    if duration_match:
+        duration = (
+            int(duration_match.group(1)) * 3600
+            + int(duration_match.group(2)) * 60
+            + float(duration_match.group(3))
+        )
+
+    video_line = next((line for line in output.splitlines() if " Video: " in line), "")
+    audio_line = next((line for line in output.splitlines() if " Audio: " in line), "")
+    video_codec_match = re.search(r"Video:\s*([^,\s]+)", video_line)
+    audio_codec_match = re.search(r"Audio:\s*([^,\s]+)", audio_line)
+    dimensions_match = re.search(r"(?<!\d)(\d{2,5})x(\d{2,5})(?!\d)", video_line)
+    pixel_format_match = re.search(r"Video:\s*[^,]+,\s*([^,(\s]+)", video_line)
+    fps_match = re.search(r"([\d.]+)\s+fps\b", video_line)
+    sar_match = re.search(r"SAR\s+(\d+:\d+)", video_line)
+    rotation_match = re.search(r"rotation of\s+(-?\d+(?:\.\d+)?)", output)
+
+    return MediaProbe(
+        has_video=bool(video_line),
+        has_audio=bool(audio_line),
+        video_codec=video_codec_match.group(1) if video_codec_match else None,
+        audio_codec=audio_codec_match.group(1) if audio_codec_match else None,
+        width=int(dimensions_match.group(1)) if dimensions_match else None,
+        height=int(dimensions_match.group(2)) if dimensions_match else None,
+        fps=float(fps_match.group(1)) if fps_match else None,
+        duration=duration,
+        pixel_format=pixel_format_match.group(1) if pixel_format_match else None,
+        sample_aspect_ratio=sar_match.group(1) if sar_match else None,
+        rotation=round(float(rotation_match.group(1))) if rotation_match else 0,
+    )
+
+
+def _gallery_url_list(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [url for url in value if isinstance(url, str)]
+    if isinstance(value, dict):
+        urls: list[str] = []
+        for key in ("MainUrl", "BackupUrl", "FallbackUrl", "UrlList"):
+            urls.extend(_gallery_url_list(value.get(key)))
+        return list(dict.fromkeys(urls))
+    return []
+
+
+def _gallery_tiktok_context(
+    url: str,
+    cookie_file: Path | None = None,
+) -> tuple[object, dict[str, object], str] | None:
+    current = url
+    seen: set[str] = set()
+    for _ in range(3):
+        if current in seen:
+            return None
+        seen.add(current)
+        extractor = (
+            TiktokPostExtractor.from_url(current)
+            or TiktokVmpostExtractor.from_url(current)
+        )
+        if extractor is None or getattr(extractor, "category", None) != "tiktok":
+            return None
+
+        queued_url: str | None = None
+        try:
+            extractor.initialize()
+            if cookie_file is not None:
+                extractor.cookies_load(str(cookie_file))
+            for message in extractor.items():
+                if message[0] == GalleryMessage.Queue:
+                    queued_url = str(message[1])
+                    break
+                if message[0] == GalleryMessage.Directory and isinstance(message[2], dict):
+                    return extractor, message[2], current
+        except Exception as error:
+            logging.info("gallery-dl не получил метаданные TikTok: %s", error)
+            return None
+        if not queued_url:
+            return None
+        current = queued_url
+    return None
+
+
+def _tiktok_video_candidates(post: dict[str, object]) -> list[dict[str, object]]:
+    video = post.get("video")
+    if not isinstance(video, dict):
+        return []
+
+    candidates: list[dict[str, object]] = []
+    bitrate_info = video.get("bitrateInfo")
+    if isinstance(bitrate_info, dict):
+        bitrate_info = [bitrate_info]
+    if isinstance(bitrate_info, list):
+        for item in bitrate_info:
+            if not isinstance(item, dict):
+                continue
+            address = item.get("PlayAddr")
+            if not isinstance(address, dict):
+                continue
+            urls = _gallery_url_list(address.get("UrlList"))
+            if not urls:
+                continue
+            audio_id = None
+            video_extra = item.get("VideoExtra")
+            if isinstance(video_extra, str):
+                try:
+                    extra_data = json.loads(video_extra)
+                    if isinstance(extra_data, dict) and extra_data.get("audio_file_id"):
+                        audio_id = str(extra_data["audio_file_id"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+            candidates.append({
+                "urls": urls,
+                "width": _to_int(address.get("Width")),
+                "height": _to_int(address.get("Height")),
+                "fps": _to_float(item.get("BitrateFPS")),
+                "bitrate": _to_int(item.get("Bitrate")),
+                "codec": str(item.get("CodecType") or ""),
+                "filesize": _to_int(address.get("DataSize")),
+                "audio_id": audio_id,
+            })
+
+    root_url = video.get("playAddr")
+    root_urls = _gallery_url_list(root_url)
+    if root_urls:
+        candidates.append({
+            "urls": root_urls,
+            "width": _to_int(video.get("width")),
+            "height": _to_int(video.get("height")),
+            "fps": None,
+            "bitrate": _to_int(video.get("bitrate")),
+            "codec": str(video.get("codecType") or ""),
+            "filesize": _to_int(video.get("size")),
+            "audio_id": None,
+        })
+
+    candidates.sort(
+        key=lambda item: (
+            _to_float(item.get("fps")) or 0.0,
+            (_to_int(item.get("width")) or 0) * (_to_int(item.get("height")) or 0),
+            _to_int(item.get("bitrate")) or 0,
+            1 if _is_h264(item.get("codec")) else 0,
+        ),
+        reverse=True,
+    )
+    return candidates
+
+
+def _tiktok_audio_urls(video: dict[str, object], audio_id: str | None) -> list[str]:
+    audio_info = video.get("bitrateAudioInfo")
+    if isinstance(audio_info, dict):
+        audio_info = [audio_info]
+    if not isinstance(audio_info, list):
+        return []
+
+    candidates = [item for item in audio_info if isinstance(item, dict)]
+    candidates.sort(
+        key=lambda item: (
+            1 if audio_id and str(item.get("FileId") or "") == audio_id else 0,
+            _to_int(item.get("Bitrate")) or 0,
+        ),
+        reverse=True,
+    )
+    for item in candidates:
+        urls = _gallery_url_list(item.get("UrlList"))
+        if urls:
+            return urls
+    return []
+
+
+def _download_gallery_stream(
+    extractor: object,
+    urls: list[str],
+    output: Path,
+) -> None:
+    last_error: Exception | None = None
+    for url in urls:
+        output.unlink(missing_ok=True)
+        response = None
+        try:
+            response = extractor.request(url, stream=True)  # type: ignore[attr-defined]
+            expected_size = _to_int(response.headers.get("content-length"))
+            if expected_size is not None and expected_size > MAX_SOURCE_VIDEO_BYTES:
+                raise VideoTooLargeError
+            size = 0
+            with output.open("wb") as file:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    size += len(chunk)
+                    if size > MAX_SOURCE_VIDEO_BYTES:
+                        raise VideoTooLargeError
+                    file.write(chunk)
+            if size:
+                return
+        except VideoTooLargeError:
+            output.unlink(missing_ok=True)
+            raise
+        except Exception as error:
+            last_error = error
+            output.unlink(missing_ok=True)
+        finally:
+            if response is not None:
+                response.close()
+    raise MediaPreparationError("gallery-dl не смог скачать поток") from last_error
+
+
+def _mux_external_audio(video: Path, audio: Path) -> None:
+    audio_probe = _probe_media(audio)
+    output = video.with_name(f"{video.stem}.muxed.mp4")
+    command = [
+        FFMPEG_EXE, "-loglevel", "error", "-y",
+        "-i", str(video),
+        "-i", str(audio),
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+    ]
+    if audio_probe.audio_codec == "aac":
+        command.extend(("-c:a", "copy"))
+    else:
+        command.extend(("-c:a", "aac", "-b:a", "192k"))
+    command.extend(("-shortest", "-movflags", "+faststart", str(output)))
+    try:
+        subprocess.run(command, check=True, capture_output=True)
+        if not _probe_media(output).has_audio:
+            raise MissingAudioError
+        os.replace(output, video)
+    finally:
+        output.unlink(missing_ok=True)
+
+
+def _download_tiktok_post(
+    extractor: object,
+    post: dict[str, object],
+    output: Path,
+) -> tuple[str | None, int | None, int | None, str | None, float | None] | None:
+    if post.get("post_type") != "video":
+        return None
+
+    candidates = _tiktok_video_candidates(post)
+    if not candidates:
+        return None
+    last_error: Exception | None = None
+    video_metadata = post.get("video")
+    raw_description = post.get("desc")
+    for selected in candidates:
+        audio_path = output.with_name(f"{output.stem}.audio.m4a")
+        try:
+            expected_size = _to_int(selected.get("filesize"))
+            if expected_size is not None and expected_size > MAX_SOURCE_VIDEO_BYTES:
+                raise VideoTooLargeError
+            urls = selected.get("urls")
+            if not isinstance(urls, list):
+                raise MediaPreparationError("TikTok не вернул URL видеопотока")
+            _download_gallery_stream(extractor, urls, output)
+
+            probe = _probe_media(output)
+            if not probe.has_audio:
+                selected_audio_id = selected.get("audio_id")
+                audio_urls = (
+                    _tiktok_audio_urls(
+                        video_metadata,
+                        str(selected_audio_id) if selected_audio_id else None,
+                    )
+                    if isinstance(video_metadata, dict)
+                    else []
+                )
+                if not audio_urls:
+                    music = post.get("music")
+                    if isinstance(music, dict):
+                        audio_urls = _gallery_url_list(music.get("playUrl"))
+                if not audio_urls:
+                    raise MissingAudioError
+                _download_gallery_stream(extractor, audio_urls, audio_path)
+                _mux_external_audio(output, audio_path)
+                probe = _probe_media(output)
+            if not probe.has_audio:
+                raise MissingAudioError
+            return (
+                str(post.get("id")) if post.get("id") else None,
+                probe.width,
+                probe.height,
+                str(raw_description) if raw_description else None,
+                probe.duration,
+            )
+        except Exception as error:
+            last_error = error
+            output.unlink(missing_ok=True)
+            logging.info(
+                "Поток TikTok %sx%s/%s FPS не подошёл: %s",
+                selected.get("width"),
+                selected.get("height"),
+                selected.get("fps"),
+                error,
+            )
+        finally:
+            audio_path.unlink(missing_ok=True)
+
+    if isinstance(last_error, (VideoTooLargeError, MissingAudioError)):
+        raise last_error
+    raise MediaPreparationError("Не удалось скачать ни один поток TikTok") from last_error
+
+
+def _gallery_tiktok_video_download(
+    url: str,
+    output: Path,
+) -> tuple[str | None, int | None, int | None, str | None, float | None] | None:
+    cookie_variants: list[Path | None] = [None, *cookie_files_for_url(url)]
+    last_error: Exception | None = None
+    for index, current_cookie_file in enumerate(cookie_variants):
+        try:
+            context = _gallery_tiktok_context(url, current_cookie_file)
+            if context is None:
+                if index + 1 < len(cookie_variants):
+                    logging.info("gallery-dl: повторяем получение TikTok с cookies")
+                continue
+            extractor, post, _ = context
+            return _download_tiktok_post(extractor, post, output)
+        except VideoTooLargeError:
+            raise
+        except Exception as error:
+            last_error = error
+            output.unlink(missing_ok=True)
+            if index + 1 < len(cookie_variants):
+                logging.info("gallery-dl: повторяем загрузку TikTok с cookies")
+                continue
+    if last_error is not None:
+        raise last_error
+    return None
+
+
+def _prepare_telegram_video(path: Path) -> tuple[Path, MediaProbe]:
+    source_probe = _probe_media(path)
+    if not source_probe.has_video:
+        raise MediaPreparationError("В файле отсутствует видеодорожка")
+    if not source_probe.has_audio:
+        raise MissingAudioError
+
+    needs_video_transcode = (
+        not _is_h264(source_probe.video_codec)
+        or source_probe.pixel_format not in (None, "yuv420p")
+        or source_probe.sample_aspect_ratio not in (None, "1:1")
+        or bool(source_probe.rotation)
+    )
+    needs_audio_transcode = source_probe.audio_codec != "aac"
+    output = path.with_name(f"{path.stem}.telegram.mp4")
+    final_path = path.with_suffix(".mp4")
+    command = [
+        FFMPEG_EXE, "-loglevel", "error", "-y",
+        "-i", str(path),
+        "-map", "0:v:0",
+        "-map", "0:a:0",
+        "-map_metadata", "-1",
+    ]
+    if needs_video_transcode:
+        command.extend((
+            "-vf", "setsar=1",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", str(VIDEO_TRANSCODE_CRF),
+            "-pix_fmt", "yuv420p",
+            "-threads", "1",
+            "-fps_mode", "vfr",
+            "-metadata:s:v:0", "rotate=0",
+        ))
+    else:
+        command.extend(("-c:v", "copy"))
+    if needs_audio_transcode:
+        command.extend(("-c:a", "aac", "-b:a", "192k"))
+    else:
+        command.extend(("-c:a", "copy"))
+    command.extend(("-movflags", "+faststart", str(output)))
+
+    try:
+        subprocess.run(command, check=True, capture_output=True)
+        prepared_probe = _probe_media(output)
+        if not prepared_probe.has_video or not prepared_probe.has_audio:
+            raise MediaPreparationError("FFmpeg создал неполный файл")
+        if not _is_h264(prepared_probe.video_codec):
+            raise MediaPreparationError("Не удалось привести видео к H.264")
+        if output.stat().st_size > MAX_SOURCE_VIDEO_BYTES:
             raise VideoTooLargeError
-        info = ydl.extract_info(url, download=True)
-        if not info:
-            return None, None, None, None, None
-        vid = str(info["id"]) if info.get("id") else None
-        width, height = _extract_dimensions(info)
-        raw_desc = info.get("description")
-        description = str(raw_desc) if raw_desc else None
-        return vid, width, height, description, _to_float(info.get("duration"))
+        os.replace(output, final_path)
+        if path != final_path:
+            path.unlink(missing_ok=True)
+        return final_path, prepared_probe
+    finally:
+        output.unlink(missing_ok=True)
 
 
 def _build_slideshow(images: list[Path], audio: Path | None, output: Path) -> None:
@@ -286,11 +976,25 @@ def _build_slideshow(images: list[Path], audio: Path | None, output: Path) -> No
 def _gallery_download(
     url: str,
     output: Path,
-) -> tuple[int | None, int | None] | None:
+) -> tuple[str | None, int | None, int | None, str | None, float | None] | None:
+    try:
+        tiktok_video = _gallery_tiktok_video_download(url, output)
+        if tiktok_video is not None:
+            return tiktok_video
+    except (VideoTooLargeError, MissingAudioError):
+        raise
+    except Exception as error:
+        logging.info("Расширенный TikTok fallback не сработал: %s", error)
+
     with tempfile.TemporaryDirectory(dir=VIDEO_DIR, prefix="slideshow_") as directory:
         work_dir = Path(directory)
-        result = subprocess.run(
-            [
+        cookie_variants: list[Path | None] = [None, *cookie_files_for_url(url)]
+        last_result: subprocess.CompletedProcess[str] | None = None
+        for index, current_cookie_file in enumerate(cookie_variants):
+            for path in work_dir.iterdir():
+                if path.is_file():
+                    path.unlink(missing_ok=True)
+            command = [
                 sys.executable, "-m", "gallery_dl", "--config-ignore", "--no-input",
                 "--filesize-max", str(MAX_SOURCE_VIDEO_BYTES),
                 "--no-mtime", "--directory", str(work_dir),
@@ -299,36 +1003,64 @@ def _gallery_download(
                 "--option", "extractor.tiktok.photos=true",
                 "--option", "extractor.tiktok.audio=true",
                 "--option", "extractor.instagram.videos=true",
-                url,
-            ],
-            capture_output=True,
-            text=True,
-        )
-        files = [path for path in work_dir.iterdir() if path.is_file()]
-        video = next(
-            (path for path in files if path.suffix.lower() in _VIDEO_EXTENSIONS),
-            None,
-        )
-        if video:
-            if video.stat().st_size > MAX_SOURCE_VIDEO_BYTES:
-                raise VideoTooLargeError
-            video.replace(output.with_suffix(video.suffix))
-            return (None, None)
+            ]
+            if current_cookie_file is not None:
+                command.extend((
+                    "--cookies", str(current_cookie_file),
+                    "--option", "extractor.cookies-update=false",
+                ))
+            command.append(url)
+            last_result = subprocess.run(command, capture_output=True, text=True)
 
-        images = sorted(
-            (path for path in files if path.suffix.lower() in _IMAGE_EXTENSIONS),
-            key=lambda path: int(path.name.partition("_")[0]),
-        )
-        if not images:
-            if result.returncode:
-                logging.info("gallery-dl не скачал медиа: %s", result.stderr.strip())
-            return None
+            files = [path for path in work_dir.iterdir() if path.is_file()]
+            audio = next(
+                (path for path in files if path.suffix.lower() in _AUDIO_EXTENSIONS),
+                None,
+            )
+            video = next(
+                (path for path in files if path.suffix.lower() in _VIDEO_EXTENSIONS),
+                None,
+            )
+            if video:
+                probe = _probe_media(video)
+                if not probe.has_audio and audio is None and index + 1 < len(cookie_variants):
+                    logging.info("gallery-dl: повторяем загрузку видео с cookies")
+                    continue
+                if video.stat().st_size > MAX_SOURCE_VIDEO_BYTES:
+                    raise VideoTooLargeError
+                target = output.with_suffix(video.suffix)
+                video.replace(target)
+                if not probe.has_audio and audio is not None:
+                    _mux_external_audio(target, audio)
+                    probe = _probe_media(target)
+                return _resolve_media(url)[0], probe.width, probe.height, None, probe.duration
 
-        audio = next((path for path in files if path.suffix.lower() in _AUDIO_EXTENSIONS), None)
-        _build_slideshow(images, audio, output)
-        if output.stat().st_size > MAX_SOURCE_VIDEO_BYTES:
-            raise VideoTooLargeError
-        return SLIDESHOW_WIDTH, SLIDESHOW_HEIGHT
+            images = sorted(
+                (path for path in files if path.suffix.lower() in _IMAGE_EXTENSIONS),
+                key=lambda path: int(path.name.partition("_")[0]),
+            )
+            if images:
+                if audio is None and index + 1 < len(cookie_variants):
+                    logging.info("gallery-dl: повторяем загрузку слайд-шоу с cookies")
+                    continue
+                _build_slideshow(images, audio, output)
+                if output.stat().st_size > MAX_SOURCE_VIDEO_BYTES:
+                    raise VideoTooLargeError
+                probe = _probe_media(output)
+                return (
+                    _resolve_media(url)[0],
+                    SLIDESHOW_WIDTH,
+                    SLIDESHOW_HEIGHT,
+                    None,
+                    probe.duration,
+                )
+
+            if index + 1 < len(cookie_variants):
+                logging.info("gallery-dl: повторяем загрузку с cookies")
+
+        if last_result is not None and last_result.returncode:
+            logging.info("gallery-dl не скачал медиа (код %s)", last_result.returncode)
+        return None
 
 
 def _download_media(
@@ -341,12 +1073,11 @@ def _download_media(
         return _ydl_download(url, outtmpl, format_id)
     except VideoTooLargeError:
         raise
-    except Exception:
-        if format_id is not None:
-            raise
-        dimensions = _gallery_download(url, slideshow_path)
-        if dimensions is not None:
-            return _resolve_media(url)[0], *dimensions, None, None
+    except Exception as error:
+        logging.info("yt-dlp не скачал медиа, используем fallback: %s", error)
+        downloaded = _gallery_download(url, slideshow_path)
+        if downloaded is not None:
+            return downloaded
         raise
 
 
@@ -490,6 +1221,7 @@ async def _deliver_video(
     placeholder_message_id: int | None = None,
     has_spoiler: bool = False,
     without_description: bool = False,
+    music_deep_link: str | None = None,
 ) -> str | None:
     """Отправляет видео пользователю, возвращает file_id для кеша (или None)."""
     # Inline-режим: редактируем сообщение через file_id из Storage
@@ -515,6 +1247,7 @@ async def _deliver_video(
                 inline_message_id=inline_message_id,
                 media=InputMediaVideo(
                     media=file_id,
+                    supports_streaming=True,
                     caption=(
                         None
                         if without_description
@@ -524,6 +1257,7 @@ async def _deliver_video(
                             with_source=True,
                             likes=likes,
                             has_spoiler=has_spoiler,
+                            music_deep_link=music_deep_link,
                         )
                     ),
                     parse_mode=ParseMode.HTML,
@@ -546,6 +1280,7 @@ async def _deliver_video(
             with_source=True,
             likes=likes,
             has_spoiler=has_spoiler,
+            music_deep_link=music_deep_link,
         )
     )
     if placeholder_message_id:
@@ -561,6 +1296,7 @@ async def _deliver_video(
                 media=media,
                 width=width,
                 height=height,
+                supports_streaming=True,
                 caption=caption,
                 parse_mode=ParseMode.HTML,
                 has_spoiler=has_spoiler,
@@ -582,6 +1318,7 @@ async def _deliver_video(
             reply_to_message_id=reply_to_message_id,
             allow_sending_without_reply=True,
             has_spoiler=has_spoiler,
+            supports_streaming=True,
         )
         return file_id
 
@@ -596,6 +1333,7 @@ async def _deliver_video(
             reply_to_message_id=reply_to_message_id,
             allow_sending_without_reply=True,
             has_spoiler=has_spoiler,
+            supports_streaming=True,
         )
         if msg.video:
             return msg.video.file_id
@@ -609,9 +1347,14 @@ def _remove_download_files(filename: str) -> None:
             path.unlink(missing_ok=True)
 
 
-def can_offer_music(without_description: bool, inline_message_id: str | None) -> bool:
-    """Literal-video and video-inline modes stay free of the extra status message."""
-    return not without_description and not inline_message_id
+def can_offer_music(without_description: bool, _inline_message_id: str | None) -> bool:
+    """Legacy status-card eligibility; inline videos never get an extra message."""
+    return not without_description and _inline_message_id is None
+
+
+def can_attach_music_link(without_description: bool) -> bool:
+    """Caption deep-links work for every captioned video, including inline mode."""
+    return not without_description
 
 
 def _music_chunk_starts(duration: float) -> range:
@@ -712,18 +1455,7 @@ def _music_status_text(text: str, source_url: str | None) -> str:
 
 
 def _probe_duration(video_path: Path) -> float | None:
-    result = subprocess.run(
-        [FFMPEG_EXE, "-hide_banner", "-i", str(video_path)],
-        check=False,
-        capture_output=True,
-        text=True,
-        errors="replace",
-    )
-    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr)
-    if not match:
-        return None
-    hours, minutes, seconds = match.groups()
-    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    return _probe_media(video_path).duration
 
 
 def _extract_music_chunk(video_path: Path, start: int, output_path: Path) -> None:
@@ -965,72 +1697,128 @@ async def _process_music_job(
         await show_music_request_result(bot, request, music_tracks)
 
 
-async def _create_music_request(
-    session: AsyncSession,
-    user_id: str,
-    chat_id: str,
-    tiktok_link: str,
-    format_id: str | None,
-    music_tracks: str | None = None,
-    inline_message_id: str | None = None,
-) -> MusicRequest:
-    request = MusicRequest(
-        token=uuid.uuid4().hex,
-        user_id=user_id,
-        chat_id=chat_id,
-        inline_message_id=inline_message_id,
-        tiktok_link=tiktok_link,
-        format_id=format_id,
-        state="done" if music_tracks is not None else "ready",
-        music_tracks=music_tracks,
-    )
-    session.add(request)
-    # The row must be visible before Telegram receives the callback button.
-    await session.commit()
-    return request
+async def _get_music_bot_username(bot: Bot) -> str | None:
+    configured = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
+    if configured:
+        return configured
+
+    global _music_bot_username_cache
+    if _music_bot_username_cache:
+        return _music_bot_username_cache
+    async with _music_bot_username_lock:
+        if _music_bot_username_cache:
+            return _music_bot_username_cache
+        try:
+            me = await bot.get_me()
+        except Exception as error:
+            logging.warning("Не удалось получить username бота для deep-link: %s", error)
+            return None
+        if not me.username:
+            logging.warning("У бота нет username, deep-link распознавания недоступен")
+            return None
+        _music_bot_username_cache = me.username
+        return _music_bot_username_cache
 
 
-async def create_music_status(
+async def create_music_deep_link(
     bot: Bot,
     session: AsyncSession,
-    user_id: str,
-    chat_id: str,
     tiktok_link: str,
     format_id: str | None,
-    music_tracks: str | None = None,
-) -> None:
-    request: MusicRequest | None = None
+) -> tuple[MusicRequest, str] | None:
+    """Reserve one unclaimed recognition job and return its private-bot link."""
+    username = await _get_music_bot_username(bot)
+    if not username:
+        return None
+    request = MusicRequest(
+        token=uuid.uuid4().hex,
+        # The user is deliberately assigned only after following the deep-link.
+        user_id="",
+        chat_id="",
+        tiktok_link=tiktok_link,
+        format_id=format_id,
+        state="ready",
+        music_tracks=None,
+    )
+    session.add(request)
+    await session.commit()
+    return request, f"https://t.me/{username}?start={MUSIC_START_PREFIX}{request.token}"
+
+
+async def prepare_music_caption_link(
+    bot: Bot,
+    session: AsyncSession,
+    tiktok_link: str,
+    format_id: str | None,
+) -> tuple[str | None, str | None]:
+    """Create a caption deep-link without blocking video delivery on failure."""
     try:
-        request = await _create_music_request(
-            session,
-            user_id,
-            chat_id,
-            tiktok_link,
-            format_id,
-            music_tracks,
-        )
-        message = await bot.send_message(
-            chat_id,
-            _music_status_text(
-                "🎵 Нажмите кнопку ниже, чтобы распознать музыку.",
-                tiktok_link,
-            ),
-            parse_mode=ParseMode.HTML,
-            reply_markup=music_button_markup(request.token),
-        )
-        request.status_message_id = message.message_id
-        await session.commit()
+        result = await create_music_deep_link(bot, session, tiktok_link, format_id)
     except Exception as error:
-        logging.warning("Не удалось создать карточку распознавания: %s", error)
+        logging.warning("Не удалось подготовить ссылку распознавания: %s", error)
         await session.rollback()
-        if request is not None:
-            try:
-                request = await session.get(MusicRequest, request.token)
-                if request is not None:
-                    await session.delete(request)
-                    await session.commit()
-            except Exception:
-                await session.rollback()
+        return None, None
+    if result is None:
+        return None, None
+    request, link = result
+    return request.token, link
+
+
+async def queue_music_deep_link(
+    session: AsyncSession,
+    token: str,
+    user_id: str,
+    chat_id: str,
+    status_message_id: int,
+) -> bool:
+    """Atomically claim a caption deep-link and put recognition into FIFO."""
+    claimed = await session.execute(
+        update(MusicRequest)
+        .where(
+            MusicRequest.token == token,
+            MusicRequest.state == "ready",
+            MusicRequest.user_id == "",
+            MusicRequest.chat_id == "",
+            MusicRequest.status_message_id.is_(None),
+            MusicRequest.inline_message_id.is_(None),
+        )
+        .values(
+            user_id=user_id,
+            chat_id=chat_id,
+            status_message_id=status_message_id,
+            state="queued",
+        )
+    )
+    if claimed.rowcount != 1:
+        return False
+
+    request = await session.get(MusicRequest, token)
+    if request is None:
+        await session.rollback()
+        return False
+    await session.refresh(request)
+    queue_item = DownloadQueue(
+        chat_id=chat_id,
+        filename=f"music_{uuid.uuid4().hex}",
+        tiktok_link=request.tiktok_link,
+        format_id=request.format_id,
+        inline_message_id=f"{MUSIC_JOB_PREFIX}{token}",
+    )
+    if await enqueue_download(session, queue_item, user_id):
+        return True
+
+    await session.execute(
+        update(MusicRequest)
+        .where(MusicRequest.token == token)
+        .values(
+            user_id="",
+            chat_id="",
+            status_message_id=None,
+            state="ready",
+        )
+    )
+    await session.commit()
+    return False
 
 
 async def process_queue(bot: Bot) -> None:
@@ -1105,17 +1893,26 @@ async def process_queue(bot: Bot) -> None:
                 tiktok_id, source_url, likes = await loop.run_in_executor(
                     None, _resolve_media, tiktok_link
                 )
+                music_deep_link: str | None = None
 
                 # 2. Проверяем кеш
                 cached: VideoCache | None = None
                 if tiktok_id and format_id is None:
+                    cache_key = _media_cache_key(tiktok_id)
                     cache_res = await session.execute(
-                        select(VideoCache).where(VideoCache.tiktok_id == tiktok_id)
+                        select(VideoCache).where(VideoCache.tiktok_id == cache_key)
                     )
                     cached = cache_res.scalar()
                     if cached and cached.file_id:
                         logging.info("Cache hit: tiktok_id=%s → отправляем без загрузки", tiktok_id)
-                        delivered_file_id = await _deliver_video(
+                        if can_attach_music_link(without_description):
+                            _, music_deep_link = await prepare_music_caption_link(
+                                bot,
+                                session,
+                                source_url,
+                                format_id,
+                            )
+                        await _deliver_video(
                             bot, chat_id, inline_message_id,
                             file_id=cached.file_id, video_path=None,
                             description=cached.description, source_url=source_url,
@@ -1124,21 +1921,8 @@ async def process_queue(bot: Bot) -> None:
                             placeholder_message_id=placeholder_message_id,
                             has_spoiler=has_spoiler,
                             without_description=without_description,
+                            music_deep_link=music_deep_link,
                         )
-                        if (
-                            delivered_file_id
-                            and can_offer_music(without_description, inline_message_id)
-                            and item.user_id
-                        ):
-                            await create_music_status(
-                                bot,
-                                session,
-                                item.user_id,
-                                chat_id,
-                                source_url,
-                                format_id,
-                                cached.music_tracks,
-                            )
                         await session.delete(item)
                         await session.commit()
                         continue
@@ -1164,6 +1948,15 @@ async def process_queue(bot: Bot) -> None:
                 if video_path.stat().st_size > MAX_SOURCE_VIDEO_BYTES:
                     raise VideoTooLargeError
 
+                video_path, media_probe = await loop.run_in_executor(
+                    None,
+                    _prepare_telegram_video,
+                    video_path,
+                )
+                width = media_probe.width or width
+                height = media_probe.height or height
+                duration = media_probe.duration or duration
+
                 if (
                     not isinstance(duration, (int, float))
                     or not math.isfinite(duration)
@@ -1174,6 +1967,13 @@ async def process_queue(bot: Bot) -> None:
                 if len(parts) > 1:
                     if inline_message_id:
                         raise InlineSplitError
+                    if can_attach_music_link(without_description):
+                        _, music_deep_link = await prepare_music_caption_link(
+                            bot,
+                            session,
+                            source_url,
+                            format_id,
+                        )
                     for number, part in enumerate(parts, start=1):
                         part_description = f"Часть {number}/{len(parts)}"
                         if number == 1 and description:
@@ -1190,6 +1990,9 @@ async def process_queue(bot: Bot) -> None:
                                     placeholder_message_id=placeholder_message_id,
                                     has_spoiler=has_spoiler,
                                     without_description=without_description,
+                                    music_deep_link=(
+                                        music_deep_link if number == 1 else None
+                                    ),
                                 )
                                 break
                             except TelegramRetryAfter as error:
@@ -1199,15 +2002,6 @@ async def process_queue(bot: Bot) -> None:
                         placeholder_message_id = None
                         part.unlink(missing_ok=True)
                     video_path.unlink(missing_ok=True)
-                    if can_offer_music(without_description, inline_message_id) and item.user_id:
-                        await create_music_status(
-                            bot,
-                            session,
-                            item.user_id,
-                            chat_id,
-                            source_url,
-                            format_id,
-                        )
                     await session.delete(item)
                     await session.commit()
                     continue
@@ -1223,6 +2017,7 @@ async def process_queue(bot: Bot) -> None:
                             video=FSInputFile(str(video_path)),
                             width=width,
                             height=height,
+                            supports_streaming=True,
                         )
                         if storage_msg.video:
                             file_id = storage_msg.video.file_id
@@ -1235,6 +2030,13 @@ async def process_queue(bot: Bot) -> None:
                         logging.warning("Не удалось отправить в Storage-канал: %s", e)
 
                 # 5. Доставляем видео
+                if can_attach_music_link(without_description):
+                    _, music_deep_link = await prepare_music_caption_link(
+                        bot,
+                        session,
+                        source_url,
+                        format_id,
+                    )
                 result_file_id = await _deliver_video(
                     bot, chat_id, inline_message_id,
                     file_id=file_id, video_path=video_path,
@@ -1245,40 +2047,52 @@ async def process_queue(bot: Bot) -> None:
                     placeholder_message_id=placeholder_message_id,
                     has_spoiler=has_spoiler,
                     without_description=without_description,
+                    music_deep_link=music_deep_link,
                 )
                 if result_file_id and not file_id:
                     file_id = result_file_id  # сохраним для кеша
-                if (
-                    result_file_id
-                    and can_offer_music(without_description, inline_message_id)
-                    and item.user_id
-                ):
-                    await create_music_status(
-                        bot,
-                        session,
-                        item.user_id,
-                        chat_id,
-                        source_url,
-                        format_id,
-                    )
-
                 # 6. Удаляем файл и кешируем
                 os.remove(video_path)
 
                 if format_id is None and final_id and file_id:
-                    if cached and cached.tiktok_id == final_id:
+                    final_cache_key = _media_cache_key(final_id)
+                    if cached and cached.tiktok_id == final_cache_key:
                         cached.file_id = file_id
                         cached.storage_message_id = storage_message_id
                         cached.description = description
                     else:
                         session.add(VideoCache(
-                            tiktok_id=final_id,
+                            tiktok_id=final_cache_key,
                             file_id=file_id,
                             storage_message_id=storage_message_id,
                             description=description,
                             music_tracks=None,
                         ))
 
+                await session.delete(item)
+                await session.commit()
+
+            except MissingAudioError:
+                logging.warning("Источник не отдал аудиодорожку: chat=%s url=%s", chat_id, tiktok_link)
+                await session.rollback()
+                _remove_download_files(filename)
+                await _show_download_error(
+                    bot, chat_id, inline_message_id, placeholder_message_id,
+                    "❌ TikTok не отдал аудиодорожку. Видео не отправлено без звука — попробуйте позже.",
+                    source_url,
+                )
+                await session.delete(item)
+                await session.commit()
+
+            except MediaPreparationError:
+                logging.exception("Не удалось подготовить совместимое видео: chat=%s url=%s", chat_id, tiktok_link)
+                await session.rollback()
+                _remove_download_files(filename)
+                await _show_download_error(
+                    bot, chat_id, inline_message_id, placeholder_message_id,
+                    "❌ Не удалось подготовить видео со звуком в максимальном совместимом качестве.",
+                    source_url,
+                )
                 await session.delete(item)
                 await session.commit()
 

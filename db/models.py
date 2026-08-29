@@ -19,7 +19,8 @@ class DownloadQueue(Base):
 class VideoCache(Base):
     __tablename__ = "VideoCache"
     id = Column(Integer, primary_key=True)
-    tiktok_id = Column(String, unique=True, index=True)   # ID видео TikTok (не URL)
+    # Версия медиапрофиля + ID TikTok; смена профиля безопасно обходит старые file_id.
+    tiktok_id = Column(String, unique=True, index=True)
     file_id = Column(String)                               # Telegram file_id для быстрой пересылки
     storage_message_id = Column(Integer)                   # ID сообщения в Storage-канале
     description = Column(String, nullable=True)            # Описание ролика для подписи под видео
