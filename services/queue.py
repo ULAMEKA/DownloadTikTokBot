@@ -2090,7 +2090,7 @@ async def process_queue(bot: Bot) -> None:
                 _remove_download_files(filename)
                 await _show_download_error(
                     bot, chat_id, inline_message_id, placeholder_message_id,
-                    "❌ Не удалось подготовить видео со звуком в максимальном совместимом качестве.",
+                    "❌ Не удалось загрузить видео.",
                     source_url,
                 )
                 await session.delete(item)
