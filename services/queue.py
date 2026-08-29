@@ -30,6 +30,12 @@ from db.session import SessionLocal
 from db.models import DownloadQueue, MusicRequest, VideoCache
 from caption import build_caption, source_link
 from promo import AD_DISPLAY_SECONDS
+from services.media_cache import (
+    CachedVideo,
+    find_cached_video,
+    invalidate_cached_video,
+    is_invalid_cached_file_id_error,
+)
 from utils.media_cookies import cookie_files_for_url
 
 BASE_DIR = Path(__file__).parent
@@ -1339,6 +1345,76 @@ async def _deliver_video(
             return msg.video.file_id
 
     return None
+
+
+async def deliver_cached_video(
+    bot: Bot,
+    cached: CachedVideo,
+    *,
+    chat_id: str,
+    fallback_source_url: str,
+    inline_message_id: str | None = None,
+    reply_to_message_id: int | None = None,
+    has_spoiler: bool = False,
+    without_description: bool = False,
+) -> None:
+    """Доставляет сохранённое Telegram-видео без локального файла и плейсхолдера."""
+    await _deliver_video(
+        bot,
+        chat_id,
+        inline_message_id,
+        file_id=cached.file_id,
+        video_path=None,
+        description=cached.description,
+        source_url=cached.source_url or fallback_source_url,
+        likes=cached.likes,
+        reply_to_message_id=reply_to_message_id,
+        placeholder_message_id=None,
+        has_spoiler=has_spoiler,
+        without_description=without_description,
+    )
+
+
+async def try_deliver_cached_video(
+    bot: Bot,
+    session: AsyncSession,
+    canonical_url: str,
+    *,
+    chat_id: str,
+    inline_message_id: str | None = None,
+    reply_to_message_id: int | None = None,
+    has_spoiler: bool = False,
+    without_description: bool = False,
+) -> bool:
+    """Пытается отправить кеш; False оставляет вызывающему обычный путь очереди."""
+    try:
+        cached = await find_cached_video(session, canonical_url)
+    except Exception:
+        logging.exception("Cache lookup failed: url=%s", canonical_url)
+        await session.rollback()
+        return False
+    if cached is None:
+        await session.rollback()
+        return False
+
+    await session.rollback()
+    try:
+        await deliver_cached_video(
+            bot,
+            cached,
+            chat_id=chat_id,
+            fallback_source_url=canonical_url,
+            inline_message_id=inline_message_id,
+            reply_to_message_id=reply_to_message_id,
+            has_spoiler=has_spoiler,
+            without_description=without_description,
+        )
+        return True
+    except TelegramBadRequest as error:
+        if not is_invalid_cached_file_id_error(error):
+            raise
+        await invalidate_cached_video(session, cached.cache_key)
+        return False
 
 
 def _remove_download_files(filename: str) -> None:
