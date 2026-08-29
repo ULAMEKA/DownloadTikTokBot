@@ -23,6 +23,7 @@ from services.queue import (
     needs_quality_choice,
     show_music_request_page,
     show_music_request_result,
+    try_deliver_cached_video,
     update_music_request_message,
 )
 from utils.links import SUPPORTED_URL_RE, canonicalize_video_url, find_video_url
@@ -161,7 +162,7 @@ async def handle_video_link_private(message: Message):
 
 
 @link.callback_query(F.data.startswith("download:"))
-async def handle_download_option(callback: CallbackQuery, session: AsyncSession):
+async def handle_download_option(callback: CallbackQuery, session: AsyncSession, bot: Bot):
     if callback.data is None:
         await callback.answer()
         return
@@ -184,12 +185,25 @@ async def handle_download_option(callback: CallbackQuery, session: AsyncSession)
         return
 
     await callback.answer()
+    pending.mode = mode
+    without_description = mode in ("no_description", "no_description_spoiler")
+    has_spoiler = mode in ("spoiler", "no_description_spoiler")
+    if await try_deliver_cached_video(
+        bot,
+        session,
+        pending.url,
+        chat_id=str(callback.from_user.id),
+        has_spoiler=has_spoiler,
+        without_description=without_description,
+    ):
+        if callback.message:
+            await callback.message.delete()
+        return
     try:
         loop = asyncio.get_running_loop()
         qualities = await loop.run_in_executor(None, list_video_qualities, pending.url)
     except Exception:
         qualities = []
-    pending.mode = mode
     if not needs_quality_choice(qualities):
         await _start_pending_download(
             callback,
@@ -382,9 +396,18 @@ async def handle_video_stats(callback: CallbackQuery):
 
 
 @link.message(F.text.regexp(SUPPORTED_URL_RE.pattern))
-async def handle_video_link_group(message: Message, session: AsyncSession):
+async def handle_video_link_group(message: Message, session: AsyncSession, bot: Bot):
     url = await _video_url_from_text(message.text or "")
     if url is None:
+        return
+
+    if await try_deliver_cached_video(
+        bot,
+        session,
+        url,
+        chat_id=str(message.chat.id),
+        reply_to_message_id=message.message_id,
+    ):
         return
 
     placeholder = await message.reply_photo(

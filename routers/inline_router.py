@@ -24,6 +24,7 @@ from services.queue import (
     enqueue_download,
     hold_inline_placeholder,
     music_button_markup,
+    try_deliver_cached_video,
 )
 from utils.links import canonicalize_video_url, find_video_url
 
@@ -109,6 +110,25 @@ async def chosen_download(result: ChosenInlineResult, session: AsyncSession, bot
     if url is None:
         return
     raw_inline_message_id = result.inline_message_id
+    without_description = result.result_id in (
+        "download_no_description",
+        "download_no_description_spoiler",
+    )
+    has_spoiler = result.result_id in (
+        "download_spoiler",
+        "download_no_description_spoiler",
+    )
+    if await try_deliver_cached_video(
+        bot,
+        session,
+        url,
+        chat_id=str(result.from_user.id),
+        inline_message_id=raw_inline_message_id,
+        has_spoiler=has_spoiler,
+        without_description=without_description,
+    ):
+        return
+
     inline_message_id = raw_inline_message_id
     if inline_message_id:
         prefix = {
