@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-AD_DISPLAY_SECONDS = 15
+AD_DISPLAY_SECONDS = 5
 BOT_USERNAME = "@dwlttbot"
 BOT_PROMO_HTML = (
     f"💡 В любом чате введите: <code>{BOT_USERNAME} *ссылка*</code> — "

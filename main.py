@@ -13,6 +13,7 @@ from middleware.db_session import DBSessionMiddleware
 from routers.command_router import commands_router
 from routers.inline_router import inline_router
 from services.queue import process_queue
+from utils.logging_config import configure_logging
 
 bot = Bot(token=os.getenv('TOKEN'))  # type: ignore[arg-type]
 storage = MemoryStorage()
@@ -40,16 +41,7 @@ async def main():
 
 
 if __name__ == '__main__':
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler("bot.log"),
-            logging.StreamHandler()
-        ]
-    )
-    # Глушим спам SQLAlchemy (BEGIN, ROLLBACK, SELECT каждую секунду)
-    logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+    configure_logging()
 
     try:
         asyncio.run(main())
