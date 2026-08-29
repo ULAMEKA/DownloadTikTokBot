@@ -1228,6 +1228,7 @@ async def _deliver_video(
     has_spoiler: bool = False,
     without_description: bool = False,
     music_deep_link: str | None = None,
+    wait_for_placeholder: bool = True,
 ) -> str | None:
     """Отправляет видео пользователю, возвращает file_id для кеша (или None)."""
     # Inline-режим: редактируем сообщение через file_id из Storage
@@ -1247,7 +1248,8 @@ async def _deliver_video(
             return None
         # Источник и лайки остаются в подписи видео.
         ready_at = _inline_placeholder_ready_at.pop(inline_message_id, 0)
-        await asyncio.sleep(max(0, ready_at - asyncio.get_running_loop().time()))
+        if wait_for_placeholder:
+            await asyncio.sleep(max(0, ready_at - asyncio.get_running_loop().time()))
         try:
             await bot.edit_message_media(
                 inline_message_id=inline_message_id,
@@ -1372,6 +1374,7 @@ async def deliver_cached_video(
         placeholder_message_id=None,
         has_spoiler=has_spoiler,
         without_description=without_description,
+        wait_for_placeholder=False,
     )
 
 

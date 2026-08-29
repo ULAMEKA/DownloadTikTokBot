@@ -25,6 +25,23 @@ class CachedDeliveryTests(unittest.IsolatedAsyncioTestCase):
         sleep_mock.assert_not_awaited()
         self.assertEqual(bot.send_video.await_args.kwargs["video"], "file-id")
 
+    async def test_cached_inline_delivery_has_no_placeholder_sleep(self):
+        """Fails if cached inline delivery waits for the normal placeholder deadline."""
+        cached = CachedVideo("h264-aac-v2:123", "file-id", "desc", None, 7)
+        bot = SimpleNamespace(edit_message_media=AsyncMock())
+
+        with patch.object(queue.asyncio, "sleep", new=AsyncMock()) as sleep_mock:
+            await queue.deliver_cached_video(
+                bot,
+                cached,
+                chat_id="1",
+                fallback_source_url="https://www.tiktok.com/@a/video/123",
+                inline_message_id="inline-message-id",
+            )
+
+        sleep_mock.assert_not_awaited()
+        self.assertEqual(bot.edit_message_media.await_args.kwargs["media"].media, "file-id")
+
     async def test_invalid_file_id_is_deleted_and_returns_miss(self):
         """Fails if a known-invalid cached file id is kept after Telegram rejects it."""
         session = AsyncMock()
