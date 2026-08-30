@@ -1,13 +1,19 @@
 import asyncio
 import tempfile
 import unittest
+from dataclasses import FrozenInstanceError
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import init_db
+import services.queue as queue
 from caption import source_link
+from db.base import Base
+from db.models import DownloadQueue, MusicRequest
 from services.queue import (
     MUSIC_PAGE_PREFIX,
     _add_music_track,
@@ -19,6 +25,244 @@ from services.queue import (
     _telegram_text_length,
     can_offer_music,
 )
+
+
+class MusicSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_recognition_and_ui_run_after_request_session_is_closed(self):
+        session_closed = asyncio.Event()
+        metrics = queue.JobStageMetrics(job_id=1)
+        request = SimpleNamespace(
+            token="a" * 32,
+            user_id="1",
+            chat_id="1",
+            status_message_id=7,
+            inline_message_id=None,
+            tiktok_link="https://www.tiktok.com/@a/video/123",
+            format_id=None,
+            state="queued",
+            music_tracks=None,
+        )
+        session = AsyncMock()
+        session.get.return_value = request
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=session)
+
+        async def close_session(*_args):
+            session_closed.set()
+
+        context.__aexit__ = AsyncMock(side_effect=close_session)
+
+        async def recognize(*_args, **_kwargs):
+            self.assertTrue(session_closed.is_set())
+            return ""
+
+        async def show_result(_bot, finished_request, music_tracks):
+            self.assertTrue(session_closed.is_set())
+            self.assertIs(finished_request, request)
+            self.assertEqual(music_tracks, "")
+
+        job = queue.QueueJob(
+            1,
+            "1",
+            "1",
+            "music_job",
+            request.tiktok_link,
+            None,
+            None,
+            f"music:{request.token}",
+            None,
+        )
+        with (
+            patch.object(queue, "SessionLocal", return_value=context),
+            patch.object(queue, "JobStageMetrics", return_value=metrics),
+            patch.object(queue, "_recognize_music_from_source", side_effect=recognize),
+            patch.object(
+                queue,
+                "_finish_music_job",
+                AsyncMock(return_value=request),
+                create=True,
+            ),
+            patch.object(queue, "show_music_request_result", side_effect=show_result),
+            patch.object(
+                metrics,
+                "log_summary",
+                wraps=metrics.log_summary,
+            ) as log_summary,
+        ):
+            await queue._process_music_job(MagicMock(), job, request.token)
+
+        self.assertIn("delivery", metrics.durations_ms)
+        log_summary.assert_called_once_with(
+            cache_status="not_applicable",
+            ffmpeg_bypassed=None,
+            queue_wait_ms=None,
+        )
+
+
+class MusicStageMetricsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_download_ffmpeg_and_shazam_have_separate_stages(self):
+        metrics = queue.JobStageMetrics(job_id=2)
+
+        class FakeShazam:
+            def __init__(self, *, segment_duration_seconds):
+                self.segment_duration_seconds = segment_duration_seconds
+
+            async def recognize(self, _path):
+                return {"track": {"title": "Song", "subtitle": "Artist"}}
+
+        with tempfile.TemporaryDirectory() as directory:
+            video_dir = Path(directory)
+
+            def download(*_args):
+                (video_dir / "music_job.mp4").write_bytes(b"video")
+                return "123", 640, 360, "description", 15.0
+
+            def extract(_video_path, _start, output_path):
+                output_path.write_bytes(b"audio")
+
+            with (
+                patch.object(queue, "VIDEO_DIR", video_dir),
+                patch.object(queue, "_download_media", side_effect=download),
+                patch.object(queue, "_extract_music_chunk", side_effect=extract),
+                patch.dict(
+                    "sys.modules",
+                    {"shazamio": SimpleNamespace(Shazam=FakeShazam)},
+                ),
+            ):
+                result = await queue._recognize_music_from_source(
+                    "https://www.tiktok.com/@a/video/123",
+                    "music_job",
+                    None,
+                    metrics=metrics,
+                )
+
+        self.assertIn("Artist — Song", result)
+        self.assertIn("download", metrics.durations_ms)
+        self.assertIn("prepare", metrics.durations_ms)
+        self.assertIn("inspect", metrics.durations_ms)
+
+
+class MusicJobFinalizationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        database_path = Path(self.temp_dir.name) / "music-finish.sqlite3"
+        self.engine = create_async_engine(f"sqlite+aiosqlite:///{database_path}")
+        self.session_factory = async_sessionmaker(self.engine, expire_on_commit=False)
+        async with self.engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        self.session_patch = patch.object(queue, "SessionLocal", self.session_factory)
+        self.session_patch.start()
+
+    async def asyncTearDown(self) -> None:
+        self.session_patch.stop()
+        await self.engine.dispose()
+        self.temp_dir.cleanup()
+
+    async def _add_job(self, token: str) -> int:
+        async with self.session_factory() as session:
+            session.add(
+                MusicRequest(
+                    token=token,
+                    user_id="1",
+                    chat_id="1",
+                    status_message_id=7,
+                    inline_message_id=None,
+                    tiktok_link="https://www.tiktok.com/@a/video/123",
+                    format_id=None,
+                    state="queued",
+                    music_tracks=None,
+                )
+            )
+            job = DownloadQueue(
+                chat_id="1",
+                user_id="1",
+                filename=f"music_{token}",
+                tiktok_link="https://www.tiktok.com/@a/video/123",
+                inline_message_id=f"music:{token}",
+            )
+            session.add(job)
+            await session.commit()
+            return job.id
+
+    async def test_load_returns_an_immutable_detached_snapshot(self):
+        token = "b" * 32
+        await self._add_job(token)
+
+        snapshot = await queue._load_music_request(token)
+
+        self.assertIsInstance(snapshot, queue.MusicRequestSnapshot)
+        self.assertEqual(snapshot.token, token)
+        self.assertEqual(snapshot.state, "queued")
+        with self.assertRaises(FrozenInstanceError):
+            snapshot.state = "done"
+
+    async def test_successful_finish_marks_done_and_deletes_job_atomically(self):
+        token = "c" * 32
+        job_id = await self._add_job(token)
+
+        snapshot = await queue._finish_music_job(
+            job_id,
+            token,
+            "00:00 — Artist — Song",
+            retry=False,
+        )
+
+        async with self.session_factory() as session:
+            request = await session.get(MusicRequest, token)
+            job = await session.get(DownloadQueue, job_id)
+        self.assertIsNone(job)
+        self.assertEqual(request.state, "done")
+        self.assertEqual(request.music_tracks, "00:00 — Artist — Song")
+        self.assertEqual(snapshot.state, "done")
+        self.assertEqual(snapshot.music_tracks, request.music_tracks)
+
+    async def test_retry_finish_restores_ready_and_deletes_job_atomically(self):
+        token = "d" * 32
+        job_id = await self._add_job(token)
+
+        snapshot = await queue._finish_music_job(
+            job_id,
+            token,
+            None,
+            retry=True,
+        )
+
+        async with self.session_factory() as session:
+            request = await session.get(MusicRequest, token)
+            job = await session.get(DownloadQueue, job_id)
+        self.assertIsNone(job)
+        self.assertEqual(request.state, "ready")
+        self.assertIsNone(request.music_tracks)
+        self.assertEqual(snapshot.state, "ready")
+
+    async def test_finish_commit_failure_rolls_back_state_and_job_delete(self):
+        token = "e" * 32
+        job_id = await self._add_job(token)
+        worker_session = self.session_factory()
+
+        with (
+            patch.object(queue, "SessionLocal", return_value=worker_session),
+            patch.object(
+                worker_session,
+                "commit",
+                AsyncMock(side_effect=RuntimeError("commit failed")),
+            ),
+            self.assertLogs(level="ERROR"),
+        ):
+            snapshot = await queue._finish_music_job(
+                job_id,
+                token,
+                "00:00 — Artist — Song",
+                retry=False,
+            )
+
+        async with self.session_factory() as session:
+            request = await session.get(MusicRequest, token)
+            job = await session.get(DownloadQueue, job_id)
+        self.assertIsNone(snapshot)
+        self.assertIsNotNone(job)
+        self.assertEqual(request.state, "queued")
+        self.assertIsNone(request.music_tracks)
 
 
 class MusicRecognitionTests(unittest.TestCase):

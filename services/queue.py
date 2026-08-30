@@ -9,10 +9,11 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 
@@ -149,6 +150,105 @@ class QueueJob:
             self.inline_message_id
             and self.inline_message_id.startswith(MUSIC_JOB_PREFIX)
         )
+
+
+@dataclass(frozen=True)
+class MusicRequestSnapshot:
+    token: str
+    user_id: str
+    chat_id: str
+    status_message_id: int | None
+    inline_message_id: str | None
+    tiktok_link: str
+    format_id: str | None
+    state: str
+    music_tracks: str | None
+
+
+_METRIC_STAGE_NAMES = (
+    "cache",
+    "inspect",
+    "download",
+    "prepare",
+    "storage",
+    "delivery",
+)
+
+
+@dataclass
+class JobStageMetrics:
+    job_id: int
+    started_at: float = field(default_factory=lambda: time.monotonic())
+    durations_ms: dict[str, int] = field(default_factory=dict)
+
+    @contextmanager
+    def stage(self, name: str):
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            duration_ms = round((time.monotonic() - started) * 1000)
+            self.durations_ms[name] = self.durations_ms.get(name, 0) + duration_ms
+
+    def log_summary(
+        self,
+        *,
+        cache_status: str,
+        ffmpeg_bypassed: bool | None,
+        queue_wait_ms: int | None,
+    ) -> None:
+        safe_cache_status = (
+            cache_status
+            if cache_status in {"hit", "miss", "not_applicable"}
+            else "unknown"
+        )
+        if ffmpeg_bypassed is True:
+            safe_ffmpeg_bypassed = "true"
+        elif ffmpeg_bypassed is False:
+            safe_ffmpeg_bypassed = "false"
+        else:
+            safe_ffmpeg_bypassed = "null"
+        fields = [
+            "job_stage_summary",
+            f"job_id={self.job_id}",
+            f"cache_status={safe_cache_status}",
+            f"ffmpeg_bypassed={safe_ffmpeg_bypassed}",
+        ]
+        if queue_wait_ms is not None:
+            fields.append(f"queue_wait_ms={queue_wait_ms}")
+        fields.extend(
+            f"{name}_ms={self.durations_ms.get(name, 0)}"
+            for name in _METRIC_STAGE_NAMES
+        )
+        fields.append(f"total_ms={round((time.monotonic() - self.started_at) * 1000)}")
+        logging.info("%s", " ".join(fields))
+
+
+@contextmanager
+def _job_stage(metrics: JobStageMetrics | None, name: str):
+    if metrics is None:
+        yield
+        return
+    with metrics.stage(name):
+        yield
+
+
+def _queue_wait_ms(
+    enqueued_at: datetime | None,
+    *,
+    now: datetime | None = None,
+) -> int | None:
+    if enqueued_at is None:
+        return None
+    observed_at = now or datetime.now(timezone.utc)
+    if enqueued_at.tzinfo is None:
+        enqueued_at = enqueued_at.replace(tzinfo=timezone.utc)
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    try:
+        return max(0, round((observed_at - enqueued_at).total_seconds() * 1000))
+    except (OverflowError, TypeError, ValueError):
+        return None
 
 
 MusicTrack = tuple[int, str, str]
@@ -1764,7 +1864,11 @@ def _extract_music_chunk(video_path: Path, start: int, output_path: Path) -> Non
     )
 
 
-async def _recognize_music_tracks(video_path: Path, duration: float | None) -> str | None:
+async def _recognize_music_tracks(
+    video_path: Path,
+    duration: float | None,
+    metrics: JobStageMetrics | None = None,
+) -> str | None:
     """Recognize sequential 15-second audio chunks without risking video delivery."""
     try:
         from shazamio import Shazam
@@ -1774,7 +1878,8 @@ async def _recognize_music_tracks(video_path: Path, duration: float | None) -> s
             or duration <= 0
         ):
             loop = asyncio.get_running_loop()
-            duration = await loop.run_in_executor(None, _probe_duration, video_path)
+            with _job_stage(metrics, "prepare"):
+                duration = await loop.run_in_executor(None, _probe_duration, video_path)
         if duration is None or duration <= 0:
             logging.info("Не удалось определить длительность для распознавания музыки: %s", video_path)
             return None
@@ -1788,9 +1893,10 @@ async def _recognize_music_tracks(video_path: Path, duration: float | None) -> s
             for start in _music_chunk_starts(duration):
                 chunk_path = Path(temp_dir) / f"{start:06d}.wav"
                 try:
-                    await loop.run_in_executor(
-                        None, _extract_music_chunk, video_path, start, chunk_path
-                    )
+                    with _job_stage(metrics, "prepare"):
+                        await loop.run_in_executor(
+                            None, _extract_music_chunk, video_path, start, chunk_path
+                        )
                 except subprocess.CalledProcessError:
                     chunk_path.unlink(missing_ok=True)
                     logging.debug("В ролике нет читаемой аудиодорожки: %s", video_path)
@@ -1798,10 +1904,11 @@ async def _recognize_music_tracks(video_path: Path, duration: float | None) -> s
                 audio_chunks += 1
 
                 try:
-                    response = await asyncio.wait_for(
-                        recognizer.recognize(str(chunk_path)),
-                        timeout=MUSIC_RECOGNITION_TIMEOUT_SECONDS,
-                    )
+                    with _job_stage(metrics, "inspect"):
+                        response = await asyncio.wait_for(
+                            recognizer.recognize(str(chunk_path)),
+                            timeout=MUSIC_RECOGNITION_TIMEOUT_SECONDS,
+                        )
                 except Exception as error:  # Recognition is strictly best-effort.
                     logging.info("Не удалось распознать музыку на %s: %s", chunk_path.name, error)
                 else:
@@ -1822,7 +1929,7 @@ async def _recognize_music_tracks(video_path: Path, duration: float | None) -> s
 
 async def update_music_request_message(
     bot: Bot,
-    request: MusicRequest,
+    request: MusicRequest | MusicRequestSnapshot,
     text: str,
     retry: bool = False,
     reply_markup: InlineKeyboardMarkup | None = None,
@@ -1854,7 +1961,7 @@ async def update_music_request_message(
 
 async def show_music_request_page(
     bot: Bot,
-    request: MusicRequest,
+    request: MusicRequest | MusicRequestSnapshot,
     page: int,
 ) -> None:
     """Show one inline page so a long result remains fully accessible."""
@@ -1877,7 +1984,7 @@ async def show_music_request_page(
 
 async def show_music_request_result(
     bot: Bot,
-    request: MusicRequest,
+    request: MusicRequest | MusicRequestSnapshot,
     music_tracks: str | None,
 ) -> None:
     if not music_tracks:
@@ -1903,22 +2010,25 @@ async def _recognize_music_from_source(
     tiktok_link: str,
     filename: str,
     format_id: str | None,
+    *,
+    metrics: JobStageMetrics | None = None,
 ) -> str | None:
     """Download only after a button press, then clean the temporary source file."""
     outtmpl = str(VIDEO_DIR / f"{filename}.%(ext)s")  # cspell:disable-line
     slideshow_path = VIDEO_DIR / f"{filename}.mp4"
     try:
         loop = asyncio.get_running_loop()
-        _, _, _, _, duration = await loop.run_in_executor(
-            None, _download_media, tiktok_link, outtmpl, slideshow_path, format_id
-        )
+        with _job_stage(metrics, "download"):
+            _, _, _, _, duration = await loop.run_in_executor(
+                None, _download_media, tiktok_link, outtmpl, slideshow_path, format_id
+            )
         matches = [
             path for path in VIDEO_DIR.glob(f"{filename}.*")
             if path.suffix.lower() in _VIDEO_EXTENSIONS
         ]
         if not matches:
             return None
-        return await _recognize_music_tracks(matches[0], duration)
+        return await _recognize_music_tracks(matches[0], duration, metrics)
     except Exception as error:
         logging.info("Не удалось скачать ролик для распознавания музыки: %s", error)
         return None
@@ -1926,67 +2036,112 @@ async def _recognize_music_from_source(
         _remove_download_files(filename)
 
 
+def _music_request_snapshot(request: MusicRequest) -> MusicRequestSnapshot:
+    return MusicRequestSnapshot(
+        token=request.token,
+        user_id=request.user_id,
+        chat_id=request.chat_id,
+        status_message_id=request.status_message_id,
+        inline_message_id=request.inline_message_id,
+        tiktok_link=request.tiktok_link,
+        format_id=request.format_id,
+        state=request.state,
+        music_tracks=request.music_tracks,
+    )
+
+
+async def _load_music_request(token: str) -> MusicRequestSnapshot | None:
+    async with SessionLocal() as session:
+        request = await session.get(MusicRequest, token)
+        if request is None:
+            return None
+        return _music_request_snapshot(request)
+
+
+async def _finish_music_job(
+    job_id: int,
+    token: str,
+    music_tracks: str | None,
+    retry: bool,
+) -> MusicRequestSnapshot | None:
+    async with SessionLocal() as session:
+        try:
+            request = await session.get(MusicRequest, token)
+            item = await session.get(DownloadQueue, job_id)
+            if request is not None:
+                request.state = "ready" if retry else "done"
+                if not retry:
+                    request.music_tracks = music_tracks or ""
+            if item is not None:
+                await session.delete(item)
+            await session.commit()
+            return _music_request_snapshot(request) if request is not None else None
+        except Exception:
+            await session.rollback()
+            logging.exception(
+                "Не удалось завершить задачу распознавания: job_id=%s",
+                job_id,
+            )
+            return None
+
+
 async def _process_music_job(
     bot: Bot,
-    session: AsyncSession,
-    item: DownloadQueue,
+    job: QueueJob,
     token: str,
 ) -> None:
-    """Run one requested recognition in the existing FIFO worker."""
-    request: MusicRequest | None = None
+    """Run one requested recognition without retaining an ORM session."""
+    metrics = JobStageMetrics(job_id=job.id)
+    request: MusicRequestSnapshot | None = None
     music_tracks: str | None = None
     retry = False
     try:
-        request = await session.get(MusicRequest, token)
-        if request is None or request.state != "queued":
-            await session.delete(item)
-            await session.commit()
-            return
-
-        music_tracks = await _recognize_music_from_source(
-            request.tiktok_link,
-            item.filename,
-            request.format_id,
-        )
-        if music_tracks is None:
-            request.state = "ready"
-            result_text = "❌ Не удалось распознать музыку. Попробуйте ещё раз."
-            retry = True
-        elif music_tracks:
-            request.music_tracks = music_tracks
-            request.state = "done"
-            result_text = ""
-        else:
-            request.music_tracks = ""
-            request.state = "done"
-            result_text = ""
-
-        await session.delete(item)
-        await session.commit()
-    except Exception:
-        logging.exception("Ошибка распознавания музыки: token=%s", token)
-        await session.rollback()
         try:
-            request = await session.get(MusicRequest, token)
-            if request is not None:
-                request.state = "ready"
-            queued_item = await session.get(DownloadQueue, item.id)
-            if queued_item is not None:
-                await session.delete(queued_item)
-            await session.commit()
-        except Exception:
-            logging.exception("Не удалось очистить задачу распознавания: token=%s", token)
-            await session.rollback()
-        result_text = "❌ Не удалось распознать музыку. Попробуйте ещё раз."
-        music_tracks = None
-        retry = True
+            request = await _load_music_request(token)
+            if request is None or request.state != "queued":
+                await _discard_job(job.id)
+                return
 
-    if request is None:
-        return
-    if retry:
-        await update_music_request_message(bot, request, result_text, retry=True)
-    else:
-        await show_music_request_result(bot, request, music_tracks)
+            music_tracks = await _recognize_music_from_source(
+                request.tiktok_link,
+                job.filename,
+                request.format_id,
+                metrics=metrics,
+            )
+            if music_tracks is None:
+                result_text = "❌ Не удалось распознать музыку. Попробуйте ещё раз."
+                retry = True
+            else:
+                result_text = ""
+
+            request = await _finish_music_job(
+                job.id,
+                token,
+                music_tracks,
+                retry,
+            )
+            if request is None:
+                return
+        except Exception:
+            logging.exception("Ошибка распознавания музыки: job_id=%s", job.id)
+            request = await _finish_music_job(job.id, token, None, retry=True)
+            result_text = "❌ Не удалось распознать музыку. Попробуйте ещё раз."
+            music_tracks = None
+            retry = True
+
+        if request is None:
+            return
+        with metrics.stage("delivery"):
+            if retry:
+                await update_music_request_message(bot, request, result_text, retry=True)
+            else:
+                await show_music_request_result(bot, request, music_tracks)
+    finally:
+        metrics.log_summary(
+            cache_status="not_applicable",
+            ffmpeg_bypassed=None,
+            queue_wait_ms=_queue_wait_ms(job.enqueued_at),
+        )
 
 
 async def _get_music_bot_username(bot: Bot) -> str | None:
@@ -2252,8 +2407,18 @@ async def _try_deliver_worker_cache(
 
 
 async def _process_video_job(bot: Bot, job: QueueJob) -> None:
+    metrics = JobStageMetrics(job_id=job.id)
+    cache_status = "miss"
+    ffmpeg_bypassed: bool | None = None
     if job.chat_id is None or job.filename is None or job.tiktok_link is None:
-        await _discard_job(job.id)
+        try:
+            await _discard_job(job.id)
+        finally:
+            metrics.log_summary(
+                cache_status=cache_status,
+                ffmpeg_bypassed=ffmpeg_bypassed,
+                queue_wait_ms=_queue_wait_ms(job.enqueued_at),
+            )
         return
 
     chat_id = job.chat_id
@@ -2295,71 +2460,83 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
     try:
         loop = asyncio.get_running_loop()
         if format_id is None:
-            cached = await _find_worker_cached_video(tiktok_link)
-            if cached is not None and await _try_deliver_worker_cache(
-                bot,
-                job,
-                cached,
-                chat_id=chat_id,
-                inline_message_id=inline_message_id,
-                reply_to_message_id=reply_to_message_id,
-                placeholder_message_id=placeholder_message_id,
-                has_spoiler=has_spoiler,
-                without_description=without_description,
-            ):
-                return
+            with metrics.stage("cache"):
+                cached = await _find_worker_cached_video(tiktok_link)
+            if cached is not None:
+                with metrics.stage("delivery"):
+                    delivered_from_cache = await _try_deliver_worker_cache(
+                        bot,
+                        job,
+                        cached,
+                        chat_id=chat_id,
+                        inline_message_id=inline_message_id,
+                        reply_to_message_id=reply_to_message_id,
+                        placeholder_message_id=placeholder_message_id,
+                        has_spoiler=has_spoiler,
+                        without_description=without_description,
+                    )
+                if delivered_from_cache:
+                    cache_status = "hit"
+                    return
 
-        snapshot = _load_info_snapshot(filename)
-        if snapshot is None:
-            try:
-                inspection = await loop.run_in_executor(None, inspect_media, tiktok_link)
-            except Exception as error:
-                raise MediaPreparationError("Не удалось получить метаданные") from error
-            info_path = write_info_snapshot(filename, inspection.info)
-        else:
-            inspection = _inspection_from_snapshot(tiktok_link, snapshot)
-            info_path = _info_snapshot_path(filename)
+        with metrics.stage("inspect"):
+            snapshot = _load_info_snapshot(filename)
+            if snapshot is None:
+                try:
+                    inspection = await loop.run_in_executor(None, inspect_media, tiktok_link)
+                except Exception as error:
+                    raise MediaPreparationError("Не удалось получить метаданные") from error
+                info_path = write_info_snapshot(filename, inspection.info)
+            else:
+                inspection = _inspection_from_snapshot(tiktok_link, snapshot)
+                info_path = _info_snapshot_path(filename)
         source_url = inspection.source_url
         likes = inspection.likes
 
         if inspection.media_id and format_id is None:
-            cached = await _find_worker_cached_video(source_url, inspection.media_id)
-            if cached is not None and await _try_deliver_worker_cache(
-                bot,
-                job,
-                cached,
-                chat_id=chat_id,
-                inline_message_id=inline_message_id,
-                reply_to_message_id=reply_to_message_id,
-                placeholder_message_id=placeholder_message_id,
-                has_spoiler=has_spoiler,
-                without_description=without_description,
-            ):
-                return
+            with metrics.stage("cache"):
+                cached = await _find_worker_cached_video(source_url, inspection.media_id)
+            if cached is not None:
+                with metrics.stage("delivery"):
+                    delivered_from_cache = await _try_deliver_worker_cache(
+                        bot,
+                        job,
+                        cached,
+                        chat_id=chat_id,
+                        inline_message_id=inline_message_id,
+                        reply_to_message_id=reply_to_message_id,
+                        placeholder_message_id=placeholder_message_id,
+                        has_spoiler=has_spoiler,
+                        without_description=without_description,
+                    )
+                if delivered_from_cache:
+                    cache_status = "hit"
+                    return
 
         outtmpl = str(VIDEO_DIR / f"{filename}.%(ext)s")  # cspell:disable-line
         slideshow_path = VIDEO_DIR / f"{filename}.mp4"
-        try:
-            downloaded = await loop.run_in_executor(
-                None,
-                _ydl_download_from_info_file,
-                tiktok_link,
-                info_path,
-                outtmpl,
-                format_id,
-            )
-        except VideoTooLargeError:
-            raise
-        except Exception as error:
-            logging.info("Info snapshot download failed, using URL fallback: %s", error)
-            downloaded = await loop.run_in_executor(
-                None,
-                _download_media,
-                tiktok_link,
-                outtmpl,
-                slideshow_path,
-                format_id,
-            )
+        with metrics.stage("download"):
+            try:
+                downloaded = await loop.run_in_executor(
+                    None,
+                    _ydl_download_from_info_file,
+                    tiktok_link,
+                    info_path,
+                    outtmpl,
+                    format_id,
+                )
+            except VideoTooLargeError:
+                raise
+            except Exception as error:
+                logging.info("Info snapshot download failed, using URL fallback: %s", error)
+                downloaded = await loop.run_in_executor(
+                    None,
+                    _download_media,
+                    tiktok_link,
+                    outtmpl,
+                    slideshow_path,
+                    format_id,
+                )
         downloaded_id, width, height, description, duration = downloaded
         final_id = inspection.media_id or downloaded_id
 
@@ -2374,11 +2551,13 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
         if video_path.stat().st_size > MAX_SOURCE_VIDEO_BYTES:
             raise VideoTooLargeError
 
-        prepared_video = await loop.run_in_executor(
-            None,
-            _prepare_telegram_video,
-            video_path,
-        )
+        with metrics.stage("prepare"):
+            prepared_video = await loop.run_in_executor(
+                None,
+                _prepare_telegram_video,
+                video_path,
+            )
+        ffmpeg_bypassed = prepared_video.bypassed_ffmpeg
         music_deep_link: str | None = None
         music_deep_link_prepared = False
         forced_normalization_attempted = False
@@ -2389,18 +2568,19 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
             height = media_probe.height or height
             duration = media_probe.duration or duration
 
-            if (
-                not isinstance(duration, (int, float))
-                or not math.isfinite(duration)
-                or duration <= 0
-            ):
-                duration = await loop.run_in_executor(None, _probe_duration, video_path)
-            parts, part_dir = await loop.run_in_executor(
-                None,
-                _split_video,
-                video_path,
-                duration,
-            )
+            with metrics.stage("prepare"):
+                if (
+                    not isinstance(duration, (int, float))
+                    or not math.isfinite(duration)
+                    or duration <= 0
+                ):
+                    duration = await loop.run_in_executor(None, _probe_duration, video_path)
+                parts, part_dir = await loop.run_in_executor(
+                    None,
+                    _split_video,
+                    video_path,
+                    duration,
+                )
             successful_sends = 0
             try:
                 if len(parts) > 1:
@@ -2422,25 +2602,26 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                             part_description = f"{part_description}\n\n{description}"
                         for attempt in range(2):
                             try:
-                                await _deliver_video(
-                                    bot,
-                                    chat_id,
-                                    None,
-                                    file_id=None,
-                                    video_path=part,
-                                    width=width,
-                                    height=height,
-                                    description=part_description,
-                                    source_url=source_url if number == 1 else None,
-                                    likes=likes if number == 1 else None,
-                                    reply_to_message_id=reply_to_message_id,
-                                    placeholder_message_id=placeholder_message_id,
-                                    has_spoiler=has_spoiler,
-                                    without_description=without_description,
-                                    music_deep_link=(
-                                        music_deep_link if number == 1 else None
-                                    ),
-                                )
+                                with metrics.stage("delivery"):
+                                    await _deliver_video(
+                                        bot,
+                                        chat_id,
+                                        None,
+                                        file_id=None,
+                                        video_path=part,
+                                        width=width,
+                                        height=height,
+                                        description=part_description,
+                                        source_url=source_url if number == 1 else None,
+                                        likes=likes if number == 1 else None,
+                                        reply_to_message_id=reply_to_message_id,
+                                        placeholder_message_id=placeholder_message_id,
+                                        has_spoiler=has_spoiler,
+                                        without_description=without_description,
+                                        music_deep_link=(
+                                            music_deep_link if number == 1 else None
+                                        ),
+                                    )
                                 successful_sends += 1
                                 break
                             except TelegramRetryAfter as error:
@@ -2457,12 +2638,13 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                 file_id: str | None = None
                 storage_message_id: int | None = None
                 if inline_message_id:
-                    file_id, storage_message_id = await _upload_to_storage(
-                        bot,
-                        video_path,
-                        width,
-                        height,
-                    )
+                    with metrics.stage("storage"):
+                        file_id, storage_message_id = await _upload_to_storage(
+                            bot,
+                            video_path,
+                            width,
+                            height,
+                        )
 
                 if (
                     can_attach_music_link(without_description)
@@ -2474,23 +2656,24 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                         format_id,
                     )
                     music_deep_link_prepared = True
-                result_file_id = await _deliver_video(
-                    bot,
-                    chat_id,
-                    inline_message_id,
-                    file_id=file_id,
-                    video_path=video_path,
-                    width=width,
-                    height=height,
-                    description=description,
-                    source_url=source_url,
-                    likes=likes,
-                    reply_to_message_id=reply_to_message_id,
-                    placeholder_message_id=placeholder_message_id,
-                    has_spoiler=has_spoiler,
-                    without_description=without_description,
-                    music_deep_link=music_deep_link,
-                )
+                with metrics.stage("delivery"):
+                    result_file_id = await _deliver_video(
+                        bot,
+                        chat_id,
+                        inline_message_id,
+                        file_id=file_id,
+                        video_path=video_path,
+                        width=width,
+                        height=height,
+                        description=description,
+                        source_url=source_url,
+                        likes=likes,
+                        reply_to_message_id=reply_to_message_id,
+                        placeholder_message_id=placeholder_message_id,
+                        has_spoiler=has_spoiler,
+                        without_description=without_description,
+                        music_deep_link=music_deep_link,
+                    )
                 successful_sends += 1
                 if result_file_id and not file_id:
                     file_id = result_file_id
@@ -2510,14 +2693,16 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                     "Telegram rejected bypassed MP4; retrying after forced normalization"
                 )
                 forced_normalization_attempted = True
-                prepared_video = await loop.run_in_executor(
-                    None,
-                    partial(
-                        _prepare_telegram_video,
-                        video_path,
-                        force_normalize=True,
-                    ),
-                )
+                with metrics.stage("prepare"):
+                    prepared_video = await loop.run_in_executor(
+                        None,
+                        partial(
+                            _prepare_telegram_video,
+                            video_path,
+                            force_normalize=True,
+                        ),
+                    )
+                ffmpeg_bypassed = prepared_video.bypassed_ffmpeg
                 continue
 
             cache_update = None
@@ -2537,91 +2722,98 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
     except MissingAudioError:
         logging.warning("Источник не отдал аудиодорожку: chat=%s url=%s", chat_id, tiktok_link)
         _remove_download_files(filename)
-        await _show_download_error(
-            bot,
-            chat_id,
-            inline_message_id,
-            placeholder_message_id,
-            "❌ TikTok не отдал аудиодорожку. Видео не отправлено без звука — попробуйте позже.",
-            source_url,
-        )
+        with metrics.stage("delivery"):
+            await _show_download_error(
+                bot,
+                chat_id,
+                inline_message_id,
+                placeholder_message_id,
+                "❌ TikTok не отдал аудиодорожку. Видео не отправлено без звука — попробуйте позже.",
+                source_url,
+            )
         await _discard_job(job.id)
 
     except MediaPreparationError:
         logging.exception("Не удалось подготовить совместимое видео: chat=%s url=%s", chat_id, tiktok_link)
         _remove_download_files(filename)
-        await _show_download_error(
-            bot,
-            chat_id,
-            inline_message_id,
-            placeholder_message_id,
-            "❌ Не удалось загрузить видео.",
-            source_url,
-        )
+        with metrics.stage("delivery"):
+            await _show_download_error(
+                bot,
+                chat_id,
+                inline_message_id,
+                placeholder_message_id,
+                "❌ Не удалось загрузить видео.",
+                source_url,
+            )
         await _discard_job(job.id)
 
     except VideoTooLargeError:
         logging.info("Видео больше 1 GB: chat=%s url=%s", chat_id, tiktok_link)
         _remove_download_files(filename)
-        await _show_download_error(
-            bot,
-            chat_id,
-            inline_message_id,
-            placeholder_message_id,
-            "❌ Видео больше 1 ГБ. Выберите другое качество.",
-            source_url,
-        )
+        with metrics.stage("delivery"):
+            await _show_download_error(
+                bot,
+                chat_id,
+                inline_message_id,
+                placeholder_message_id,
+                "❌ Видео больше 1 ГБ. Выберите другое качество.",
+                source_url,
+            )
         await _discard_job(job.id)
 
     except InlineSplitError:
         _remove_download_files(filename)
-        await _show_download_error(
-            bot,
-            chat_id,
-            inline_message_id,
-            placeholder_message_id,
-            "❌ Большие видео отправляются частями только в личном чате с ботом.",
-            source_url,
-        )
+        with metrics.stage("delivery"):
+            await _show_download_error(
+                bot,
+                chat_id,
+                inline_message_id,
+                placeholder_message_id,
+                "❌ Большие видео отправляются частями только в личном чате с ботом.",
+                source_url,
+            )
         await _discard_job(job.id)
 
     except VideoSplitError:
         logging.warning("Не удалось разделить видео: chat=%s url=%s", chat_id, tiktok_link)
         _remove_download_files(filename)
-        await _show_download_error(
-            bot,
-            chat_id,
-            inline_message_id,
-            placeholder_message_id,
-            "❌ Не удалось безопасно разделить видео. Выберите другое качество.",
-            source_url,
-        )
+        with metrics.stage("delivery"):
+            await _show_download_error(
+                bot,
+                chat_id,
+                inline_message_id,
+                placeholder_message_id,
+                "❌ Не удалось безопасно разделить видео. Выберите другое качество.",
+                source_url,
+            )
         await _discard_job(job.id)
 
     except (TelegramBadRequest, TelegramForbiddenError) as error:
         logging.warning("Telegram delivery error for chat %s: %s", chat_id, error)
         _remove_download_files(filename)
-        await _show_download_error(
-            bot,
-            chat_id,
-            inline_message_id,
-            placeholder_message_id,
-            "❌ Не удалось доставить видео. Возможно, оно слишком большое.",
-            source_url,
-        )
+        with metrics.stage("delivery"):
+            await _show_download_error(
+                bot,
+                chat_id,
+                inline_message_id,
+                placeholder_message_id,
+                "❌ Не удалось доставить видео. Возможно, оно слишком большое.",
+                source_url,
+            )
         await _discard_job(job.id)
 
     except Exception:
         logging.exception("Ошибка загрузки: chat=%s url=%s", chat_id, tiktok_link)
         _remove_download_files(filename)
-        await _show_download_error(
-            bot,
-            chat_id,
-            inline_message_id,
-            placeholder_message_id,
-            "❌ Не удалось скачать видео. Попробуй ещё раз.",
-            source_url,
-        )
+        with metrics.stage("delivery"):
+            await _show_download_error(
+                bot,
+                chat_id,
+                inline_message_id,
+                placeholder_message_id,
+                "❌ Не удалось скачать видео. Попробуй ещё раз.",
+                source_url,
+            )
         await asyncio.sleep(3)
         await _discard_job(job.id)
     finally:
@@ -2631,22 +2823,10 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
             _placeholder_ready_at.pop((chat_id, placeholder_for_cleanup), None)
         if inline_message_id:
             _inline_placeholder_ready_at.pop(inline_message_id, None)
-
-
-async def _process_music_job_legacy(bot: Bot, job: QueueJob) -> None:
-    async with SessionLocal() as session:
-        item = await session.get(DownloadQueue, job.id)
-        if item is None:
-            return
-        if item.chat_id is None or item.filename is None or item.tiktok_link is None:
-            await session.delete(item)
-            await session.commit()
-            return
-        await _process_music_job(
-            bot,
-            session,
-            item,
-            job.inline_message_id.removeprefix(MUSIC_JOB_PREFIX),
+        metrics.log_summary(
+            cache_status=cache_status,
+            ffmpeg_bypassed=ffmpeg_bypassed,
+            queue_wait_ms=_queue_wait_ms(job.enqueued_at),
         )
 
 
@@ -2655,6 +2835,10 @@ async def process_queue(bot: Bot) -> None:
     while True:
         job = await _wait_for_next_job()
         if job.is_music:
-            await _process_music_job_legacy(bot, job)
+            await _process_music_job(
+                bot,
+                job,
+                job.inline_message_id.removeprefix(MUSIC_JOB_PREFIX),
+            )
         else:
             await _process_video_job(bot, job)

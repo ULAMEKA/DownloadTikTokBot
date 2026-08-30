@@ -211,6 +211,125 @@ class QueueSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(item.enqueued_at)
 
 
+class JobStageMetricsTests(unittest.TestCase):
+    def test_stage_metrics_use_monotonic_deltas(self):
+        with patch("services.queue.time.monotonic", side_effect=[10.0, 10.2, 10.5]):
+            metrics = queue.JobStageMetrics(job_id=7)
+            with metrics.stage("download"):
+                pass
+
+        self.assertEqual(metrics.durations_ms["download"], 300)
+
+    def test_queue_wait_handles_nullable_naive_and_aware_datetimes(self):
+        now = datetime(2026, 8, 30, 12, 0, 1, tzinfo=timezone.utc)
+
+        self.assertIsNone(queue._queue_wait_ms(None, now=now))
+        self.assertEqual(
+            queue._queue_wait_ms(datetime(2026, 8, 30, 12, 0, 0), now=now),
+            1000,
+        )
+        self.assertEqual(
+            queue._queue_wait_ms(
+                datetime(2026, 8, 30, 12, 0, 0, tzinfo=timezone.utc),
+                now=now,
+            ),
+            1000,
+        )
+        self.assertEqual(
+            queue._queue_wait_ms(
+                datetime(2026, 8, 30, 15, 0, 0, tzinfo=timezone(timedelta(hours=3))),
+                now=now,
+            ),
+            1000,
+        )
+
+    def test_summary_is_bounded_numeric_and_redacts_sensitive_metadata(self):
+        metrics = queue.JobStageMetrics(job_id=9, started_at=100.0)
+        metrics.durations_ms.update(
+            {
+                "inspect": 11,
+                "download": 22,
+                "prepare": 33,
+                "storage": 44,
+                "delivery": 55,
+            }
+        )
+        metrics.source_url = "https://example.test/video?secret_query=1"
+        metrics.cookies = "session-cookie"
+        metrics.headers = {"Authorization": "Bearer header-secret"}
+
+        with (
+            patch("services.queue.time.monotonic", return_value=100.9),
+            self.assertLogs(level="INFO") as captured,
+        ):
+            metrics.log_summary(
+                cache_status="miss secret_query=1",
+                ffmpeg_bypassed=True,
+                queue_wait_ms=125,
+            )
+
+        self.assertEqual(len(captured.output), 1)
+        summary = captured.output[0]
+        self.assertIn("job_id=9", summary)
+        self.assertIn("cache_status=unknown", summary)
+        self.assertIn("ffmpeg_bypassed=true", summary)
+        for field in (
+            "queue_wait",
+            "inspect",
+            "download",
+            "prepare",
+            "storage",
+            "delivery",
+            "total",
+        ):
+            self.assertRegex(summary, rf"\b{field}_ms=\d+\b")
+        for sensitive in (
+            "secret_query",
+            "session-cookie",
+            "Authorization",
+            "header-secret",
+        ):
+            self.assertNotIn(sensitive, summary)
+
+    def test_summary_omits_queue_wait_for_legacy_rows(self):
+        metrics = queue.JobStageMetrics(job_id=10, started_at=100.0)
+
+        with (
+            patch("services.queue.time.monotonic", return_value=100.1),
+            self.assertLogs(level="INFO") as captured,
+        ):
+            metrics.log_summary(
+                cache_status="miss",
+                ffmpeg_bypassed=None,
+                queue_wait_ms=None,
+            )
+
+        self.assertNotIn("queue_wait_ms=", captured.output[0])
+
+
+class JobProcessorMetricsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_invalid_video_job_emits_one_terminal_summary(self):
+        metrics = queue.JobStageMetrics(job_id=99)
+        job = queue.QueueJob(99, None, None, None, None, None, None, None, None)
+
+        with (
+            patch.object(queue, "JobStageMetrics", return_value=metrics),
+            patch.object(queue, "_discard_job", AsyncMock()),
+            patch.object(
+                metrics,
+                "log_summary",
+                wraps=metrics.log_summary,
+            ) as log_summary,
+        ):
+            await queue._process_video_job(MagicMock(), job)
+
+        log_summary.assert_called_once_with(
+            cache_status="miss",
+            ffmpeg_bypassed=None,
+            queue_wait_ms=None,
+        )
+
+
 class ShortSessionTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _job() -> queue.QueueJob:
@@ -598,6 +717,29 @@ class DeliveryRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cache_update.storage_message_id, 77)
         result.discard.assert_not_awaited()
         result.show_error.assert_not_awaited()
+
+    async def test_video_success_records_external_stages_and_one_summary(self):
+        metrics = queue.JobStageMetrics(job_id=1)
+
+        with (
+            patch.object(queue, "JobStageMetrics", return_value=metrics),
+            patch.object(
+                metrics,
+                "log_summary",
+                wraps=metrics.log_summary,
+            ) as log_summary,
+        ):
+            await self._run_single_delivery("inline-message-id")
+
+        self.assertTrue(
+            {"cache", "inspect", "download", "prepare", "storage", "delivery"}
+            <= metrics.durations_ms.keys()
+        )
+        log_summary.assert_called_once_with(
+            cache_status="miss",
+            ffmpeg_bypassed=True,
+            queue_wait_ms=None,
+        )
 
 
 class ForcedNormalizationRetryTests(unittest.IsolatedAsyncioTestCase):
