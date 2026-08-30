@@ -35,7 +35,9 @@ FFmpeg-потоком на малом VDS. Более ранний H.264-first s
 5. Сохранить current cache fast path, inline/storage, split, music deep-link,
    one-heavy-worker и sessionless DB boundaries.
 6. Сохранить старые HD cache hits по выбранной переходной политике.
-7. Сделать причину отказа явной, когда совместимого H.264-источника нет.
+7. Сохранить TikTok photo galleries: скачать изображения и исходный трек,
+   затем собрать слайд-шоу с аудио.
+8. Сделать причину отказа явной, когда совместимого H.264-источника нет.
 
 ## Не цели
 
@@ -143,6 +145,11 @@ H.264 encoding неизбежен. Для него используется не
 audio AAC `128k`, preset `ultrafast` и CRF `26`. Это не преобразование
 скачанного source video.
 
+Этот путь не удаляется и не считается ошибкой из-за отсутствия H.264 source
+video: gallery fallback сохраняет последовательность image download → source
+audio download → H.264/AAC slideshow. Если исходный трек недоступен, остаётся
+существующий явный сценарий слайд-шоу без audio, а не отказ от всей галереи.
+
 ## Ошибки и совместимость
 
 - `MissingAudioError` сохраняет текущий понятный UX: видео без аудио не
@@ -187,7 +194,10 @@ TDD добавляет или обновляет тесты для:
 7. Legacy queued `format_id` cannot force HEVC conversion.
 8. User-facing no-fast-H.264 error and preserved missing-audio error.
 9. Photo slideshow encoding at `480×854` with fast preset.
-10. Existing cache, queue lifecycle, session, telemetry, split, music and
+10. Photo gallery with an external source track keeps the audio in the final
+    slideshow; gallery without a track still produces the existing silent
+    slideshow path.
+11. Existing cache, queue lifecycle, session, telemetry, split, music and
     error regressions.
 
 The full safe suite remains:
