@@ -139,6 +139,31 @@ class PreparedVideo:
 
 
 @dataclass(frozen=True)
+class GalleryDownloadResult:
+    media_id: str | None
+    path: Path
+    probe: MediaProbe
+    width: int | None
+    height: int | None
+    description: str | None
+    duration: float | None
+    generated_slideshow: bool = False
+
+    @property
+    def has_audio(self) -> bool:
+        return self.probe.has_audio
+
+    def metadata(self) -> tuple[
+        str | None,
+        int | None,
+        int | None,
+        str | None,
+        float | None,
+    ]:
+        return self.media_id, self.width, self.height, self.description, self.duration
+
+
+@dataclass(frozen=True)
 class VideoSplitOutcome:
     parts: list[Path]
     part_dir: Path | None
@@ -447,6 +472,11 @@ def _has_audio(item: dict[str, object]) -> bool:
     return item.get("acodec") not in (None, "none")
 
 
+def _combined_source_may_have_audio(item: dict[str, object]) -> bool:
+    codec = item.get("acodec")
+    return not (isinstance(codec, str) and codec.lower() == "none")
+
+
 def _audio_quality_key(item: dict[str, object]) -> tuple[int, int, int]:
     return (
         _to_int(item.get("abr")) or 0,
@@ -486,8 +516,14 @@ def select_fast_h264_format(formats: object) -> str | None:
     classes = (
         lambda item: _is_h264(item.get("vcodec")) and _has_audio(item)
         and str(item.get("acodec", "")).lower().startswith("aac"),
-        lambda item: _is_h264(item.get("vcodec")) and not _has_audio(item) and best_aac,
-        lambda item: _is_h264(item.get("vcodec")) and not _has_audio(item) and best_audio,
+        lambda item: _is_h264(item.get("vcodec"))
+        and _combined_source_may_have_audio(item),
+        lambda item: _is_h264(item.get("vcodec"))
+        and not _combined_source_may_have_audio(item)
+        and best_aac,
+        lambda item: _is_h264(item.get("vcodec"))
+        and not _combined_source_may_have_audio(item)
+        and best_audio,
     )
     for allowed in classes:
         candidates = [item for item in typed if _has_video(item) and allowed(item)]
@@ -497,7 +533,7 @@ def select_fast_h264_format(formats: object) -> str | None:
         video_id = selected.get("format_id")
         if not isinstance(video_id, str):
             continue
-        if _has_audio(selected):
+        if _combined_source_may_have_audio(selected):
             return video_id
         audio_item = best_aac or best_audio
         audio_id = audio_item.get("format_id") if audio_item else None
@@ -1060,10 +1096,12 @@ def _gallery_tiktok_context(
     return None
 
 
-def _tiktok_video_candidates(post: dict[str, object]) -> list[dict[str, object]]:
+def _tiktok_video_candidate_selection(
+    post: dict[str, object],
+) -> tuple[list[dict[str, object]], bool]:
     video = post.get("video")
     if not isinstance(video, dict):
-        return []
+        return [], False
 
     candidates: list[dict[str, object]] = []
     bitrate_info = video.get("bitrateInfo")
@@ -1113,6 +1151,7 @@ def _tiktok_video_candidates(post: dict[str, object]) -> list[dict[str, object]]
             "audio_id": None,
         })
 
+    had_video_candidates = bool(candidates)
     candidates = [
         candidate
         for candidate in candidates
@@ -1126,6 +1165,11 @@ def _tiktok_video_candidates(post: dict[str, object]) -> list[dict[str, object]]
         ),
         reverse=True,
     )
+    return candidates, had_video_candidates
+
+
+def _tiktok_video_candidates(post: dict[str, object]) -> list[dict[str, object]]:
+    candidates, _ = _tiktok_video_candidate_selection(post)
     return candidates
 
 
@@ -1221,8 +1265,12 @@ def _download_tiktok_post(
     if post.get("post_type") != "video":
         return None
 
-    candidates = _tiktok_video_candidates(post)
+    candidates, had_video_candidates = _tiktok_video_candidate_selection(post)
     if not candidates:
+        if had_video_candidates:
+            raise NoFastH264FormatError(
+                "TikTok metadata не содержит совместимый H.264 видеопоток"
+            )
         return None
     last_error: Exception | None = None
     no_fast_error: NoFastH264FormatError | None = None
@@ -1423,14 +1471,24 @@ def _build_slideshow(images: list[Path], audio: Path | None, output: Path) -> No
 def _gallery_download(
     url: str,
     output: Path,
-) -> tuple[str | None, int | None, int | None, str | None, float | None] | None:
+) -> GalleryDownloadResult | None:
     local_identity = media_identity_from_source(url)
     local_media_id = local_identity.media_id if local_identity is not None else None
     advanced_no_fast_error: NoFastH264FormatError | None = None
     try:
         tiktok_video = _gallery_tiktok_video_download(url, output)
         if tiktok_video is not None:
-            return tiktok_video
+            media_id, width, height, description, duration = tiktok_video
+            probe = _probe_media(output)
+            return GalleryDownloadResult(
+                media_id,
+                output,
+                probe,
+                probe.width or width,
+                probe.height or height,
+                description,
+                probe.duration or duration,
+            )
     except (VideoTooLargeError, MissingAudioError):
         raise
     except NoFastH264FormatError as error:
@@ -1490,7 +1548,15 @@ def _gallery_download(
                 if not probe.has_audio and audio is not None:
                     _mux_external_audio(target, audio)
                     probe = _probe_media(target)
-                return local_media_id, probe.width, probe.height, None, probe.duration
+                return GalleryDownloadResult(
+                    local_media_id,
+                    target,
+                    probe,
+                    probe.width,
+                    probe.height,
+                    None,
+                    probe.duration,
+                )
 
             images = sorted(
                 (path for path in files if path.suffix.lower() in _IMAGE_EXTENSIONS),
@@ -1504,12 +1570,17 @@ def _gallery_download(
                 if output.stat().st_size > MAX_SOURCE_VIDEO_BYTES:
                     raise VideoTooLargeError
                 probe = _probe_media(output)
-                return (
+                if not probe.has_video or not _is_h264(probe.video_codec):
+                    raise MediaPreparationError("FFmpeg не создал H.264 слайд-шоу")
+                return GalleryDownloadResult(
                     local_media_id,
+                    output,
+                    probe,
                     SLIDESHOW_WIDTH,
                     SLIDESHOW_HEIGHT,
                     None,
                     probe.duration,
+                    generated_slideshow=True,
                 )
 
             if index + 1 < len(cookie_variants):
@@ -1543,7 +1614,7 @@ def _download_media(
             metrics.download_fallback = "gallery"
         downloaded = _gallery_download(url, slideshow_path)
         if downloaded is not None:
-            return downloaded
+            return downloaded.metadata()
         raise
 
 
@@ -2721,7 +2792,12 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                 info_path = _info_snapshot_path(filename)
         source_url = inspection.source_url
         likes = inspection.likes
-        download_format_id = require_fast_h264_format(inspection)
+        selector_error: NoFastH264FormatError | None = None
+        try:
+            download_format_id = require_fast_h264_format(inspection)
+        except NoFastH264FormatError as error:
+            selector_error = error
+            download_format_id = None
 
         if inspection.identity and format_id is None:
             with metrics.stage("cache"):
@@ -2745,31 +2821,53 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
 
         outtmpl = str(VIDEO_DIR / f"{filename}.%(ext)s")  # cspell:disable-line
         slideshow_path = VIDEO_DIR / f"{filename}.mp4"
+        gallery_result: GalleryDownloadResult | None = None
         with metrics.stage("download"):
-            try:
-                metrics.download_backend = "info_snapshot"
-                downloaded = await loop.run_in_executor(
-                    None,
-                    _ydl_download_from_info_file,
-                    tiktok_link,
-                    info_path,
-                    outtmpl,
-                    download_format_id,
-                )
-            except VideoTooLargeError:
-                raise
-            except InfoSnapshotDownloadError as error:
-                logging.info("Info snapshot download failed, using gallery fallback: %s", error)
+            if download_format_id is None:
                 metrics.download_backend = "gallery"
                 metrics.download_fallback = "gallery"
-                downloaded = await loop.run_in_executor(
+                gallery_result = await loop.run_in_executor(
                     None,
                     _gallery_download,
                     tiktok_link,
                     slideshow_path,
                 )
-                if downloaded is None:
-                    raise MediaPreparationError("Fallback не скачал медиа") from error
+                if gallery_result is None:
+                    if selector_error is not None:
+                        raise selector_error
+                    raise NoFastH264FormatError(
+                        "Fallback не нашёл совместимый H.264 источник"
+                    )
+                downloaded = gallery_result.metadata()
+            else:
+                try:
+                    metrics.download_backend = "info_snapshot"
+                    downloaded = await loop.run_in_executor(
+                        None,
+                        _ydl_download_from_info_file,
+                        tiktok_link,
+                        info_path,
+                        outtmpl,
+                        download_format_id,
+                    )
+                except VideoTooLargeError:
+                    raise
+                except InfoSnapshotDownloadError as error:
+                    logging.info(
+                        "Info snapshot download failed, using gallery fallback: %s",
+                        error,
+                    )
+                    metrics.download_backend = "gallery"
+                    metrics.download_fallback = "gallery"
+                    gallery_result = await loop.run_in_executor(
+                        None,
+                        _gallery_download,
+                        tiktok_link,
+                        slideshow_path,
+                    )
+                    if gallery_result is None:
+                        raise MediaPreparationError("Fallback не скачал медиа") from error
+                    downloaded = gallery_result.metadata()
         downloaded_id, width, height, description, duration = downloaded
         final_identity = (
             inspection.identity
@@ -2777,23 +2875,34 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
             or media_identity_from_source(tiktok_link, downloaded_id)
         )
 
-        matches = [
-            path
-            for path in VIDEO_DIR.glob(f"{filename}.*")
-            if path.suffix.lower() in _VIDEO_EXTENSIONS
-        ]
-        if not matches:
-            raise FileNotFoundError(f"Файл после загрузки не найден: {filename}")
-        video_path = matches[0]
+        if gallery_result is not None:
+            video_path = gallery_result.path
+        else:
+            matches = [
+                path
+                for path in VIDEO_DIR.glob(f"{filename}.*")
+                if path.suffix.lower() in _VIDEO_EXTENSIONS
+            ]
+            if not matches:
+                raise FileNotFoundError(f"Файл после загрузки не найден: {filename}")
+            video_path = matches[0]
         if video_path.stat().st_size > MAX_SOURCE_VIDEO_BYTES:
             raise VideoTooLargeError
 
         with metrics.stage("prepare"):
-            prepared_video = await loop.run_in_executor(
-                None,
-                _prepare_telegram_video,
-                video_path,
-            )
+            if gallery_result is not None and gallery_result.generated_slideshow:
+                prepared_video = PreparedVideo(
+                    gallery_result.path,
+                    gallery_result.probe,
+                    False,
+                    "slideshow_encode",
+                )
+            else:
+                prepared_video = await loop.run_in_executor(
+                    None,
+                    _prepare_telegram_video,
+                    video_path,
+                )
         ffmpeg_bypassed = prepared_video.bypassed_ffmpeg
         metrics.preparation_mode = prepared_video.preparation_mode
         music_deep_link: str | None = None
@@ -2984,7 +3093,7 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                 chat_id,
                 inline_message_id,
                 placeholder_message_id,
-                "❌ Видео больше 1 ГБ. Выберите другое качество.",
+                "❌ Видео больше 1 ГБ. Попробуйте другое видео или повторите позже.",
                 source_url,
             )
         await _discard_job(job.id)
@@ -3011,7 +3120,8 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                 chat_id,
                 inline_message_id,
                 placeholder_message_id,
-                "❌ Не удалось безопасно разделить видео. Выберите другое качество.",
+                "❌ Не удалось безопасно разделить видео. "
+                "Попробуйте другое видео или повторите позже.",
                 source_url,
             )
         await _discard_job(job.id)

@@ -239,7 +239,8 @@ class MediaInspectionTests(unittest.TestCase):
             ):
                 result = queue._gallery_download(instagram_url, output)
 
-        self.assertEqual(result[0], "AbC_123")
+        self.assertEqual(result.media_id, "AbC_123")
+        self.assertEqual(result.path.suffix, ".mp4")
         youtube_dl.assert_not_called()
 
     def test_gallery_cookie_variants_preserve_no_fast_after_later_generic_failure(self):
@@ -270,6 +271,176 @@ class MediaInspectionTests(unittest.TestCase):
 
 
 class InfoSnapshotWorkerFallbackTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _photo_inspection() -> queue.MediaInspection:
+        info = {
+            "id": "123",
+            "webpage_url": SOURCE_URL,
+            "formats": [
+                {"format_id": "audio", "vcodec": "none", "acodec": "aac"},
+            ],
+        }
+        return queue.MediaInspection(
+            queue.MediaIdentity(queue.MediaProvider.TIKTOK, "123"),
+            SOURCE_URL,
+            9,
+            "desc",
+            None,
+            None,
+            None,
+            (),
+            info,
+            None,
+        )
+
+    @staticmethod
+    def _photo_job(job_id: int = 10) -> queue.QueueJob:
+        return queue.QueueJob(
+            job_id,
+            "1",
+            "1",
+            f"photo-{job_id}",
+            SOURCE_URL,
+            None,
+            None,
+            "direct:no_description",
+            None,
+        )
+
+    async def test_photo_snapshot_without_fast_video_selector_calls_gallery_slideshow(self):
+        """Fails if selector absence terminates before the gallery fallback."""
+        job = self._photo_job()
+        inspection = self._photo_inspection()
+        gallery = MagicMock(return_value=None)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(queue, "VIDEO_DIR", Path(directory)),
+                patch.object(
+                    queue,
+                    "_find_worker_cached_video",
+                    AsyncMock(return_value=None),
+                ),
+                patch.object(queue, "_load_info_snapshot", return_value=inspection.info),
+                patch.object(queue, "_inspection_from_snapshot", return_value=inspection),
+                patch.object(queue, "_ydl_download_from_info_file") as snapshot_download,
+                patch.object(queue, "_gallery_download", gallery),
+                patch.object(queue, "_discard_job", AsyncMock()),
+                patch.object(queue, "_show_download_error", AsyncMock()),
+                patch.object(queue, "_remove_download_files"),
+                self.assertLogs(level="INFO"),
+            ):
+                await queue._process_video_job(MagicMock(), job)
+
+        gallery.assert_called_once_with(
+            SOURCE_URL,
+            Path(directory) / f"{job.filename}.mp4",
+        )
+        snapshot_download.assert_not_called()
+
+    async def _run_generated_photo_slideshow(self, *, has_audio: bool) -> list[str]:
+        job = self._photo_job(11 if has_audio else 12)
+        inspection = self._photo_inspection()
+        metrics = queue.JobStageMetrics(job.id)
+        ffmpeg_commands: list[list[str]] = []
+
+        with tempfile.TemporaryDirectory() as directory:
+            work_dir = Path(directory)
+            image = work_dir / "1_photo.jpg"
+            image.write_bytes(b"image")
+            audio = work_dir / "1_audio.m4a" if has_audio else None
+            if audio is not None:
+                audio.write_bytes(b"audio")
+            output = work_dir / f"{job.filename}.mp4"
+            probe = queue.MediaProbe(
+                has_video=True,
+                has_audio=has_audio,
+                video_codec="h264",
+                audio_codec="aac" if has_audio else None,
+                width=queue.SLIDESHOW_WIDTH,
+                height=queue.SLIDESHOW_HEIGHT,
+                duration=5.0,
+                pixel_format="yuv420p",
+                sample_aspect_ratio="1:1",
+            )
+
+            def ffmpeg_run(command, **_kwargs):
+                ffmpeg_commands.append(command)
+                Path(command[-1]).write_bytes(b"slideshow")
+                return SimpleNamespace(returncode=0)
+
+            def gallery_download(_url, slideshow_path):
+                queue._build_slideshow([image], audio, slideshow_path)
+                return queue.GalleryDownloadResult(
+                    "123",
+                    slideshow_path,
+                    probe,
+                    probe.width,
+                    probe.height,
+                    None,
+                    probe.duration,
+                    generated_slideshow=True,
+                )
+
+            prepare = MagicMock(side_effect=AssertionError("generated slideshow was re-prepared"))
+            deliver = AsyncMock(return_value="telegram-file-id")
+            show_error = AsyncMock()
+            log_summary = MagicMock(wraps=metrics.log_summary)
+            with (
+                patch.object(queue, "VIDEO_DIR", work_dir),
+                patch.object(queue, "JobStageMetrics", return_value=metrics),
+                patch.object(metrics, "log_summary", log_summary),
+                patch.object(queue, "_find_worker_cached_video", AsyncMock(return_value=None)),
+                patch.object(queue, "_load_info_snapshot", return_value=inspection.info),
+                patch.object(queue, "_inspection_from_snapshot", return_value=inspection),
+                patch.object(queue, "_ydl_download_from_info_file") as snapshot_download,
+                patch.object(queue, "_gallery_download", side_effect=gallery_download) as gallery,
+                patch.object(queue.subprocess, "run", side_effect=ffmpeg_run),
+                patch.object(queue, "_prepare_telegram_video", prepare),
+                patch.object(
+                    queue,
+                    "_split_video",
+                    return_value=queue.VideoSplitOutcome([output], None, 0),
+                ),
+                patch.object(queue, "_deliver_video", deliver),
+                patch.object(queue, "_finish_video_job", AsyncMock()),
+                patch.object(queue, "_discard_job", AsyncMock()),
+                patch.object(queue, "_show_download_error", show_error),
+                patch.object(queue, "_remove_download_files"),
+                patch.object(queue.asyncio, "sleep", AsyncMock()),
+            ):
+                await queue._process_video_job(MagicMock(), job)
+
+            gallery.assert_called_once_with(SOURCE_URL, output)
+            snapshot_download.assert_not_called()
+            prepare.assert_not_called()
+            show_error.assert_not_awaited()
+            deliver.assert_awaited_once()
+            self.assertEqual(metrics.preparation_mode, "slideshow_encode")
+            log_summary.assert_called_once_with(
+                cache_status="miss",
+                ffmpeg_bypassed=False,
+                queue_wait_ms=None,
+            )
+
+        self.assertEqual(len(ffmpeg_commands), 1)
+        return ffmpeg_commands[0]
+
+    async def test_photo_gallery_with_audio_delivers_slideshow_encode_mode(self):
+        command = await self._run_generated_photo_slideshow(has_audio=True)
+
+        self.assertIn("-c:a", command)
+        self.assertIn("aac", command)
+        self.assertIn("0:v:0", command)
+        self.assertIn("1:a:0", command)
+        self.assertNotIn("-an", command)
+
+    async def test_photo_gallery_without_audio_delivers_silent_slideshow(self):
+        command = await self._run_generated_photo_slideshow(has_audio=False)
+
+        self.assertIn("-an", command)
+        self.assertNotIn("-c:a", command)
+
     async def test_legacy_hevc_format_id_cannot_force_slow_transcode(self):
         """A queued legacy selector must not bypass the current H.264 inspection."""
         job = queue.QueueJob(
@@ -352,7 +523,24 @@ class InfoSnapshotWorkerFallbackTests(unittest.IsolatedAsyncioTestCase):
 
             def fallback_download(*_args):
                 video_path.write_bytes(b"video")
-                return "123", 720, 1280, "desc", 10.0
+                probe = queue.MediaProbe(
+                    has_video=True,
+                    has_audio=True,
+                    video_codec="h264",
+                    audio_codec="aac",
+                    width=720,
+                    height=1280,
+                    duration=10.0,
+                )
+                return queue.GalleryDownloadResult(
+                    "123",
+                    video_path,
+                    probe,
+                    720,
+                    1280,
+                    "desc",
+                    10.0,
+                )
 
             with (
                 patch.object(queue, "VIDEO_DIR", Path(directory)),

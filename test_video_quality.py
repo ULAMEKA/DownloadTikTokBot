@@ -53,6 +53,56 @@ class VideoQualityTests(unittest.TestCase):
             {"format_id": "hevc", "vcodec": "h265", "acodec": "aac"},
         ]))
 
+    def test_fast_selector_accepts_combined_h264_with_unknown_audio_codec(self):
+        formats = [
+            {
+                "format_id": "combined-unknown",
+                "vcodec": "h264",
+                "acodec": None,
+                "fps": 30,
+                "width": 720,
+                "height": 1280,
+            },
+        ]
+
+        self.assertEqual(select_fast_h264_format(formats), "combined-unknown")
+
+    def test_fast_selector_accepts_combined_h264_with_non_aac_audio_codec(self):
+        formats = [
+            {
+                "format_id": "combined-opus",
+                "vcodec": "avc1.640028",
+                "acodec": "opus",
+                "fps": 60,
+                "width": 720,
+                "height": 1280,
+            },
+        ]
+
+        self.assertEqual(select_fast_h264_format(formats), "combined-opus")
+
+    def test_fast_selector_rejects_explicit_audio_none(self):
+        formats = [
+            {
+                "format_id": "combined-unknown",
+                "vcodec": "h264",
+                "acodec": None,
+                "fps": 30,
+                "width": 720,
+                "height": 1280,
+            },
+            {
+                "format_id": "silent-video",
+                "vcodec": "h264",
+                "acodec": "none",
+                "fps": 60,
+                "width": 1080,
+                "height": 1920,
+            },
+        ]
+
+        self.assertEqual(select_fast_h264_format(formats), "combined-unknown")
+
     def test_list_video_qualities_remains_a_compatibility_wrapper(self):
         inspection = queue.MediaInspection(
             identity=queue.MediaIdentity(queue.MediaProvider.TIKTOK, "123"),
@@ -352,6 +402,99 @@ class VideoQualityTests(unittest.TestCase):
 
         self.assertNotIsInstance(captured.exception, queue.NoFastH264FormatError)
         self.assertEqual(str(captured.exception.__cause__), "second candidate failed")
+
+    def test_hevc_only_tiktok_metadata_raises_no_fast_error_after_full_fallback(self):
+        post = {
+            "post_type": "video",
+            "video": {
+                "bitrateInfo": [
+                    {
+                        "CodecType": "h265_hvc1",
+                        "PlayAddr": {"UrlList": ["https://cdn/hevc"]},
+                    },
+                ],
+            },
+        }
+        context = (object(), post, "https://www.tiktok.com/@a/video/123")
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            queue,
+            "VIDEO_DIR",
+            Path(directory),
+        ):
+            output = Path(directory) / "job.mp4"
+            with (
+                patch.object(queue, "cookie_files_for_url", return_value=[]),
+                patch.object(queue, "_gallery_tiktok_context", return_value=context),
+                patch.object(queue, "_download_gallery_stream") as stream_download,
+                patch.object(
+                    queue.subprocess,
+                    "run",
+                    return_value=SimpleNamespace(returncode=1),
+                ),
+            ):
+                with self.assertRaises(queue.NoFastH264FormatError):
+                    queue._gallery_download(
+                        "https://www.tiktok.com/@a/video/123",
+                        output,
+                    )
+
+        stream_download.assert_not_called()
+
+    def test_photo_post_without_h264_video_remains_eligible_for_slideshow(self):
+        post = {
+            "post_type": "photo",
+            "video": {
+                "bitrateInfo": [
+                    {
+                        "CodecType": "h265_hvc1",
+                        "PlayAddr": {"UrlList": ["https://cdn/hevc"]},
+                    },
+                ],
+            },
+        }
+        context = (object(), post, "https://www.tiktok.com/@a/photo/123")
+        silent_probe = queue.MediaProbe(
+            has_video=True,
+            has_audio=False,
+            video_codec="h264",
+            width=queue.SLIDESHOW_WIDTH,
+            height=queue.SLIDESHOW_HEIGHT,
+            duration=5.0,
+        )
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            queue,
+            "VIDEO_DIR",
+            Path(directory),
+        ):
+            output = Path(directory) / "job.mp4"
+
+            def gallery_cli(command, **_kwargs):
+                work_dir = Path(command[command.index("--directory") + 1])
+                (work_dir / "1_photo.jpg").write_bytes(b"image")
+                return SimpleNamespace(returncode=0)
+
+            def build_slideshow(_images, _audio, slideshow_path):
+                slideshow_path.write_bytes(b"slideshow")
+
+            with (
+                patch.object(queue, "cookie_files_for_url", return_value=[]),
+                patch.object(queue, "_gallery_tiktok_context", return_value=context),
+                patch.object(queue, "_download_gallery_stream") as stream_download,
+                patch.object(queue.subprocess, "run", side_effect=gallery_cli),
+                patch.object(queue, "_build_slideshow", side_effect=build_slideshow),
+                patch.object(queue, "_probe_media", return_value=silent_probe),
+            ):
+                result = queue._gallery_download(
+                    "https://www.tiktok.com/@a/photo/123",
+                    output,
+                )
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result.generated_slideshow)
+        self.assertFalse(result.has_audio)
+        stream_download.assert_not_called()
 
     def test_generic_gallery_rejects_non_h264_video_before_moving_it(self):
         probe = queue.MediaProbe(

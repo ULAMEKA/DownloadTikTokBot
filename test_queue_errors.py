@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from aiogram.enums import ParseMode
@@ -56,6 +58,97 @@ class ErrorSourceLinkTests(unittest.IsolatedAsyncioTestCase):
 
 
 class QueueErrorMessageTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _inspection(source_url: str) -> queue.MediaInspection:
+        return queue.MediaInspection(
+            queue.MediaIdentity(queue.MediaProvider.TIKTOK, "123"),
+            source_url,
+            None,
+            None,
+            640,
+            360,
+            5.0,
+            (),
+            {"id": "123", "webpage_url": source_url},
+            "h264-aac",
+        )
+
+    async def test_oversized_video_message_offers_an_available_action(self):
+        source_url = "https://www.tiktok.com/@author/video/123"
+        job = queue.QueueJob(20, "123", "456", "oversized", source_url, None, None, None, None)
+        inspection = self._inspection(source_url)
+        show_error = AsyncMock()
+
+        with (
+            patch.object(queue, "_find_worker_cached_video", AsyncMock(return_value=None)),
+            patch.object(queue, "_load_info_snapshot", return_value=inspection.info),
+            patch.object(queue, "_inspection_from_snapshot", return_value=inspection),
+            patch.object(
+                queue,
+                "_ydl_download_from_info_file",
+                side_effect=queue.VideoTooLargeError,
+            ),
+            patch.object(queue, "_discard_job", AsyncMock()),
+            patch.object(queue, "_show_download_error", show_error),
+            patch.object(queue, "_remove_download_files"),
+            self.assertLogs(level="INFO"),
+        ):
+            await queue._process_video_job(AsyncMock(), job)
+
+        message = show_error.await_args.args[4]
+        self.assertNotIn("другое качество", message.lower())
+        self.assertIn("Попробуйте другое видео или повторите позже.", message)
+
+    async def test_split_failure_message_offers_an_available_action(self):
+        source_url = "https://www.tiktok.com/@author/video/123"
+        job = queue.QueueJob(21, "123", "456", "split", source_url, None, None, None, None)
+        inspection = self._inspection(source_url)
+        show_error = AsyncMock()
+
+        with tempfile.TemporaryDirectory() as directory:
+            video_path = Path(directory) / "split.mp4"
+
+            def download(*_args):
+                video_path.write_bytes(b"video")
+                return "123", 640, 360, None, 5.0
+
+            prepared = queue.PreparedVideo(
+                video_path,
+                queue.MediaProbe(
+                    has_video=True,
+                    has_audio=True,
+                    video_codec="h264",
+                    audio_codec="aac",
+                    width=640,
+                    height=360,
+                    duration=5.0,
+                ),
+                True,
+                "direct",
+            )
+            with (
+                patch.object(queue, "VIDEO_DIR", Path(directory)),
+                patch.object(queue, "_find_worker_cached_video", AsyncMock(return_value=None)),
+                patch.object(queue, "_load_info_snapshot", return_value=inspection.info),
+                patch.object(queue, "_inspection_from_snapshot", return_value=inspection),
+                patch.object(queue, "_ydl_download_from_info_file", side_effect=download),
+                patch.object(queue, "_prepare_telegram_video", return_value=prepared),
+                patch.object(
+                    queue,
+                    "_split_video",
+                    side_effect=queue.VideoSplitError(attempts=1),
+                ),
+                patch.object(queue, "_discard_job", AsyncMock()),
+                patch.object(queue, "_show_download_error", show_error),
+                patch.object(queue, "_remove_download_files"),
+                self.assertLogs(level="WARNING"),
+            ):
+                await queue._process_video_job(AsyncMock(), job)
+
+        message = show_error.await_args.args[4]
+        self.assertNotIn("другое качество", message.lower())
+        self.assertIn("Попробуйте другое видео или повторите позже.", message)
+
     async def test_no_fast_h264_error_keeps_source_link(self):
         source_url = "https://www.tiktok.com/@author/video/123"
         job = queue.QueueJob(1, "123", "456", "no-fast-h264", source_url, None, None, None, None)
@@ -88,6 +181,7 @@ class QueueErrorMessageTests(unittest.IsolatedAsyncioTestCase):
                 "require_fast_h264_format",
                 side_effect=queue.NoFastH264FormatError,
             ),
+            patch.object(queue, "_gallery_download", return_value=None),
             patch.object(queue, "_discard_job", AsyncMock()),
             patch.object(queue, "_remove_download_files"),
             self.assertLogs(level="INFO"),
