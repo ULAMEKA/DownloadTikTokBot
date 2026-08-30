@@ -363,6 +363,37 @@ class JobStageMetricsTests(unittest.TestCase):
         self.assertIn("download_fallback=gallery", summary)
         self.assertIn("split_attempts=3", summary)
 
+    def test_summary_allowlists_preparation_mode(self):
+        """Fails if preparation telemetry can expose arbitrary source metadata."""
+        metrics = queue.JobStageMetrics(job_id=12, started_at=100.0)
+        metrics.preparation_mode = "rejected_no_fast_h264"
+
+        with (
+            patch("services.queue.time.monotonic", return_value=100.1),
+            self.assertLogs(level="INFO") as captured,
+        ):
+            metrics.log_summary(
+                cache_status="miss",
+                ffmpeg_bypassed=None,
+                queue_wait_ms=None,
+            )
+
+        self.assertIn("preparation_mode=rejected_no_fast_h264", captured.output[0])
+
+        metrics.preparation_mode = "source=https://example.test/?token=secret"
+        with (
+            patch("services.queue.time.monotonic", return_value=100.2),
+            self.assertLogs(level="INFO") as captured,
+        ):
+            metrics.log_summary(
+                cache_status="miss",
+                ffmpeg_bypassed=None,
+                queue_wait_ms=None,
+            )
+
+        self.assertIn("preparation_mode=unknown", captured.output[0])
+        self.assertNotIn("token=secret", captured.output[0])
+
     def test_summary_omits_queue_wait_for_legacy_rows(self):
         metrics = queue.JobStageMetrics(job_id=10, started_at=100.0)
 

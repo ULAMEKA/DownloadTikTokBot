@@ -194,6 +194,7 @@ class JobStageMetrics:
     download_backend: str = "none"
     download_fallback: str = "none"
     split_attempts: int = 0
+    preparation_mode: str = "direct"
 
     @contextmanager
     def stage(self, name: str):
@@ -239,6 +240,17 @@ class JobStageMetrics:
             and self.split_attempts > 0
             else 0
         )
+        safe_preparation_mode = (
+            self.preparation_mode
+            if self.preparation_mode in {
+                "direct",
+                "remux_copy",
+                "audio_to_aac",
+                "rejected_no_fast_h264",
+                "slideshow_encode",
+            }
+            else "unknown"
+        )
         fields = [
             "job_stage_summary",
             f"job_id={self.job_id}",
@@ -247,6 +259,7 @@ class JobStageMetrics:
             f"download_backend={safe_download_backend}",
             f"download_fallback={safe_download_fallback}",
             f"split_attempts={safe_split_attempts}",
+            f"preparation_mode={safe_preparation_mode}",
         ]
         if queue_wait_ms is not None:
             fields.append(f"queue_wait_ms={queue_wait_ms}")
@@ -2701,6 +2714,7 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                 info_path = _info_snapshot_path(filename)
         source_url = inspection.source_url
         likes = inspection.likes
+        download_format_id = require_fast_h264_format(inspection)
 
         if inspection.identity and format_id is None:
             with metrics.stage("cache"):
@@ -2733,7 +2747,7 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                     tiktok_link,
                     info_path,
                     outtmpl,
-                    require_fast_h264_format(inspection),
+                    download_format_id,
                 )
             except VideoTooLargeError:
                 raise
@@ -2774,6 +2788,7 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                 video_path,
             )
         ffmpeg_bypassed = prepared_video.bypassed_ffmpeg
+        metrics.preparation_mode = prepared_video.preparation_mode
         music_deep_link: str | None = None
         music_deep_link_prepared = False
         video_path = prepared_video.path
@@ -2919,6 +2934,22 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                 inline_message_id,
                 placeholder_message_id,
                 "❌ TikTok не отдал аудиодорожку. Видео не отправлено без звука — попробуйте позже.",
+                source_url,
+            )
+        await _discard_job(job.id)
+
+    except NoFastH264FormatError:
+        metrics.preparation_mode = "rejected_no_fast_h264"
+        logging.info("Источник не отдал быстрый H.264-вариант: chat=%s url=%s", chat_id, tiktok_link)
+        _remove_download_files(filename)
+        with metrics.stage("delivery"):
+            await _show_download_error(
+                bot,
+                chat_id,
+                inline_message_id,
+                placeholder_message_id,
+                "❌ Источник не отдал совместимый H.264-вариант без долгого перекодирования.\n"
+                "Попробуйте другое видео.",
                 source_url,
             )
         await _discard_job(job.id)

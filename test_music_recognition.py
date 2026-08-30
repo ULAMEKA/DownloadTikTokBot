@@ -151,6 +151,31 @@ class MusicSessionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MusicStageMetricsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_non_h264_music_source_never_enters_video_preparation(self):
+        """Music recognition only needs an audio-extractable source, not Telegram video."""
+        with tempfile.TemporaryDirectory() as directory:
+            video_dir = Path(directory)
+
+            def download(*_args):
+                (video_dir / "music_hevc.mp4").write_bytes(b"hevc source")
+                return "123", 640, 360, "description", 15.0
+
+            with (
+                patch.object(queue, "VIDEO_DIR", video_dir),
+                patch.object(queue, "_download_media", side_effect=download) as download_media,
+                patch.object(queue, "_recognize_music_tracks", AsyncMock(return_value="Artist — Song")),
+                patch.object(queue, "_prepare_telegram_video") as prepare_video,
+            ):
+                result = await queue._recognize_music_from_source(
+                    "https://www.tiktok.com/@a/video/123",
+                    "music_hevc",
+                    "hevc-only",
+                )
+
+        self.assertEqual(result, "Artist — Song")
+        self.assertEqual(download_media.call_args.args[3], "hevc-only")
+        prepare_video.assert_not_called()
+
     async def test_download_ffmpeg_and_shazam_have_separate_stages(self):
         metrics = queue.JobStageMetrics(job_id=2)
 

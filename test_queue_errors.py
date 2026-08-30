@@ -56,6 +56,47 @@ class ErrorSourceLinkTests(unittest.IsolatedAsyncioTestCase):
 
 
 class QueueErrorMessageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_no_fast_h264_error_keeps_source_link(self):
+        source_url = "https://www.tiktok.com/@author/video/123"
+        job = queue.QueueJob(1, "123", "456", "no-fast-h264", source_url, None, None, None, None)
+        inspection = queue.MediaInspection(
+            queue.MediaIdentity(queue.MediaProvider.TIKTOK, "123"),
+            source_url,
+            None,
+            None,
+            640,
+            360,
+            5.0,
+            (),
+            {"id": "123", "webpage_url": source_url},
+            "h264-aac",
+        )
+
+        class BotStub:
+            message_args = None
+
+            async def send_message(self, **kwargs):
+                self.message_args = kwargs
+
+        bot = BotStub()
+        with (
+            patch.object(queue, "_find_worker_cached_video", AsyncMock(return_value=None)),
+            patch.object(queue, "_load_info_snapshot", return_value=inspection.info),
+            patch.object(queue, "_inspection_from_snapshot", return_value=inspection),
+            patch.object(
+                queue,
+                "require_fast_h264_format",
+                side_effect=queue.NoFastH264FormatError,
+            ),
+            patch.object(queue, "_discard_job", AsyncMock()),
+            patch.object(queue, "_remove_download_files"),
+            self.assertLogs(level="INFO"),
+        ):
+            await queue._process_video_job(bot, job)
+
+        self.assertIn("совместимый H.264-вариант", bot.message_args["text"])
+        self.assertIn('href="https://www.tiktok.com/@author/video/123"', bot.message_args["text"])
+
     async def test_inspection_failure_reports_video_download_failure(self):
         source_url = "https://www.tiktok.com/@author/video/123"
         job = queue.QueueJob(
@@ -119,6 +160,7 @@ class QueueErrorMessageTests(unittest.IsolatedAsyncioTestCase):
             None,
             (),
             {"id": "123", "webpage_url": source_url},
+            "h264-aac",
         )
 
         class QueueStopped(Exception):

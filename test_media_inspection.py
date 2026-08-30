@@ -270,6 +270,58 @@ class MediaInspectionTests(unittest.TestCase):
 
 
 class InfoSnapshotWorkerFallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_hevc_format_id_cannot_force_slow_transcode(self):
+        """A queued legacy selector must not bypass the current H.264 inspection."""
+        job = queue.QueueJob(
+            7,
+            "1",
+            "1",
+            "legacy",
+            SOURCE_URL,
+            "hevc-id",
+            None,
+            None,
+            None,
+        )
+        inspection = queue.MediaInspection(
+            queue.MediaIdentity(queue.MediaProvider.TIKTOK, "123"),
+            SOURCE_URL,
+            None,
+            None,
+            640,
+            360,
+            5.0,
+            (),
+            {"id": "123", "webpage_url": SOURCE_URL},
+            "h264-aac",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            video_path = Path(directory) / "legacy.mp4"
+
+            def download(*_args):
+                video_path.write_bytes(b"video")
+                return "123", 640, 360, None, 5.0
+
+            with (
+                patch.object(queue, "VIDEO_DIR", Path(directory)),
+                patch.object(queue, "_load_info_snapshot", return_value=inspection.info),
+                patch.object(queue, "_inspection_from_snapshot", return_value=inspection),
+                patch.object(queue, "_ydl_download_from_info_file", side_effect=download) as snapshot_download,
+                patch.object(
+                    queue,
+                    "_prepare_telegram_video",
+                    side_effect=queue.MediaPreparationError("stop after download"),
+                ),
+                patch.object(queue, "_discard_job", AsyncMock()),
+                patch.object(queue, "_show_download_error", AsyncMock()),
+                patch.object(queue, "_remove_download_files"),
+                self.assertLogs(level="ERROR"),
+            ):
+                await queue._process_video_job(MagicMock(), job)
+
+        self.assertEqual(snapshot_download.call_args.args[3], "h264-aac")
+
     async def test_typed_snapshot_download_failure_calls_gallery_directly(self):
         job = queue.QueueJob(
             1,
