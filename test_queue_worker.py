@@ -573,7 +573,10 @@ class ShortSessionTests(unittest.IsolatedAsyncioTestCase):
 
 class DeliveryRoutingTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
-    def _job(inline_message_id: str | None = None) -> queue.QueueJob:
+    def _job(
+        inline_message_id: str | None = None,
+        enqueued_at: datetime | None = None,
+    ) -> queue.QueueJob:
         return queue.QueueJob(
             1,
             "-100200",
@@ -583,7 +586,7 @@ class DeliveryRoutingTests(unittest.IsolatedAsyncioTestCase):
             None,
             None,
             inline_message_id,
-            None,
+            enqueued_at,
         )
 
     @staticmethod
@@ -600,8 +603,14 @@ class DeliveryRoutingTests(unittest.IsolatedAsyncioTestCase):
             sample_aspect_ratio="1:1",
         )
 
-    async def _run_single_delivery(self, inline_message_id: str | None):
-        job = self._job(inline_message_id)
+    async def _run_single_delivery(
+        self,
+        inline_message_id: str | None,
+        *,
+        enqueued_at: datetime | None = None,
+        on_download=None,
+    ):
+        job = self._job(inline_message_id, enqueued_at)
         probe = self._probe()
         inspection = queue.MediaInspection(
             "123",
@@ -637,6 +646,8 @@ class DeliveryRoutingTests(unittest.IsolatedAsyncioTestCase):
             video_path = Path(directory) / f"{job.filename}.mp4"
 
             def download(*_args):
+                if on_download is not None:
+                    on_download()
                 video_path.write_bytes(b"video")
                 return "123", 640, 360, "description", 5.0
 
@@ -740,6 +751,32 @@ class DeliveryRoutingTests(unittest.IsolatedAsyncioTestCase):
             ffmpeg_bypassed=True,
             queue_wait_ms=None,
         )
+
+    async def test_queue_wait_is_snapshotted_before_video_processing(self):
+        enqueued_at = datetime(2026, 8, 30, 12, 0, 0, tzinfo=timezone.utc)
+        clock = SimpleNamespace(current=enqueued_at + timedelta(seconds=1))
+
+        class FakeDateTime:
+            @classmethod
+            def now(cls, _tz=None):
+                return clock.current
+
+        def advance_clock():
+            clock.current = enqueued_at + timedelta(seconds=6)
+
+        with (
+            patch.object(queue, "datetime", FakeDateTime),
+            self.assertLogs(level="INFO") as captured,
+        ):
+            await self._run_single_delivery(
+                "inline-message-id",
+                enqueued_at=enqueued_at,
+                on_download=advance_clock,
+            )
+
+        summary = next(line for line in captured.output if "job_stage_summary" in line)
+        self.assertIn("queue_wait_ms=1000", summary)
+        self.assertNotIn("queue_wait_ms=6000", summary)
 
 
 class ForcedNormalizationRetryTests(unittest.IsolatedAsyncioTestCase):

@@ -2,6 +2,7 @@ import asyncio
 import tempfile
 import unittest
 from dataclasses import FrozenInstanceError
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -97,6 +98,56 @@ class MusicSessionTests(unittest.IsolatedAsyncioTestCase):
             ffmpeg_bypassed=None,
             queue_wait_ms=None,
         )
+
+    async def test_queue_wait_is_snapshotted_before_music_processing(self):
+        enqueued_at = datetime(2026, 8, 30, 12, 0, 0, tzinfo=timezone.utc)
+        clock = SimpleNamespace(current=enqueued_at + timedelta(seconds=1))
+
+        class FakeDateTime:
+            @classmethod
+            def now(cls, _tz=None):
+                return clock.current
+
+        request = SimpleNamespace(
+            token="f" * 32,
+            user_id="1",
+            chat_id="1",
+            status_message_id=7,
+            inline_message_id=None,
+            tiktok_link="https://www.tiktok.com/@a/video/123",
+            format_id=None,
+            state="queued",
+            music_tracks=None,
+        )
+
+        async def recognize(*_args, **_kwargs):
+            clock.current = enqueued_at + timedelta(seconds=6)
+            return ""
+
+        job = queue.QueueJob(
+            2,
+            "1",
+            "1",
+            "music_job",
+            request.tiktok_link,
+            None,
+            None,
+            f"music:{request.token}",
+            enqueued_at,
+        )
+        with (
+            patch.object(queue, "datetime", FakeDateTime),
+            patch.object(queue, "_load_music_request", AsyncMock(return_value=request)),
+            patch.object(queue, "_recognize_music_from_source", side_effect=recognize),
+            patch.object(queue, "_finish_music_job", AsyncMock(return_value=request)),
+            patch.object(queue, "show_music_request_result", AsyncMock()),
+            self.assertLogs(level="INFO") as captured,
+        ):
+            await queue._process_music_job(MagicMock(), job, request.token)
+
+        summary = next(line for line in captured.output if "job_stage_summary" in line)
+        self.assertIn("queue_wait_ms=1000", summary)
+        self.assertNotIn("queue_wait_ms=6000", summary)
 
 
 class MusicStageMetricsTests(unittest.IsolatedAsyncioTestCase):

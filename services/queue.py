@@ -2092,6 +2092,7 @@ async def _process_music_job(
 ) -> None:
     """Run one requested recognition without retaining an ORM session."""
     metrics = JobStageMetrics(job_id=job.id)
+    queue_wait_ms = _queue_wait_ms(job.enqueued_at)
     request: MusicRequestSnapshot | None = None
     music_tracks: str | None = None
     retry = False
@@ -2140,7 +2141,7 @@ async def _process_music_job(
         metrics.log_summary(
             cache_status="not_applicable",
             ffmpeg_bypassed=None,
-            queue_wait_ms=_queue_wait_ms(job.enqueued_at),
+            queue_wait_ms=queue_wait_ms,
         )
 
 
@@ -2408,6 +2409,7 @@ async def _try_deliver_worker_cache(
 
 async def _process_video_job(bot: Bot, job: QueueJob) -> None:
     metrics = JobStageMetrics(job_id=job.id)
+    queue_wait_ms = _queue_wait_ms(job.enqueued_at)
     cache_status = "miss"
     ffmpeg_bypassed: bool | None = None
     if job.chat_id is None or job.filename is None or job.tiktok_link is None:
@@ -2417,7 +2419,7 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
             metrics.log_summary(
                 cache_status=cache_status,
                 ffmpeg_bypassed=ffmpeg_bypassed,
-                queue_wait_ms=_queue_wait_ms(job.enqueued_at),
+                queue_wait_ms=queue_wait_ms,
             )
         return
 
@@ -2826,7 +2828,7 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
         metrics.log_summary(
             cache_status=cache_status,
             ffmpeg_bypassed=ffmpeg_bypassed,
-            queue_wait_ms=_queue_wait_ms(job.enqueued_at),
+            queue_wait_ms=queue_wait_ms,
         )
 
 
