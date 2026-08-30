@@ -11,7 +11,11 @@ Telegram-бот на `aiogram` для загрузки видео из TikTok и
 ### Возможности
 
 - Загружает видео из TikTok и Instagram Reels.
-- Собирает фотопосты TikTok в MP4-слайдшоу с оригинальным звуком, если он доступен.
+- Для обычных видео бот выбирает совместимый H.264/AAC источник и не выполняет
+  долгое перекодирование видеопотока. Если такого источника нет, бот сообщает
+  об этом вместо многоминутной обработки.
+- Меню выбора качества больше не показывается. Фото-галереи по-прежнему
+  собираются в MP4 с исходным треком, если он доступен.
 - Работает в личных сообщениях, группах и inline-режиме.
 - В личном чате и inline-режиме позволяет убрать описание, скрыть видео под
   спойлером или применить оба варианта.
@@ -22,8 +26,6 @@ Telegram-бот на `aiogram` для загрузки видео из TikTok и
   внутри каждого типа сохраняется FIFO и одновременно работает одна тяжёлая задача.
 - Не принимает больше двух незавершённых загрузок от одного пользователя.
 - Повторно использует Telegram `file_id`, чтобы не скачивать уже известные видео заново.
-- Показывает выбор качества только для больших исходников и отправляет их частями
-  примерно по 50 МБ.
 - После отправки ссылки в личном чате кнопку `🎵 Распознать музыку` можно
   нажать сразу или использовать карточку под уже загруженным видео. После
   нажатия сообщение меняется на «Идёт распознавание», а затем — на список
@@ -122,6 +124,8 @@ Linux/macOS:
   синхронизировано между несколькими процессами.
 - Одна тяжёлая задача выполняется за раз; параллельные загрузки или распознавания
   музыки не запускаются.
+- Для обычного видео нужен совместимый H.264/AAC источник; если его нет, бот
+  завершает загрузку понятной ошибкой вместо долгого перекодирования.
 - Кнопки выбора в личном чате действуют 10 минут и сбрасываются при перезапуске.
 - Из одного сообщения обрабатывается только первая поддерживаемая ссылка.
 
@@ -133,8 +137,13 @@ Linux/macOS:
    для новой загрузки рекламная заглушка остаётся видимой не меньше пяти секунд.
 3. Воркер берёт обычные видео раньше ожидающих задач распознавания музыки,
    сохраняя FIFO внутри каждого типа, и выполняет только одну тяжёлую задачу.
-4. Новое видео сначала загружается через `yt-dlp`; при ошибке используется
-   `gallery-dl`, а фотопост TikTok преобразуется в слайдшоу.
+4. Для обычного видео воркер выбирает совместимый H.264/AAC источник. Готовый
+   совместимый MP4 отправляется напрямую; иначе выполняется быстрый remux с
+   копированием видеопотока и, при необходимости, перекодированием только
+   аудио в AAC. Если такого источника нет, бот сообщает об этом без долгого
+   перекодирования. Затем видео загружается через `yt-dlp`; при ошибке
+   используется `gallery-dl`, а фотопост TikTok преобразуется в MP4-слайдшоу
+   с исходным аудиотреком, если он доступен.
 5. После доставки бот сохраняет доступный `file_id`, удаляет временный файл и
    запись очереди.
 
@@ -165,8 +174,11 @@ Linux/macOS:
 ### Features
 
 - Downloads videos from TikTok and Instagram Reels.
-- Turns TikTok photo posts into MP4 slideshows with the original audio when
-  available.
+- For regular videos, the bot selects a compatible H.264/AAC source and does not
+  perform lengthy video-stream transcoding. If no such source exists, it reports
+  this instead of processing for many minutes.
+- The quality-selection menu is no longer shown. Photo galleries are still
+  assembled into MP4 with the original track when available.
 - Works in private chats, groups, and inline mode.
 - In private chats and inline mode, it can omit the description, hide the video
   behind a spoiler, or apply both options.
@@ -178,8 +190,6 @@ Linux/macOS:
   FIFO is preserved within each type and only one heavy job runs at a time.
 - Limits each user to two unfinished downloads in the queue.
 - Reuses Telegram `file_id` values instead of downloading known videos again.
-- Shows quality choices only for large source files and sends them in parts of
-  about 50 MB.
 - In private chat, `🎵 Recognize music` is available immediately after sending
   the link and also below a downloaded video. After it is pressed, the message
   changes to "Recognizing" and then to the tracks found in sequential
@@ -276,6 +286,8 @@ Supported links include `tiktok.com`, `vm.tiktok.com`, `vt.tiktok.com`, and
   multiple processes.
 - One heavy job runs at a time; parallel downloads or music recognition jobs are
   not started.
+- Regular videos require a compatible H.264/AAC source; if none is available,
+  the bot ends the download with a clear error instead of lengthy transcoding.
 - Private-chat option buttons expire after 10 minutes and are lost on restart.
 - Only the first supported link in each message is processed.
 
@@ -288,8 +300,13 @@ Supported links include `tiktok.com`, `vm.tiktok.com`, `vt.tiktok.com`, and
    five seconds.
 3. A worker takes regular video jobs before waiting music-recognition jobs,
    preserves FIFO within each type, and runs only one heavy job.
-4. New videos are downloaded with `yt-dlp` first; `gallery-dl` is used as a
-   fallback, and TikTok photo posts are converted into a slideshow.
+4. For regular videos, the worker selects a compatible H.264/AAC source. A
+   compatible MP4 is sent directly; otherwise a fast remux copies the video
+   stream and, when needed, transcodes only the audio to AAC. If no such source
+   exists, the bot reports this without lengthy transcoding. The video is then
+   downloaded with `yt-dlp`; `gallery-dl` is used as a fallback, and TikTok photo
+   posts are converted into an MP4 slideshow with the original audio track when
+   available.
 5. After delivery, the bot stores an available `file_id`, deletes the temporary
    file, and removes the queue entry.
 
