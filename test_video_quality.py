@@ -270,7 +270,7 @@ class VideoQualityTests(unittest.TestCase):
                 patch.object(queue, "_probe_media", side_effect=[hevc_probe, h264_probe]),
                 patch.object(queue, "_mux_external_audio") as mux_audio,
             ):
-                with self.assertRaises(queue.MediaPreparationError):
+                with self.assertRaises(queue.NoFastH264FormatError):
                     queue._download_tiktok_post(object(), post, output)
 
             mux_audio.assert_not_called()
@@ -308,6 +308,36 @@ class VideoQualityTests(unittest.TestCase):
                     )
 
             self.assertFalse(output.exists())
+
+    def test_gallery_fallback_preserves_advanced_no_fast_error_when_cli_finds_nothing(self):
+        no_fast_error = queue.NoFastH264FormatError("downloaded HEVC")
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            queue,
+            "VIDEO_DIR",
+            Path(directory),
+        ):
+            output = Path(directory) / "job.mp4"
+            with (
+                patch.object(
+                    queue,
+                    "_gallery_tiktok_video_download",
+                    side_effect=no_fast_error,
+                ),
+                patch.object(queue, "cookie_files_for_url", return_value=[]),
+                patch.object(
+                    queue.subprocess,
+                    "run",
+                    return_value=SimpleNamespace(returncode=1),
+                ),
+            ):
+                with self.assertRaises(queue.NoFastH264FormatError) as captured:
+                    queue._gallery_download(
+                        "https://www.tiktok.com/@a/video/123",
+                        output,
+                    )
+
+            self.assertIs(captured.exception, no_fast_error)
 
     def test_quality_menu_is_only_needed_for_large_sources(self):
         self.assertFalse(needs_quality_choice([

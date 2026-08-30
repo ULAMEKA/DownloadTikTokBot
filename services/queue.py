@@ -1268,7 +1268,10 @@ def _download_tiktok_post(
         finally:
             audio_path.unlink(missing_ok=True)
 
-    if isinstance(last_error, (VideoTooLargeError, MissingAudioError)):
+    if isinstance(
+        last_error,
+        (VideoTooLargeError, MissingAudioError, NoFastH264FormatError),
+    ):
         raise last_error
     raise MediaPreparationError("Не удалось скачать ни один поток TikTok") from last_error
 
@@ -1396,12 +1399,16 @@ def _gallery_download(
 ) -> tuple[str | None, int | None, int | None, str | None, float | None] | None:
     local_identity = media_identity_from_source(url)
     local_media_id = local_identity.media_id if local_identity is not None else None
+    advanced_no_fast_error: NoFastH264FormatError | None = None
     try:
         tiktok_video = _gallery_tiktok_video_download(url, output)
         if tiktok_video is not None:
             return tiktok_video
     except (VideoTooLargeError, MissingAudioError):
         raise
+    except NoFastH264FormatError as error:
+        advanced_no_fast_error = error
+        logging.info("Расширенный TikTok fallback не нашёл H.264: %s", error)
     except Exception as error:
         logging.info("Расширенный TikTok fallback не сработал: %s", error)
 
@@ -1483,6 +1490,8 @@ def _gallery_download(
 
         if last_result is not None and last_result.returncode:
             logging.info("gallery-dl не скачал медиа (код %s)", last_result.returncode)
+        if advanced_no_fast_error is not None:
+            raise advanced_no_fast_error
         return None
 
 
