@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import uuid
 
 from aiogram import Bot, Router, F
@@ -24,6 +25,7 @@ from services.queue import (
     enqueue_download,
     hold_inline_placeholder,
     music_button_markup,
+    release_inline_placeholder,
     try_deliver_cached_video,
 )
 from utils.links import canonicalize_video_url, find_video_url
@@ -68,6 +70,45 @@ def _placeholder_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="⏳ Загружается…", callback_data="inline_loading")
     ]])
+
+
+async def _render_inline_download_error(
+    bot: Bot,
+    result: ChosenInlineResult,
+    url: str,
+    message: str,
+) -> None:
+    if not result.inline_message_id:
+        return
+    error_text = f"{message}\n\n{source_link(url)}"
+    try:
+        await bot.edit_message_caption(
+            inline_message_id=result.inline_message_id,
+            caption=error_text,
+            parse_mode="HTML",
+            reply_markup=None,
+        )
+        return
+    except (TelegramBadRequest, TelegramForbiddenError):
+        pass
+    try:
+        await bot.edit_message_text(
+            inline_message_id=result.inline_message_id,
+            text=error_text,
+            parse_mode="HTML",
+            reply_markup=None,
+        )
+        return
+    except (TelegramBadRequest, TelegramForbiddenError):
+        pass
+    try:
+        await bot.send_message(
+            chat_id=result.from_user.id,
+            text=error_text,
+            parse_mode="HTML",
+        )
+    except (TelegramBadRequest, TelegramForbiddenError):
+        pass
 
 
 @inline_router.inline_query()
@@ -160,33 +201,25 @@ async def chosen_download(result: ChosenInlineResult, session: AsyncSession, bot
         except (TelegramBadRequest, TelegramForbiddenError):
             pass
 
-    if not await enqueue_download(session, queue_item, str(result.from_user.id)):
+    if raw_inline_message_id:
+        hold_inline_placeholder(raw_inline_message_id)
+    try:
+        enqueued = await enqueue_download(session, queue_item, str(result.from_user.id))
+    except Exception as error:
+        logging.exception("Не удалось поставить inline-загрузку в очередь: %s", error)
         if raw_inline_message_id:
-            error_text = f"{QUEUE_LIMIT_MESSAGE}\n\n{source_link(url)}"
-            try:
-                await bot.edit_message_caption(
-                    inline_message_id=raw_inline_message_id,
-                    caption=error_text,
-                    parse_mode="HTML",
-                    reply_markup=None,
-                )
-            except (TelegramBadRequest, TelegramForbiddenError):
-                try:
-                    await bot.edit_message_text(
-                        inline_message_id=raw_inline_message_id,
-                        text=error_text,
-                        parse_mode="HTML",
-                        reply_markup=None,
-                    )
-                except (TelegramBadRequest, TelegramForbiddenError):
-                    try:
-                        await bot.send_message(
-                            chat_id=result.from_user.id,
-                            text=error_text,
-                            parse_mode="HTML",
-                        )
-                    except (TelegramBadRequest, TelegramForbiddenError):
-                        pass
+            release_inline_placeholder(raw_inline_message_id)
+        await _render_inline_download_error(
+            bot,
+            result,
+            url,
+            "❌ Не удалось загрузить видео.",
+        )
+        return
+    if not enqueued:
+        if raw_inline_message_id:
+            release_inline_placeholder(raw_inline_message_id)
+        await _render_inline_download_error(bot, result, url, QUEUE_LIMIT_MESSAGE)
         return
     stmt = select(func.count()).select_from(DownloadQueue).where(DownloadQueue.id <= queue_item.id)
     position = (await session.execute(stmt)).scalar_one()
@@ -209,8 +242,6 @@ async def chosen_download(result: ChosenInlineResult, session: AsyncSession, bot
                 )
             except (TelegramBadRequest, TelegramForbiddenError):
                 pass
-    if raw_inline_message_id:
-        hold_inline_placeholder(raw_inline_message_id)
 
 
 @inline_router.chosen_inline_result(F.result_id == "recognize_music")

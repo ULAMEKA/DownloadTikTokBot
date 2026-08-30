@@ -305,6 +305,10 @@ def hold_placeholder(chat_id: str, message_id: int) -> None:
     )
 
 
+def release_placeholder(chat_id: str, message_id: int) -> None:
+    _placeholder_ready_at.pop((chat_id, message_id), None)
+
+
 def hold_inline_placeholder(inline_message_id: str) -> None:
     _inline_placeholder_ready_at[inline_message_id] = (
         asyncio.get_running_loop().time() + AD_DISPLAY_SECONDS
@@ -344,6 +348,10 @@ def _can_bypass_telegram_normalization(path: Path, probe: MediaProbe) -> bool:
         and probe.sample_aspect_ratio in (None, "1:1")
         and not probe.rotation
     )
+
+
+def release_inline_placeholder(inline_message_id: str) -> None:
+    _inline_placeholder_ready_at.pop(inline_message_id, None)
 
 
 def _has_video(item: dict[str, object]) -> bool:
@@ -583,6 +591,13 @@ def write_info_snapshot(filename: str, info: dict[str, object]) -> Path:
         return destination
     finally:
         temporary_path.unlink(missing_ok=True)
+
+
+def move_info_snapshot(snapshot_path: Path, filename: str) -> Path:
+    """Atomically transfer a bounded pending snapshot to its durable queue job."""
+    destination = _info_snapshot_path(filename)
+    os.replace(snapshot_path, destination)
+    return destination
 
 
 def _load_info_snapshot(filename: str) -> dict[str, object] | None:

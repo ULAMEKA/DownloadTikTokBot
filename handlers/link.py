@@ -1,6 +1,8 @@
 import asyncio
+import logging
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatType, ParseMode
@@ -21,7 +23,9 @@ from services.queue import (
     enqueue_download,
     hold_placeholder,
     inspect_media,
+    move_info_snapshot,
     needs_quality_choice,
+    release_placeholder,
     show_music_request_page,
     show_music_request_result,
     try_deliver_cached_video,
@@ -38,11 +42,20 @@ class PendingDownload:
     user_id: int
     url: str
     mode: str | None = None
-    qualities: list[VideoQuality] | None = None
-    inspection: MediaInspection | None = None
+    inspection: "PendingInspection | None" = None
+    snapshot_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class PendingInspection:
+    qualities: tuple[VideoQuality, ...]
 
 
 _pending: dict[str, PendingDownload] = {}
+_pending_expiry_tasks: dict[str, asyncio.Task[None]] = {}
+PENDING_TTL_SECONDS = 600
+MAX_PENDING_PER_USER = 2
+MAX_PENDING_GLOBAL = 256
 
 
 async def _video_url_from_text(text: str) -> str | None:
@@ -59,9 +72,66 @@ async def _video_url_from_text(text: str) -> str | None:
         return url
 
 
-async def _expire_pending(token: str) -> None:
-    await asyncio.sleep(600)
-    _pending.pop(token, None)
+def _cleanup_pending_snapshot(pending: PendingDownload) -> None:
+    snapshot_path = pending.snapshot_path
+    pending.snapshot_path = None
+    if snapshot_path is None:
+        return
+    try:
+        snapshot_path.unlink(missing_ok=True)
+    except OSError as error:
+        logging.warning("Не удалось удалить pending info snapshot %s: %s", snapshot_path, error)
+
+
+def _cancel_pending_expiry(token: str) -> None:
+    task = _pending_expiry_tasks.pop(token, None)
+    if task is None or task.done() or task is asyncio.current_task():
+        return
+    task.cancel()
+
+
+def _drop_pending(token: str, *, cleanup_snapshot: bool) -> PendingDownload | None:
+    pending = _pending.pop(token, None)
+    _cancel_pending_expiry(token)
+    if pending is not None and cleanup_snapshot:
+        _cleanup_pending_snapshot(pending)
+    return pending
+
+
+def _take_pending(token: str) -> PendingDownload | None:
+    return _drop_pending(token, cleanup_snapshot=False)
+
+
+async def _expire_pending(
+    token: str,
+    expected: PendingDownload | None = None,
+) -> None:
+    if expected is None:
+        expected = _pending.get(token)
+    await asyncio.sleep(PENDING_TTL_SECONDS)
+    if expected is not None and _pending.get(token) is expected:
+        _drop_pending(token, cleanup_snapshot=True)
+
+
+def _store_pending(token: str, pending: PendingDownload) -> None:
+    previous = _pending.get(token)
+    if previous is not None:
+        _drop_pending(token, cleanup_snapshot=previous is not pending)
+
+    same_user_tokens = [
+        current_token
+        for current_token, current in _pending.items()
+        if current.user_id == pending.user_id
+    ]
+    while len(same_user_tokens) >= MAX_PENDING_PER_USER:
+        _drop_pending(same_user_tokens.pop(0), cleanup_snapshot=True)
+
+    while len(_pending) >= MAX_PENDING_GLOBAL:
+        oldest_token = next(iter(_pending))
+        _drop_pending(oldest_token, cleanup_snapshot=True)
+
+    _pending[token] = pending
+    _pending_expiry_tasks[token] = asyncio.create_task(_expire_pending(token, pending))
 
 
 def _quality_markup(token: str, qualities: list[VideoQuality]) -> InlineKeyboardMarkup:
@@ -74,6 +144,18 @@ def _quality_markup(token: str, qualities: list[VideoQuality]) -> InlineKeyboard
     ])
 
 
+async def _render_private_enqueue_error(
+    callback: CallbackQuery,
+    text: str,
+    *,
+    callback_answered: bool,
+) -> None:
+    if callback_answered and callback.message:
+        await callback.message.answer(text)
+    else:
+        await callback.answer(text, show_alert=True)
+
+
 async def _start_pending_download(
     callback: CallbackQuery,
     session: AsyncSession,
@@ -83,49 +165,61 @@ async def _start_pending_download(
     callback_answered: bool = False,
 ) -> None:
     placeholder = None
-    if callback.message:
-        placeholder = await callback.message.answer_photo(
-            photo=FSInputFile(str(AD_PLACEHOLDER_IMAGE)),
-            caption=loading_placeholder_caption(),
-            parse_mode=ParseMode.HTML,
-        )
-
     queue_item = DownloadQueue(
         chat_id=str(callback.from_user.id),
         filename=str(uuid.uuid4()),
         tiktok_link=pending.url,
         format_id=format_id,
-        reply_to_message_id=-placeholder.message_id if placeholder else None,
         inline_message_id=f"direct:{pending.mode}" if pending.mode != "normal" else None,
     )
-    snapshot_path = (
-        write_info_snapshot(queue_item.filename, pending.inspection.info)
-        if pending.inspection is not None
-        else None
-    )
     try:
+        if pending.snapshot_path is not None:
+            pending.snapshot_path = move_info_snapshot(
+                pending.snapshot_path,
+                queue_item.filename,
+            )
+        if callback.message:
+            placeholder = await callback.message.answer_photo(
+                photo=FSInputFile(str(AD_PLACEHOLDER_IMAGE)),
+                caption=loading_placeholder_caption(),
+                parse_mode=ParseMode.HTML,
+            )
+            queue_item.reply_to_message_id = -placeholder.message_id
+            hold_placeholder(str(callback.from_user.id), placeholder.message_id)
         enqueued = await enqueue_download(session, queue_item, str(callback.from_user.id))
-    except Exception:
-        if snapshot_path is not None:
-            snapshot_path.unlink(missing_ok=True)
-        raise
-    if not enqueued:
-        if snapshot_path is not None:
-            snapshot_path.unlink(missing_ok=True)
-        _pending[token] = pending
+    except Exception as error:
+        logging.exception("Не удалось поставить private-загрузку в очередь: %s", error)
         if placeholder:
-            await placeholder.delete()
-        if callback_answered and callback.message:
-            await callback.message.answer(QUEUE_LIMIT_MESSAGE)
-        else:
-            await callback.answer(QUEUE_LIMIT_MESSAGE, show_alert=True)
+            release_placeholder(str(callback.from_user.id), placeholder.message_id)
+            try:
+                await placeholder.delete()
+            except Exception:
+                logging.exception("Не удалось удалить private placeholder после ошибки enqueue")
+        _store_pending(token, pending)
+        await _render_private_enqueue_error(
+            callback,
+            "❌ Не удалось загрузить видео.",
+            callback_answered=callback_answered,
+        )
+        return
+    if not enqueued:
+        if placeholder:
+            release_placeholder(str(callback.from_user.id), placeholder.message_id)
+            try:
+                await placeholder.delete()
+            except Exception:
+                logging.exception("Не удалось удалить private placeholder после отказа enqueue")
+        _store_pending(token, pending)
+        await _render_private_enqueue_error(
+            callback,
+            QUEUE_LIMIT_MESSAGE,
+            callback_answered=callback_answered,
+        )
         return
 
-    _pending.pop(token, None)
+    pending.snapshot_path = None
     if callback.message:
         await callback.message.delete()
-    if placeholder:
-        hold_placeholder(str(callback.from_user.id), placeholder.message_id)
 
     stmt = select(func.count()).select_from(DownloadQueue).where(DownloadQueue.id <= queue_item.id)
     position = (await session.execute(stmt)).scalar_one()
@@ -145,7 +239,7 @@ async def handle_video_link_private(message: Message):
         return
 
     token = uuid.uuid4().hex
-    _pending[token] = PendingDownload(message.chat.id, url)
+    _store_pending(token, PendingDownload(message.chat.id, url))
     await message.answer(
         f"Как загрузить видео?\n\n{source_link(url)}",
         parse_mode=ParseMode.HTML,
@@ -174,7 +268,6 @@ async def handle_video_link_private(message: Message):
             )],
         ]),
     )
-    asyncio.create_task(_expire_pending(token))
 
 
 @link.callback_query(F.data.startswith("download:"))
@@ -195,7 +288,7 @@ async def handle_download_option(callback: CallbackQuery, session: AsyncSession,
     if callback.from_user.id != pending.user_id:
         await callback.answer("Эта кнопка предназначена другому пользователю.", show_alert=True)
         return
-    pending = _pending.pop(token, None)
+    pending = _take_pending(token)
     if pending is None:
         await callback.answer("Ссылка уже обрабатывается.")
         return
@@ -212,6 +305,7 @@ async def handle_download_option(callback: CallbackQuery, session: AsyncSession,
         has_spoiler=has_spoiler,
         without_description=without_description,
     ):
+        _cleanup_pending_snapshot(pending)
         if callback.message:
             await callback.message.delete()
         return
@@ -222,8 +316,22 @@ async def handle_download_option(callback: CallbackQuery, session: AsyncSession,
         inspection = None
         qualities = []
     else:
-        pending.inspection = inspection
         qualities = list(inspection.qualities)
+        try:
+            pending.snapshot_path = write_info_snapshot(
+                f"pending_{token}",
+                inspection.info,
+            )
+        except (OSError, TypeError, ValueError) as error:
+            logging.warning("Не удалось сохранить pending info snapshot: %s", error)
+            _store_pending(token, pending)
+            await _render_private_enqueue_error(
+                callback,
+                "❌ Не удалось загрузить видео.",
+                callback_answered=True,
+            )
+            return
+        pending.inspection = PendingInspection(tuple(inspection.qualities))
     if not needs_quality_choice(qualities):
         await _start_pending_download(
             callback,
@@ -235,8 +343,7 @@ async def handle_download_option(callback: CallbackQuery, session: AsyncSession,
         )
         return
 
-    pending.qualities = qualities
-    _pending[token] = pending
+    _store_pending(token, pending)
     if callback.message:
         await callback.message.edit_text(
             "Видео больше 50 МБ. Выберите качество — бот отправит его частями примерно по 50 МБ.",
@@ -256,18 +363,18 @@ async def handle_quality_option(callback: CallbackQuery, session: AsyncSession):
         return
     _, token, index_text = parts
     pending = _pending.get(token)
-    if pending is None or pending.mode is None or pending.qualities is None:
+    if pending is None or pending.mode is None or pending.inspection is None:
         await callback.answer("Ссылка устарела. Отправьте её ещё раз.", show_alert=True)
         return
     if callback.from_user.id != pending.user_id:
         await callback.answer("Эта кнопка предназначена другому пользователю.", show_alert=True)
         return
     try:
-        quality = pending.qualities[int(index_text)]
+        quality = pending.inspection.qualities[int(index_text)]
     except (IndexError, ValueError):
         await callback.answer("Этот вариант больше недоступен. Отправьте ссылку ещё раз.", show_alert=True)
         return
-    pending = _pending.pop(token, None)
+    pending = _take_pending(token)
     if pending is None:
         await callback.answer("Ссылка уже обрабатывается.")
         return
@@ -302,7 +409,7 @@ async def handle_music_recognition(
         ):
             await callback.answer("Кнопка устарела.", show_alert=True)
             return
-        pending = _pending.pop(token, None)
+        pending = _take_pending(token)
         if pending is None:
             await callback.answer("Ссылка уже обрабатывается.")
             return
@@ -319,7 +426,7 @@ async def handle_music_recognition(
             await session.commit()
         except Exception:
             await session.rollback()
-            _pending[token] = pending
+            _store_pending(token, pending)
             await callback.answer("Не удалось запустить распознавание.", show_alert=True)
             return
     if str(callback.from_user.id) != request.user_id:
@@ -442,8 +549,24 @@ async def handle_video_link_group(message: Message, session: AsyncSession, bot: 
         reply_to_message_id=-placeholder.message_id,
     )
     user_id = str(message.from_user.id if message.from_user else message.chat.id)
-    if not await enqueue_download(session, queue_item, user_id):
-        await placeholder.delete()
+    hold_placeholder(str(message.chat.id), placeholder.message_id)
+    try:
+        enqueued = await enqueue_download(session, queue_item, user_id)
+    except Exception as error:
+        logging.exception("Не удалось поставить group-загрузку в очередь: %s", error)
+        release_placeholder(str(message.chat.id), placeholder.message_id)
+        try:
+            await placeholder.delete()
+        except Exception:
+            logging.exception("Не удалось удалить group placeholder после ошибки enqueue")
+        await message.reply("❌ Не удалось загрузить видео.")
+        return
+    if not enqueued:
+        release_placeholder(str(message.chat.id), placeholder.message_id)
+        try:
+            await placeholder.delete()
+        except Exception:
+            logging.exception("Не удалось удалить group placeholder после отказа enqueue")
         await message.reply(QUEUE_LIMIT_MESSAGE)
         return
     stmt = select(func.count()).select_from(DownloadQueue).where(DownloadQueue.id <= queue_item.id)
@@ -452,7 +575,6 @@ async def handle_video_link_group(message: Message, session: AsyncSession, bot: 
         caption=loading_placeholder_caption(position),
         parse_mode=ParseMode.HTML,
     )
-    hold_placeholder(str(message.chat.id), placeholder.message_id)
 
 
 @link.message(F.chat.type == ChatType.PRIVATE)
