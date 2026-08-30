@@ -43,6 +43,7 @@ class AdvertisementDeadlineOrderingTests(unittest.IsolatedAsyncioTestCase):
 
         async def enqueue(_session, item, _user_id):
             events.append("enqueue")
+            self.assertIsNone(item.format_id)
             item.id = 1
             return True
 
@@ -58,7 +59,7 @@ class AdvertisementDeadlineOrderingTests(unittest.IsolatedAsyncioTestCase):
                 session,
                 "private-token",
                 pending,
-                format_id=None,
+                callback_answered=False,
             )
 
         self.assertEqual(events[:2], ["deadline", "enqueue"])
@@ -459,9 +460,9 @@ class PendingLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("token", link_handler._pending)
             self.assertFalse(snapshot.exists())
 
-    async def test_large_quality_reinsert_gets_disk_snapshot_and_fresh_expiry(self):
-        """Fails if the temporary-pop race reinserts a large item without a live TTL."""
-        token = "large-quality"
+    async def test_private_snapshot_reinsert_gets_fresh_expiry_after_enqueue_rejection(self):
+        """Fails if a rejected private enqueue loses its retry snapshot or TTL."""
+        token = "private-retry"
         inspection = queue.MediaInspection(
             identity=queue.MediaIdentity(queue.MediaProvider.TIKTOK, "123"),
             source_url=SOURCE_URL,
@@ -470,13 +471,7 @@ class PendingLifecycleTests(unittest.IsolatedAsyncioTestCase):
             width=1080,
             height=1920,
             duration=12.5,
-            qualities=(
-                queue.VideoQuality(
-                    "large-format",
-                    "1080×1920 · 60 FPS",
-                    queue.MAX_TELEGRAM_PART_BYTES + 1,
-                ),
-            ),
+            qualities=(),
             info={"id": "123", "webpage_url": SOURCE_URL, "formats": []},
         )
         callback = SimpleNamespace(
@@ -486,7 +481,11 @@ class PendingLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 delete=AsyncMock(),
                 answer=AsyncMock(),
                 edit_text=AsyncMock(),
-                answer_photo=AsyncMock(),
+                answer_photo=AsyncMock(return_value=SimpleNamespace(
+                    message_id=55,
+                    delete=AsyncMock(),
+                    edit_caption=AsyncMock(),
+                )),
             ),
             answer=AsyncMock(),
         )
@@ -515,6 +514,7 @@ class PendingLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(queue, "VIDEO_DIR", Path(directory)),
                 patch("handlers.link.try_deliver_cached_video", AsyncMock(return_value=False)),
                 patch("handlers.link.inspect_media", return_value=inspection),
+                patch("handlers.link.enqueue_download", AsyncMock(return_value=False)),
                 patch("handlers.link.asyncio.create_task", side_effect=create_task),
             ):
                 await link_handler.handle_download_option(
@@ -524,7 +524,6 @@ class PendingLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 )
                 pending = link_handler._pending[token]
                 self.assertTrue(pending.snapshot_path.exists())
-                self.assertEqual(pending.inspection.qualities, inspection.qualities)
                 self.assertEqual(len(created_tasks), 1)
 
         for task in created_tasks:

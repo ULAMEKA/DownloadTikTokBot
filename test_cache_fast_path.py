@@ -173,6 +173,11 @@ class HandlerCacheFastPathTests(unittest.IsolatedAsyncioTestCase):
             answer=AsyncMock(),
         )
 
+    def test_private_quality_callback_surface_is_removed(self):
+        self.assertFalse(hasattr(link_handler, "PendingInspection"))
+        self.assertFalse(hasattr(link_handler, "_quality_markup"))
+        self.assertFalse(hasattr(link_handler, "handle_quality_option"))
+
     async def test_private_cache_hits_skip_inspection_and_enqueue_for_every_delivery_mode(self):
         """Fails if any direct-download mode inspects or queues a cached video."""
         expected_flags = {
@@ -237,6 +242,39 @@ class HandlerCacheFastPathTests(unittest.IsolatedAsyncioTestCase):
 
         inspection.assert_called_once_with("https://www.tiktok.com/@a/video/123")
         start.assert_awaited_once()
+
+    async def test_private_download_starts_after_one_snapshot_without_quality_menu(self):
+        token = "private-no-quality"
+        callback = self._callback("normal", token)
+        session = SimpleNamespace()
+        link_handler._pending[token] = link_handler.PendingDownload(
+            42, "https://www.tiktok.com/@a/video/123"
+        )
+        inspection_result = queue.MediaInspection(
+            identity=queue.MediaIdentity(queue.MediaProvider.TIKTOK, "123"),
+            source_url="https://www.tiktok.com/@a/video/123",
+            likes=None,
+            description=None,
+            width=1080,
+            height=1920,
+            duration=12.0,
+            qualities=(queue.VideoQuality("large", "1080×1920", queue.MAX_TELEGRAM_PART_BYTES + 1),),
+            info={"id": "123"},
+            fast_format_id="h264-aac",
+        )
+
+        with (
+            patch("handlers.link.try_deliver_cached_video", AsyncMock(return_value=False)),
+            patch("handlers.link.inspect_media", return_value=inspection_result),
+            patch("handlers.link._start_pending_download", AsyncMock()) as start,
+        ):
+            await link_handler.handle_download_option(callback, session, SimpleNamespace())
+
+        self.assertEqual(start.await_count, 1)
+        self.assertTrue(start.await_args.kwargs["callback_answered"])
+        self.assertNotIn("format_id", start.await_args.kwargs)
+        callback.message.edit_text.assert_not_awaited()
+        self.assertNotIn(token, link_handler._pending)
 
     async def test_group_cache_hit_skips_placeholder_queue_and_hold(self):
         """Fails if a group cache hit creates any queue-owned placeholder."""

@@ -479,7 +479,7 @@ class PrivateInspectionTests(unittest.IsolatedAsyncioTestCase):
             answer=AsyncMock(),
         )
 
-    async def test_one_inspection_supplies_quality_choice_and_enqueued_snapshot(self):
+    async def test_one_inspection_starts_download_without_quality_choice_and_keeps_snapshot(self):
         token = "private-inspection"
         inspection = queue.MediaInspection(
             identity=queue.MediaIdentity(queue.MediaProvider.TIKTOK, "123"),
@@ -489,13 +489,7 @@ class PrivateInspectionTests(unittest.IsolatedAsyncioTestCase):
             width=1080,
             height=1920,
             duration=12.5,
-            qualities=(
-                queue.VideoQuality(
-                    "large-format",
-                    "1080×1920 · 60 FPS",
-                    queue.MAX_TELEGRAM_PART_BYTES + 1,
-                ),
-            ),
+            qualities=(),
             info={"id": "123", "webpage_url": SOURCE_URL, "formats": []},
         )
         link_handler._pending[token] = link_handler.PendingDownload(42, SOURCE_URL)
@@ -506,6 +500,7 @@ class PrivateInspectionTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch("handlers.link.try_deliver_cached_video", AsyncMock(return_value=False)),
                 patch("handlers.link.inspect_media", return_value=inspection) as inspect,
+                patch("handlers.link._start_pending_download", AsyncMock()) as start,
             ):
                 await link_handler.handle_download_option(
                     callback,
@@ -514,48 +509,14 @@ class PrivateInspectionTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             inspect.assert_called_once_with(SOURCE_URL)
-            pending = link_handler._pending[token]
-            self.assertEqual(pending.inspection.qualities, inspection.qualities)
-            self.assertFalse(hasattr(pending, "qualities"))
+            start.assert_awaited_once()
+            self.assertTrue(start.await_args.kwargs["callback_answered"])
+            self.assertNotIn("format_id", start.await_args.kwargs)
             self.assertEqual(
-                json.loads(pending.snapshot_path.read_text(encoding="utf-8")),
+                json.loads(start.await_args.args[3].snapshot_path.read_text(encoding="utf-8")),
                 inspection.info,
             )
-            markup = callback.message.edit_text.await_args.kwargs["reply_markup"]
-            self.assertEqual(markup.inline_keyboard[0][0].text, "1080×1920 · 60 FPS")
-
-            placeholder = SimpleNamespace(
-                message_id=55,
-                delete=AsyncMock(),
-                edit_caption=AsyncMock(),
-            )
-            quality_callback = SimpleNamespace(
-                data=f"quality:{token}:0",
-                from_user=SimpleNamespace(id=42),
-                message=SimpleNamespace(
-                    answer_photo=AsyncMock(return_value=placeholder),
-                    delete=AsyncMock(),
-                ),
-                answer=AsyncMock(),
-            )
-            result = MagicMock()
-            result.scalar_one.return_value = 1
-            session = SimpleNamespace(execute=AsyncMock(return_value=result))
-            captured = {}
-
-            async def accept_enqueue(_session, item, user_id):
-                item.id = 1
-                captured["format_id"] = item.format_id
-                captured["user_id"] = user_id
-                captured["snapshot"] = queue._load_info_snapshot(item.filename)
-                return True
-
-            with patch("handlers.link.enqueue_download", side_effect=accept_enqueue):
-                await link_handler.handle_quality_option(quality_callback, session)
-
-            self.assertEqual(captured["format_id"], "large-format")
-            self.assertEqual(captured["user_id"], "42")
-            self.assertEqual(captured["snapshot"], inspection.info)
+            callback.message.edit_text.assert_not_awaited()
 
     async def test_enqueue_rejection_restores_bounded_snapshot_for_retry(self):
         placeholder = SimpleNamespace(message_id=55, delete=AsyncMock())
@@ -578,7 +539,6 @@ class PrivateInspectionTests(unittest.IsolatedAsyncioTestCase):
                 42,
                 SOURCE_URL,
                 mode="normal",
-                inspection=link_handler.PendingInspection(()),
                 snapshot_path=queue.write_info_snapshot("pending_token", {"id": "123"}),
             )
             with patch("handlers.link.enqueue_download", side_effect=reject_enqueue):
@@ -587,7 +547,7 @@ class PrivateInspectionTests(unittest.IsolatedAsyncioTestCase):
                     SimpleNamespace(),
                     "token",
                     pending,
-                    format_id=None,
+                    callback_answered=False,
                 )
 
             self.assertIsNotNone(captured_filename)

@@ -18,12 +18,10 @@ from services.queue import (
     QUEUE_LIMIT_MESSAGE,
     MUSIC_JOB_PREFIX,
     MUSIC_PAGE_PREFIX,
-    VideoQuality,
     enqueue_download,
     hold_placeholder,
     inspect_media,
     move_info_snapshot,
-    needs_quality_choice,
     release_placeholder,
     show_music_request_page,
     show_music_request_result,
@@ -42,13 +40,7 @@ class PendingDownload:
     user_id: int
     url: str
     mode: str | None = None
-    inspection: "PendingInspection | None" = None
     snapshot_path: Path | None = None
-
-
-@dataclass(frozen=True)
-class PendingInspection:
-    qualities: tuple[VideoQuality, ...]
 
 
 _pending: dict[str, PendingDownload] = {}
@@ -134,16 +126,6 @@ def _store_pending(token: str, pending: PendingDownload) -> None:
     _pending_expiry_tasks[token] = asyncio.create_task(_expire_pending(token, pending))
 
 
-def _quality_markup(token: str, qualities: list[VideoQuality]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=quality.label,
-            callback_data=f"quality:{token}:{index}",
-        )]
-        for index, quality in enumerate(qualities)
-    ])
-
-
 async def _render_private_enqueue_error(
     callback: CallbackQuery,
     text: str,
@@ -161,15 +143,15 @@ async def _start_pending_download(
     session: AsyncSession,
     token: str,
     pending: PendingDownload,
-    format_id: str | None,
-    callback_answered: bool = False,
+    *,
+    callback_answered: bool,
 ) -> None:
     placeholder = None
     queue_item = DownloadQueue(
         chat_id=str(callback.from_user.id),
         filename=str(uuid.uuid4()),
         tiktok_link=pending.url,
-        format_id=format_id,
+        format_id=None,
         inline_message_id=f"direct:{pending.mode}" if pending.mode != "normal" else None,
     )
     try:
@@ -313,9 +295,7 @@ async def handle_download_option(callback: CallbackQuery, session: AsyncSession,
         inspection = await loop.run_in_executor(None, inspect_media, pending.url)
     except Exception:
         inspection = None
-        qualities = []
     else:
-        qualities = list(inspection.qualities)
         try:
             pending.snapshot_path = write_info_snapshot(
                 f"pending_{token}",
@@ -330,60 +310,12 @@ async def handle_download_option(callback: CallbackQuery, session: AsyncSession,
                 callback_answered=True,
             )
             return
-        pending.inspection = PendingInspection(tuple(inspection.qualities))
-    if not needs_quality_choice(qualities):
-        await _start_pending_download(
-            callback,
-            session,
-            token,
-            pending,
-            format_id=None,
-            callback_answered=True,
-        )
-        return
-
-    _store_pending(token, pending)
-    if callback.message:
-        await callback.message.edit_text(
-            "Видео больше 50 МБ. Выберите качество — бот отправит его частями примерно по 50 МБ.",
-            reply_markup=_quality_markup(token, qualities),
-        )
-
-
-@link.callback_query(F.data.startswith("quality:"))
-async def handle_quality_option(callback: CallbackQuery, session: AsyncSession):
-    if callback.data is None:
-        await callback.answer()
-        return
-
-    parts = callback.data.split(":", 2)
-    if len(parts) != 3:
-        await callback.answer()
-        return
-    _, token, index_text = parts
-    pending = _pending.get(token)
-    if pending is None or pending.mode is None or pending.inspection is None:
-        await callback.answer("Ссылка устарела. Отправьте её ещё раз.", show_alert=True)
-        return
-    if callback.from_user.id != pending.user_id:
-        await callback.answer("Эта кнопка предназначена другому пользователю.", show_alert=True)
-        return
-    try:
-        quality = pending.inspection.qualities[int(index_text)]
-    except (IndexError, ValueError):
-        await callback.answer("Этот вариант больше недоступен. Отправьте ссылку ещё раз.", show_alert=True)
-        return
-    pending = _take_pending(token)
-    if pending is None:
-        await callback.answer("Ссылка уже обрабатывается.")
-        return
-
     await _start_pending_download(
         callback,
         session,
         token,
         pending,
-        quality.format_id,
+        callback_answered=True,
     )
 
 

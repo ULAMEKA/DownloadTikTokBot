@@ -14,6 +14,7 @@ from services.queue import (
     NoFastH264FormatError,
     _is_fast_h264_direct,
     _prepare_telegram_video,
+    _build_slideshow,
 )
 
 
@@ -188,6 +189,44 @@ class FastH264DirectPredicateTests(unittest.TestCase):
         for path, probe in incompatible_cases:
             with self.subTest(path=path, probe=probe):
                 self.assertFalse(_is_fast_h264_direct(path, probe))
+
+
+class SlideshowEncodingTests(unittest.TestCase):
+    def _capture_command(self, *, audio: bool) -> list[str]:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            images = [root / "one.jpg", root / "two.jpg"]
+            for image in images:
+                image.write_bytes(b"image")
+            audio_path = root / "sound.m4a" if audio else None
+            if audio_path:
+                audio_path.write_bytes(b"audio")
+            command_capture = {}
+            with patch.object(
+                queue.subprocess,
+                "run",
+                side_effect=lambda command, **_kwargs: command_capture.setdefault("command", command),
+            ):
+                _build_slideshow(images, audio_path, root / "output.mp4")
+            return command_capture["command"]
+
+    def test_slideshow_uses_fast_h264_exception_settings(self):
+        command = self._capture_command(audio=True)
+        rendered = " ".join(command)
+        self.assertIn("scale=480:854", rendered)
+        self.assertIn("ultrafast", rendered)
+        self.assertIn("-crf 26", rendered)
+        self.assertIn("128k", rendered)
+
+    def test_slideshow_with_external_audio_maps_both_streams(self):
+        command = self._capture_command(audio=True)
+        self.assertEqual(command[command.index("-map") + 1], "0:v:0")
+        self.assertEqual(command[command.index("-map") + 3], "1:a:0")
+
+    def test_silent_slideshow_retains_no_audio_fallback(self):
+        command = self._capture_command(audio=False)
+        self.assertIn("-an", command)
+        self.assertNotIn("1:a:0", command)
 
 
 if __name__ == "__main__":

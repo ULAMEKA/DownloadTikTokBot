@@ -53,8 +53,11 @@ PARENT_DIR = BASE_DIR.parent
 VIDEO_DIR = PARENT_DIR / "videos"
 VIDEO_DIR.mkdir(exist_ok=True)
 PHOTO_DURATION = 2.5
-SLIDESHOW_WIDTH = 720
-SLIDESHOW_HEIGHT = 1280
+SLIDESHOW_WIDTH = 480
+SLIDESHOW_HEIGHT = 854
+SLIDESHOW_VIDEO_PRESET = "ultrafast"
+SLIDESHOW_VIDEO_CRF = 26
+SLIDESHOW_AUDIO_BITRATE = "128k"
 FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 FFPROBE_EXE = shutil.which("ffprobe")
 
@@ -1402,11 +1405,15 @@ def _build_slideshow(images: list[Path], audio: Path | None, output: Path) -> No
         f"scale={SLIDESHOW_WIDTH}:{SLIDESHOW_HEIGHT}:force_original_aspect_ratio=decrease,"
         f"pad={SLIDESHOW_WIDTH}:{SLIDESHOW_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black,setsar=1",
         "-t", str(len(images) * PHOTO_DURATION),
-        "-c:v", "libx264", "-preset", "veryfast", "-threads", "1",
+        "-c:v", "libx264", "-preset", SLIDESHOW_VIDEO_PRESET,
+        "-crf", str(SLIDESHOW_VIDEO_CRF), "-threads", "1",
         "-pix_fmt", "yuv420p", "-fps_mode", "vfr",
     ))
     if audio:
-        command.extend(("-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "192k"))
+        command.extend((
+            "-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac",
+            "-b:a", SLIDESHOW_AUDIO_BITRATE,
+        ))
     else:
         command.append("-an")
     command.extend(("-movflags", "+faststart", str(output)))
