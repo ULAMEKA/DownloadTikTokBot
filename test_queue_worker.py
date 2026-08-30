@@ -6,6 +6,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
+from aiogram.types import FSInputFile
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -444,6 +450,411 @@ class ShortSessionTests(unittest.IsolatedAsyncioTestCase):
         )
         fallback_download.assert_not_called()
         resolve.assert_not_called()
+
+
+class DeliveryRoutingTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _job(inline_message_id: str | None = None) -> queue.QueueJob:
+        return queue.QueueJob(
+            1,
+            "-100200",
+            "42",
+            "delivery-job",
+            "https://www.tiktok.com/@a/video/123",
+            None,
+            None,
+            inline_message_id,
+            None,
+        )
+
+    @staticmethod
+    def _probe() -> queue.MediaProbe:
+        return queue.MediaProbe(
+            has_video=True,
+            has_audio=True,
+            video_codec="h264",
+            audio_codec="aac",
+            width=640,
+            height=360,
+            duration=5.0,
+            pixel_format="yuv420p",
+            sample_aspect_ratio="1:1",
+        )
+
+    async def _run_single_delivery(self, inline_message_id: str | None):
+        job = self._job(inline_message_id)
+        probe = self._probe()
+        inspection = queue.MediaInspection(
+            "123",
+            job.tiktok_link,
+            9,
+            "description",
+            640,
+            360,
+            5.0,
+            (),
+            {"id": "123", "webpage_url": job.tiktok_link},
+        )
+        bot = SimpleNamespace(
+            send_video=AsyncMock(
+                return_value=SimpleNamespace(
+                    video=SimpleNamespace(file_id="direct-file-id"),
+                    message_id=55,
+                )
+            ),
+            edit_message_media=AsyncMock(
+                return_value=SimpleNamespace(video=SimpleNamespace(file_id="unused"))
+            ),
+            edit_message_caption=AsyncMock(),
+            edit_message_text=AsyncMock(),
+            send_message=AsyncMock(),
+        )
+        upload_to_storage = AsyncMock(return_value=("storage-file-id", 77))
+        finish = AsyncMock()
+        discard = AsyncMock()
+        show_error = AsyncMock()
+
+        with tempfile.TemporaryDirectory() as directory:
+            video_path = Path(directory) / f"{job.filename}.mp4"
+
+            def download(*_args):
+                video_path.write_bytes(b"video")
+                return "123", 640, 360, "description", 5.0
+
+            prepared = queue.PreparedVideo(
+                path=video_path,
+                probe=probe,
+                bypassed_ffmpeg=True,
+            )
+            with (
+                patch.object(queue, "VIDEO_DIR", Path(directory)),
+                patch.object(queue, "STORAGE_CHAT_ID", "-100999"),
+                patch.object(queue, "_find_worker_cached_video", AsyncMock(return_value=None)),
+                patch.object(queue, "_load_info_snapshot", return_value=inspection.info),
+                patch.object(queue, "_inspection_from_snapshot", return_value=inspection),
+                patch.object(queue, "_ydl_download_from_info_file", side_effect=download),
+                patch.object(queue, "_prepare_telegram_video", return_value=prepared),
+                patch.object(queue, "_split_video", return_value=([video_path], None)),
+                patch.object(
+                    queue,
+                    "_upload_to_storage",
+                    upload_to_storage,
+                    create=True,
+                ),
+                patch.object(
+                    queue,
+                    "prepare_music_caption_link",
+                    AsyncMock(return_value=(None, None)),
+                ),
+                patch.object(queue, "_finish_video_job", finish),
+                patch.object(queue, "_discard_job", discard),
+                patch.object(queue, "_show_download_error", show_error),
+                patch.object(queue, "_remove_download_files"),
+                patch.object(queue.asyncio, "sleep", AsyncMock()),
+            ):
+                await queue._process_video_job(bot, job)
+
+            sent_video = (
+                bot.send_video.await_args.kwargs["video"]
+                if bot.send_video.await_count
+                else None
+            )
+
+        return SimpleNamespace(
+            bot=bot,
+            upload_to_storage=upload_to_storage,
+            finish=finish,
+            discard=discard,
+            show_error=show_error,
+            sent_video=sent_video,
+        )
+
+    async def test_private_and_group_misses_deliver_local_file_without_storage(self):
+        for inline_message_id in (None, "direct:no_description"):
+            with self.subTest(inline_message_id=inline_message_id):
+                result = await self._run_single_delivery(inline_message_id)
+
+                result.upload_to_storage.assert_not_awaited()
+                self.assertEqual(result.bot.send_video.await_count, 1)
+                self.assertIsInstance(result.sent_video, FSInputFile)
+                result.bot.edit_message_media.assert_not_awaited()
+                cache_update = result.finish.await_args.args[1]
+                self.assertEqual(cache_update.file_id, "direct-file-id")
+                self.assertIsNone(cache_update.storage_message_id)
+                result.discard.assert_not_awaited()
+                result.show_error.assert_not_awaited()
+
+    async def test_inline_miss_uploads_to_storage_once_and_edits_by_file_id(self):
+        result = await self._run_single_delivery("inline-message-id")
+
+        result.upload_to_storage.assert_awaited_once()
+        result.bot.send_video.assert_not_awaited()
+        self.assertEqual(
+            result.bot.edit_message_media.await_args.kwargs["media"].media,
+            "storage-file-id",
+        )
+        cache_update = result.finish.await_args.args[1]
+        self.assertEqual(cache_update.file_id, "storage-file-id")
+        self.assertEqual(cache_update.storage_message_id, 77)
+        result.discard.assert_not_awaited()
+        result.show_error.assert_not_awaited()
+
+
+class ForcedNormalizationRetryTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _job(inline_message_id: str | None = None) -> queue.QueueJob:
+        return queue.QueueJob(
+            1,
+            "42",
+            "42",
+            "retry-job",
+            "https://www.tiktok.com/@a/video/123",
+            None,
+            None,
+            inline_message_id,
+            None,
+        )
+
+    @staticmethod
+    def _probe() -> queue.MediaProbe:
+        return queue.MediaProbe(
+            has_video=True,
+            has_audio=True,
+            video_codec="h264",
+            audio_codec="aac",
+            width=640,
+            height=360,
+            duration=5.0,
+            pixel_format="yuv420p",
+            sample_aspect_ratio="1:1",
+        )
+
+    async def _run_failed_local_delivery(
+        self,
+        error: Exception,
+        *,
+        bypassed_ffmpeg: bool,
+        inline_message_id: str | None = None,
+        split_after_normalize: bool = False,
+    ):
+        job = self._job(inline_message_id)
+        probe = self._probe()
+        inspection = queue.MediaInspection(
+            "123",
+            job.tiktok_link,
+            None,
+            None,
+            640,
+            360,
+            5.0,
+            (),
+            {"id": "123", "webpage_url": job.tiktok_link},
+        )
+        prepare_forces: list[bool] = []
+        split_paths: list[Path] = []
+        deliver = AsyncMock(side_effect=[error, "part-one", "part-two"])
+        upload_to_storage = AsyncMock(return_value=("storage-file-id", 77))
+        finish = AsyncMock()
+        discard = AsyncMock()
+        show_error = AsyncMock()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / f"{job.filename}.mp4"
+            normalized = root / f"{job.filename}.normalized.mp4"
+            part_dir = root / "normalized-parts"
+
+            def download(*_args):
+                source.write_bytes(b"source")
+                return "123", 640, 360, None, 5.0
+
+            def prepare(path: Path, *, force_normalize: bool = False):
+                prepare_forces.append(force_normalize)
+                if force_normalize:
+                    normalized.write_bytes(b"normalized")
+                    return queue.PreparedVideo(
+                        path=normalized,
+                        probe=probe,
+                        bypassed_ffmpeg=False,
+                    )
+                return queue.PreparedVideo(
+                    path=path,
+                    probe=probe,
+                    bypassed_ffmpeg=bypassed_ffmpeg,
+                )
+
+            def split(path: Path, _duration: float | None):
+                split_paths.append(path)
+                if path == normalized and split_after_normalize:
+                    part_dir.mkdir()
+                    first = part_dir / "part_000.mp4"
+                    second = part_dir / "part_001.mp4"
+                    first.write_bytes(b"one")
+                    second.write_bytes(b"two")
+                    return [first, second], part_dir
+                return [path], None
+
+            bot = SimpleNamespace(send_video=AsyncMock())
+            with (
+                patch.object(queue, "VIDEO_DIR", root),
+                patch.object(queue, "STORAGE_CHAT_ID", None),
+                patch.object(queue, "_find_worker_cached_video", AsyncMock(return_value=None)),
+                patch.object(queue, "_load_info_snapshot", return_value=inspection.info),
+                patch.object(queue, "_inspection_from_snapshot", return_value=inspection),
+                patch.object(queue, "_ydl_download_from_info_file", side_effect=download),
+                patch.object(queue, "_prepare_telegram_video", side_effect=prepare),
+                patch.object(queue, "_split_video", side_effect=split),
+                patch.object(queue, "_deliver_video", deliver),
+                patch.object(
+                    queue,
+                    "_upload_to_storage",
+                    upload_to_storage,
+                    create=True,
+                ),
+                patch.object(
+                    queue,
+                    "prepare_music_caption_link",
+                    AsyncMock(return_value=(None, None)),
+                ),
+                patch.object(queue, "_finish_video_job", finish),
+                patch.object(queue, "_discard_job", discard),
+                patch.object(queue, "_show_download_error", show_error),
+                patch.object(queue, "_remove_download_files"),
+                patch.object(queue.asyncio, "sleep", AsyncMock()),
+                self.assertLogs(level="WARNING"),
+            ):
+                await queue._process_video_job(bot, job)
+
+        return SimpleNamespace(
+            prepare_forces=prepare_forces,
+            split_paths=split_paths,
+            source=source,
+            normalized=normalized,
+            deliver=deliver,
+            upload_to_storage=upload_to_storage,
+            finish=finish,
+            discard=discard,
+            show_error=show_error,
+        )
+
+    async def test_first_bypassed_local_bad_request_forces_one_normalize_and_resplit(self):
+        result = await self._run_failed_local_delivery(
+            TelegramBadRequest(MagicMock(), "Bad Request: wrong file format"),
+            bypassed_ffmpeg=True,
+            split_after_normalize=True,
+        )
+
+        self.assertEqual(result.prepare_forces, [False, True])
+        self.assertEqual(result.split_paths, [result.source, result.normalized])
+        self.assertEqual(result.deliver.await_count, 3)
+        result.upload_to_storage.assert_not_awaited()
+        result.finish.assert_awaited_once_with(1, None)
+        result.discard.assert_not_awaited()
+        result.show_error.assert_not_awaited()
+
+    async def test_nonlocal_or_already_normalized_errors_do_not_force_normalization(self):
+        cases = (
+            (
+                "already-normalized",
+                TelegramBadRequest(MagicMock(), "Bad Request: wrong file format"),
+                False,
+                None,
+            ),
+            (
+                "forbidden",
+                TelegramForbiddenError(MagicMock(), "Forbidden"),
+                True,
+                None,
+            ),
+            (
+                "rate-limit",
+                TelegramRetryAfter(MagicMock(), "Retry later", 1),
+                True,
+                None,
+            ),
+            (
+                "file-id-delivery",
+                TelegramBadRequest(MagicMock(), "Bad Request: message is not modified"),
+                True,
+                "inline-message-id",
+            ),
+        )
+
+        for name, error, bypassed, inline_message_id in cases:
+            with self.subTest(name=name):
+                result = await self._run_failed_local_delivery(
+                    error,
+                    bypassed_ffmpeg=bypassed,
+                    inline_message_id=inline_message_id,
+                )
+
+                self.assertEqual(result.prepare_forces, [False])
+                self.assertEqual(result.split_paths, [result.source])
+                self.assertEqual(result.deliver.await_count, 1)
+
+    async def test_bad_request_after_a_successful_part_does_not_force_normalization(self):
+        job = self._job()
+        probe = self._probe()
+        inspection = queue.MediaInspection(
+            "123",
+            job.tiktok_link,
+            None,
+            None,
+            640,
+            360,
+            5.0,
+            (),
+            {"id": "123", "webpage_url": job.tiktok_link},
+        )
+        prepare_forces: list[bool] = []
+        deliver = AsyncMock(
+            side_effect=[
+                "first-part-file-id",
+                TelegramBadRequest(MagicMock(), "Bad Request: wrong file format"),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / f"{job.filename}.mp4"
+            part_dir = root / "parts"
+            part_dir.mkdir()
+            parts = [part_dir / "part_000.mp4", part_dir / "part_001.mp4"]
+            for part in parts:
+                part.write_bytes(b"part")
+
+            def download(*_args):
+                source.write_bytes(b"source")
+                return "123", 640, 360, None, 5.0
+
+            def prepare(path: Path, *, force_normalize: bool = False):
+                prepare_forces.append(force_normalize)
+                return queue.PreparedVideo(path=path, probe=probe, bypassed_ffmpeg=True)
+
+            with (
+                patch.object(queue, "VIDEO_DIR", root),
+                patch.object(queue, "STORAGE_CHAT_ID", None),
+                patch.object(queue, "_find_worker_cached_video", AsyncMock(return_value=None)),
+                patch.object(queue, "_load_info_snapshot", return_value=inspection.info),
+                patch.object(queue, "_inspection_from_snapshot", return_value=inspection),
+                patch.object(queue, "_ydl_download_from_info_file", side_effect=download),
+                patch.object(queue, "_prepare_telegram_video", side_effect=prepare),
+                patch.object(queue, "_split_video", return_value=(parts, part_dir)),
+                patch.object(queue, "_deliver_video", deliver),
+                patch.object(
+                    queue,
+                    "prepare_music_caption_link",
+                    AsyncMock(return_value=(None, None)),
+                ),
+                patch.object(queue, "_discard_job", AsyncMock()),
+                patch.object(queue, "_show_download_error", AsyncMock()),
+                patch.object(queue, "_remove_download_files"),
+                self.assertLogs(level="WARNING"),
+            ):
+                await queue._process_video_job(SimpleNamespace(), job)
+
+        self.assertEqual(prepare_forces, [False])
+        self.assertEqual(deliver.await_count, 2)
 
 
 class VideoJobFinalizationTests(unittest.IsolatedAsyncioTestCase):

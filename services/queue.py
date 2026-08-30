@@ -13,6 +13,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 
 import imageio_ffmpeg
@@ -124,6 +125,13 @@ class MediaProbe:
 
 
 @dataclass(frozen=True)
+class PreparedVideo:
+    path: Path
+    probe: MediaProbe
+    bypassed_ffmpeg: bool
+
+
+@dataclass(frozen=True)
 class QueueJob:
     id: int
     chat_id: str
@@ -223,6 +231,19 @@ def _format_megabytes(value: int | None) -> str:
 
 def _is_h264(vcodec: object) -> bool:
     return isinstance(vcodec, str) and vcodec.lower().startswith(("h264", "avc"))
+
+
+def _can_bypass_telegram_normalization(path: Path, probe: MediaProbe) -> bool:
+    return (
+        path.suffix.lower() == ".mp4"
+        and probe.has_video
+        and probe.has_audio
+        and _is_h264(probe.video_codec)
+        and probe.pixel_format in (None, "yuv420p")
+        and probe.audio_codec == "aac"
+        and probe.sample_aspect_ratio in (None, "1:1")
+        and not probe.rotation
+    )
 
 
 def _has_video(item: dict[str, object]) -> bool:
@@ -1045,12 +1066,21 @@ def _gallery_tiktok_video_download(
     return None
 
 
-def _prepare_telegram_video(path: Path) -> tuple[Path, MediaProbe]:
+def _prepare_telegram_video(
+    path: Path,
+    *,
+    force_normalize: bool = False,
+) -> PreparedVideo:
     source_probe = _probe_media(path)
     if not source_probe.has_video:
         raise MediaPreparationError("В файле отсутствует видеодорожка")
     if not source_probe.has_audio:
         raise MissingAudioError
+    if (
+        not force_normalize
+        and _can_bypass_telegram_normalization(path, source_probe)
+    ):
+        return PreparedVideo(path, source_probe, True)
 
     needs_video_transcode = (
         not _is_h264(source_probe.video_codec)
@@ -1099,7 +1129,7 @@ def _prepare_telegram_video(path: Path) -> tuple[Path, MediaProbe]:
         os.replace(output, final_path)
         if path != final_path:
             path.unlink(missing_ok=True)
-        return final_path, prepared_probe
+        return PreparedVideo(final_path, prepared_probe, False)
     finally:
         output.unlink(missing_ok=True)
 
@@ -1365,6 +1395,31 @@ def _music_result_markup(token: str, page: int, pages: int) -> InlineKeyboardMar
             text="▶️", callback_data=f"{MUSIC_PAGE_PREFIX}{token}:{page + 1}"
         ))
     return InlineKeyboardMarkup(inline_keyboard=[buttons]) if buttons else None
+
+
+async def _upload_to_storage(
+    bot: Bot,
+    video_path: Path,
+    width: int | None,
+    height: int | None,
+) -> tuple[str | None, int | None]:
+    if not STORAGE_CHAT_ID:
+        return None, None
+    try:
+        storage_msg = await bot.send_video(
+            chat_id=STORAGE_CHAT_ID,
+            video=FSInputFile(str(video_path)),
+            width=width,
+            height=height,
+            supports_streaming=True,
+        )
+    except (TelegramBadRequest, TelegramForbiddenError) as error:
+        logging.warning("Не удалось отправить в Storage-канал: %s", error)
+        return None, None
+    if not storage_msg.video:
+        return None, None
+    logging.info("Storage: message_id=%s", storage_msg.message_id)
+    return storage_msg.video.file_id, storage_msg.message_id
 
 
 async def _deliver_video(
@@ -2319,127 +2374,165 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
         if video_path.stat().st_size > MAX_SOURCE_VIDEO_BYTES:
             raise VideoTooLargeError
 
-        video_path, media_probe = await loop.run_in_executor(
+        prepared_video = await loop.run_in_executor(
             None,
             _prepare_telegram_video,
             video_path,
         )
-        width = media_probe.width or width
-        height = media_probe.height or height
-        duration = media_probe.duration or duration
-
-        if (
-            not isinstance(duration, (int, float))
-            or not math.isfinite(duration)
-            or duration <= 0
-        ):
-            duration = await loop.run_in_executor(None, _probe_duration, video_path)
-        parts, part_dir = await loop.run_in_executor(None, _split_video, video_path, duration)
         music_deep_link: str | None = None
-        if len(parts) > 1:
-            if inline_message_id:
-                raise InlineSplitError
-            if can_attach_music_link(without_description):
-                _, music_deep_link = await prepare_music_caption_link(
-                    bot,
-                    source_url,
-                    format_id,
-                )
-            for number, part in enumerate(parts, start=1):
-                part_description = f"Часть {number}/{len(parts)}"
-                if number == 1 and description:
-                    part_description = f"{part_description}\n\n{description}"
-                for attempt in range(2):
-                    try:
-                        await _deliver_video(
-                            bot,
-                            chat_id,
-                            None,
-                            file_id=None,
-                            video_path=part,
-                            width=width,
-                            height=height,
-                            description=part_description,
-                            source_url=source_url if number == 1 else None,
-                            likes=likes if number == 1 else None,
-                            reply_to_message_id=reply_to_message_id,
-                            placeholder_message_id=placeholder_message_id,
-                            has_spoiler=has_spoiler,
-                            without_description=without_description,
-                            music_deep_link=music_deep_link if number == 1 else None,
-                        )
-                        break
-                    except TelegramRetryAfter as error:
-                        if attempt:
-                            raise
-                        await asyncio.sleep(error.retry_after)
-                placeholder_message_id = None
-                part.unlink(missing_ok=True)
-            video_path.unlink(missing_ok=True)
-            _remove_download_files(filename)
-            await _finish_video_job(job.id, None)
-            return
+        music_deep_link_prepared = False
+        forced_normalization_attempted = False
+        while True:
+            video_path = prepared_video.path
+            media_probe = prepared_video.probe
+            width = media_probe.width or width
+            height = media_probe.height or height
+            duration = media_probe.duration or duration
 
-        file_id: str | None = None
-        storage_message_id: int | None = None
-        if STORAGE_CHAT_ID:
+            if (
+                not isinstance(duration, (int, float))
+                or not math.isfinite(duration)
+                or duration <= 0
+            ):
+                duration = await loop.run_in_executor(None, _probe_duration, video_path)
+            parts, part_dir = await loop.run_in_executor(
+                None,
+                _split_video,
+                video_path,
+                duration,
+            )
+            successful_sends = 0
             try:
-                storage_msg = await bot.send_video(
-                    chat_id=STORAGE_CHAT_ID,
-                    video=FSInputFile(str(video_path)),
+                if len(parts) > 1:
+                    if inline_message_id:
+                        raise InlineSplitError
+                    if (
+                        can_attach_music_link(without_description)
+                        and not music_deep_link_prepared
+                    ):
+                        _, music_deep_link = await prepare_music_caption_link(
+                            bot,
+                            source_url,
+                            format_id,
+                        )
+                        music_deep_link_prepared = True
+                    for number, part in enumerate(parts, start=1):
+                        part_description = f"Часть {number}/{len(parts)}"
+                        if number == 1 and description:
+                            part_description = f"{part_description}\n\n{description}"
+                        for attempt in range(2):
+                            try:
+                                await _deliver_video(
+                                    bot,
+                                    chat_id,
+                                    None,
+                                    file_id=None,
+                                    video_path=part,
+                                    width=width,
+                                    height=height,
+                                    description=part_description,
+                                    source_url=source_url if number == 1 else None,
+                                    likes=likes if number == 1 else None,
+                                    reply_to_message_id=reply_to_message_id,
+                                    placeholder_message_id=placeholder_message_id,
+                                    has_spoiler=has_spoiler,
+                                    without_description=without_description,
+                                    music_deep_link=(
+                                        music_deep_link if number == 1 else None
+                                    ),
+                                )
+                                successful_sends += 1
+                                break
+                            except TelegramRetryAfter as error:
+                                if attempt:
+                                    raise
+                                await asyncio.sleep(error.retry_after)
+                        placeholder_message_id = None
+                        part.unlink(missing_ok=True)
+                    video_path.unlink(missing_ok=True)
+                    _remove_download_files(filename)
+                    await _finish_video_job(job.id, None)
+                    return
+
+                file_id: str | None = None
+                storage_message_id: int | None = None
+                if inline_message_id:
+                    file_id, storage_message_id = await _upload_to_storage(
+                        bot,
+                        video_path,
+                        width,
+                        height,
+                    )
+
+                if (
+                    can_attach_music_link(without_description)
+                    and not music_deep_link_prepared
+                ):
+                    _, music_deep_link = await prepare_music_caption_link(
+                        bot,
+                        source_url,
+                        format_id,
+                    )
+                    music_deep_link_prepared = True
+                result_file_id = await _deliver_video(
+                    bot,
+                    chat_id,
+                    inline_message_id,
+                    file_id=file_id,
+                    video_path=video_path,
                     width=width,
                     height=height,
-                    supports_streaming=True,
+                    description=description,
+                    source_url=source_url,
+                    likes=likes,
+                    reply_to_message_id=reply_to_message_id,
+                    placeholder_message_id=placeholder_message_id,
+                    has_spoiler=has_spoiler,
+                    without_description=without_description,
+                    music_deep_link=music_deep_link,
                 )
-                if storage_msg.video:
-                    file_id = storage_msg.video.file_id
-                    storage_message_id = storage_msg.message_id
-                    logging.info(
-                        "Storage: tiktok_id=%s → message_id=%s",
-                        final_id,
-                        storage_message_id,
-                    )
-            except (TelegramBadRequest, TelegramForbiddenError) as error:
-                logging.warning("Не удалось отправить в Storage-канал: %s", error)
+                successful_sends += 1
+                if result_file_id and not file_id:
+                    file_id = result_file_id
+            except TelegramBadRequest:
+                can_force_normalize = (
+                    inline_message_id is None
+                    and prepared_video.bypassed_ffmpeg
+                    and not forced_normalization_attempted
+                    and successful_sends == 0
+                )
+                if not can_force_normalize:
+                    raise
+                if part_dir:
+                    shutil.rmtree(part_dir, ignore_errors=True)
+                    part_dir = None
+                logging.warning(
+                    "Telegram rejected bypassed MP4; retrying after forced normalization"
+                )
+                forced_normalization_attempted = True
+                prepared_video = await loop.run_in_executor(
+                    None,
+                    partial(
+                        _prepare_telegram_video,
+                        video_path,
+                        force_normalize=True,
+                    ),
+                )
+                continue
 
-        if can_attach_music_link(without_description):
-            _, music_deep_link = await prepare_music_caption_link(
-                bot,
-                source_url,
-                format_id,
-            )
-        result_file_id = await _deliver_video(
-            bot,
-            chat_id,
-            inline_message_id,
-            file_id=file_id,
-            video_path=video_path,
-            width=width,
-            height=height,
-            description=description,
-            source_url=source_url,
-            likes=likes,
-            reply_to_message_id=reply_to_message_id,
-            placeholder_message_id=placeholder_message_id,
-            has_spoiler=has_spoiler,
-            without_description=without_description,
-            music_deep_link=music_deep_link,
-        )
-        if result_file_id and not file_id:
-            file_id = result_file_id
-
-        cache_update = None
-        if format_id is None and final_id and file_id:
-            cache_update = VideoCacheUpdate(
-                cache_key=_media_cache_key(final_id),
-                file_id=file_id,
-                storage_message_id=storage_message_id,
-                description=description,
-                source_url=source_url,
-                likes=likes,
-            )
-        _remove_download_files(filename)
-        await _finish_video_job(job.id, cache_update)
+            cache_update = None
+            if format_id is None and final_id and file_id:
+                cache_update = VideoCacheUpdate(
+                    cache_key=_media_cache_key(final_id),
+                    file_id=file_id,
+                    storage_message_id=storage_message_id,
+                    description=description,
+                    source_url=source_url,
+                    likes=likes,
+                )
+            _remove_download_files(filename)
+            await _finish_video_job(job.id, cache_update)
+            return
 
     except MissingAudioError:
         logging.warning("Источник не отдал аудиодорожку: chat=%s url=%s", chat_id, tiktok_link)
