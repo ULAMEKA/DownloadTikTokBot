@@ -3,15 +3,16 @@ import unittest
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from sqlalchemy import delete, text
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import init_db
 import services.queue as queue
 from db.base import Base
-from db.models import DownloadQueue
+from db.models import DownloadQueue, VideoCache
 
 
 class QueueWakeupTests(unittest.IsolatedAsyncioTestCase):
@@ -202,6 +203,358 @@ class QueueSelectionTests(unittest.IsolatedAsyncioTestCase):
             await session.commit()
 
         self.assertIsNotNone(item.enqueued_at)
+
+
+class ShortSessionTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _job() -> queue.QueueJob:
+        return queue.QueueJob(
+            1,
+            "1",
+            "1",
+            "job",
+            "https://www.tiktok.com/@a/video/123",
+            None,
+            None,
+            None,
+            None,
+        )
+
+    @staticmethod
+    def _inspection(job: queue.QueueJob) -> queue.MediaInspection:
+        return queue.MediaInspection(
+            "123",
+            job.tiktok_link,
+            9,
+            "desc",
+            720,
+            1280,
+            10.0,
+            (),
+            {"id": "123", "webpage_url": job.tiktok_link},
+        )
+
+    async def test_download_starts_after_load_session_exits(self):
+        job = self._job()
+        inspection = self._inspection(job)
+        session_active = False
+        session = SimpleNamespace()
+        test_case = self
+
+        class SessionContext:
+            async def __aenter__(self):
+                nonlocal session_active
+                test_case.assertFalse(session_active)
+                session_active = True
+                return session
+
+            async def __aexit__(self, *_args):
+                nonlocal session_active
+                session_active = False
+
+        def download(*_args):
+            self.assertFalse(session_active)
+            raise queue.MediaPreparationError("stop")
+
+        with (
+            patch.object(queue, "SessionLocal", side_effect=SessionContext),
+            patch.object(queue, "find_cached_video", AsyncMock(return_value=None)),
+            patch.object(
+                queue,
+                "find_cached_video_by_id",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(queue, "_load_info_snapshot", return_value=inspection.info),
+            patch.object(queue, "_inspection_from_snapshot", return_value=inspection),
+            patch.object(
+                queue,
+                "_ydl_download_from_info_file",
+                side_effect=download,
+            ) as snapshot_download,
+            patch.object(
+                queue,
+                "_download_media",
+                side_effect=download,
+            ) as url_download,
+            patch.object(queue, "_discard_job", AsyncMock()),
+            patch.object(queue, "_show_download_error", AsyncMock()),
+            patch.object(queue, "_remove_download_files"),
+            self.assertLogs(level="ERROR"),
+        ):
+            await queue._process_video_job(MagicMock(), job)
+
+        self.assertFalse(session_active)
+        snapshot_download.assert_called_once()
+        url_download.assert_called_once()
+
+    async def test_fresh_snapshot_skips_resolve_and_second_extract(self):
+        job = self._job()
+        inspection = self._inspection(job)
+        session_context = AsyncMock()
+        session_context.__aenter__.return_value = SimpleNamespace()
+
+        with tempfile.TemporaryDirectory() as directory:
+            video_path = Path(directory) / "job.mp4"
+            snapshot_path = Path(directory) / "job.info.json"
+
+            def download(*_args):
+                video_path.write_bytes(b"video")
+                return "123", 720, 1280, "desc", 10.0
+
+            with (
+                patch.object(queue, "VIDEO_DIR", Path(directory)),
+                patch.object(queue, "SessionLocal", return_value=session_context),
+                patch.object(queue, "find_cached_video", AsyncMock(return_value=None)),
+                patch.object(
+                    queue,
+                    "find_cached_video_by_id",
+                    AsyncMock(return_value=None),
+                ),
+                patch.object(queue, "_load_info_snapshot", return_value=inspection.info),
+                patch.object(queue, "_inspection_from_snapshot", return_value=inspection),
+                patch.object(queue, "inspect_media") as inspect,
+                patch.object(queue, "write_info_snapshot") as write_snapshot,
+                patch.object(
+                    queue,
+                    "_ydl_download_from_info_file",
+                    side_effect=download,
+                ) as download_from_snapshot,
+                patch.object(queue, "_download_media") as fallback_download,
+                patch.object(
+                    queue,
+                    "_prepare_telegram_video",
+                    side_effect=queue.MediaPreparationError("stop after download"),
+                ),
+                patch.object(queue, "_resolve_media") as resolve,
+                patch.object(queue, "_discard_job", AsyncMock()),
+                patch.object(queue, "_show_download_error", AsyncMock()),
+                patch.object(queue, "_remove_download_files"),
+                self.assertLogs(level="ERROR"),
+            ):
+                await queue._process_video_job(MagicMock(), job)
+
+        inspect.assert_not_called()
+        write_snapshot.assert_not_called()
+        download_from_snapshot.assert_called_once_with(
+            job.tiktok_link,
+            snapshot_path,
+            str(Path(directory) / "job.%(ext)s"),
+            None,
+        )
+        fallback_download.assert_not_called()
+        resolve.assert_not_called()
+
+    async def test_music_username_lookup_precedes_its_short_insert_session(self):
+        session_opened = False
+        session_exited = False
+        session = SimpleNamespace(add=MagicMock(), commit=AsyncMock())
+        test_case = self
+
+        class BotStub:
+            async def get_me(self):
+                test_case.assertFalse(session_opened)
+                return SimpleNamespace(username="download_bot")
+
+        class SessionContext:
+            async def __aenter__(self):
+                nonlocal session_opened
+                session_opened = True
+                return session
+
+            async def __aexit__(self, *_args):
+                nonlocal session_exited
+                session_exited = True
+
+        with (
+            patch.object(queue, "SessionLocal", side_effect=SessionContext),
+            patch.object(queue, "_music_bot_username_cache", None),
+            patch.object(queue.os, "getenv", return_value=""),
+        ):
+            token, link = await queue.prepare_music_caption_link(
+                BotStub(),
+                "https://www.tiktok.com/@a/video/123",
+                None,
+            )
+
+        self.assertTrue(session_exited)
+        self.assertIsNotNone(token)
+        self.assertEqual(link, f"https://t.me/download_bot?start=music_{token}")
+        session.add.assert_called_once()
+        session.commit.assert_awaited_once()
+
+    async def test_missing_snapshot_inspects_once_and_downloads_from_written_snapshot(self):
+        job = self._job()
+        inspection = self._inspection(job)
+        session = SimpleNamespace()
+        session_context = AsyncMock()
+        session_context.__aenter__.return_value = session
+
+        with tempfile.TemporaryDirectory() as directory:
+            video_path = Path(directory) / "job.mp4"
+            snapshot_path = Path(directory) / "job.info.json"
+
+            def download(*_args):
+                video_path.write_bytes(b"video")
+                return "123", 720, 1280, "desc", 10.0
+
+            cache_by_id = AsyncMock(return_value=None)
+            with (
+                patch.object(queue, "VIDEO_DIR", Path(directory)),
+                patch.object(queue, "SessionLocal", return_value=session_context),
+                patch.object(queue, "find_cached_video", AsyncMock(return_value=None)),
+                patch.object(queue, "find_cached_video_by_id", cache_by_id),
+                patch.object(queue, "_load_info_snapshot", return_value=None),
+                patch.object(queue, "inspect_media", return_value=inspection) as inspect,
+                patch.object(
+                    queue,
+                    "write_info_snapshot",
+                    return_value=snapshot_path,
+                ) as write_snapshot,
+                patch.object(
+                    queue,
+                    "_ydl_download_from_info_file",
+                    side_effect=download,
+                ) as download_from_snapshot,
+                patch.object(queue, "_download_media") as fallback_download,
+                patch.object(
+                    queue,
+                    "_prepare_telegram_video",
+                    side_effect=queue.MediaPreparationError("stop after download"),
+                ),
+                patch.object(queue, "_resolve_media") as resolve,
+                patch.object(queue, "_discard_job", AsyncMock()),
+                patch.object(queue, "_show_download_error", AsyncMock()),
+                patch.object(queue, "_remove_download_files"),
+                self.assertLogs(level="ERROR"),
+            ):
+                await queue._process_video_job(MagicMock(), job)
+
+        inspect.assert_called_once_with(job.tiktok_link)
+        write_snapshot.assert_called_once_with(job.filename, inspection.info)
+        cache_by_id.assert_awaited_once_with(
+            session,
+            inspection.media_id,
+            inspection.source_url,
+        )
+        download_from_snapshot.assert_called_once_with(
+            job.tiktok_link,
+            snapshot_path,
+            str(Path(directory) / "job.%(ext)s"),
+            None,
+        )
+        fallback_download.assert_not_called()
+        resolve.assert_not_called()
+
+
+class VideoJobFinalizationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        database_path = Path(self.temp_dir.name) / "finish.sqlite3"
+        self.engine = create_async_engine(f"sqlite+aiosqlite:///{database_path}")
+        self.session_factory = async_sessionmaker(self.engine, expire_on_commit=False)
+        async with self.engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        self.session_patch = patch.object(queue, "SessionLocal", self.session_factory)
+        self.session_patch.start()
+
+    async def asyncTearDown(self) -> None:
+        self.session_patch.stop()
+        await self.engine.dispose()
+        self.temp_dir.cleanup()
+
+    async def _add_job(self, filename: str = "job") -> int:
+        async with self.session_factory() as session:
+            item = DownloadQueue(
+                chat_id="1",
+                user_id="1",
+                filename=filename,
+                tiktok_link="https://www.tiktok.com/@a/video/123",
+            )
+            session.add(item)
+            await session.commit()
+            return item.id
+
+    async def test_finish_upserts_complete_cache_snapshot_and_deletes_job(self):
+        job_id = await self._add_job()
+        async with self.session_factory() as session:
+            session.add(
+                VideoCache(
+                    tiktok_id="h264-aac-v2:123",
+                    file_id="old-file",
+                    storage_message_id=1,
+                    description="old",
+                    source_url="https://old.example",
+                    likes=1,
+                )
+            )
+            await session.commit()
+
+        cache_update = queue.VideoCacheUpdate(
+            cache_key="h264-aac-v2:123",
+            file_id="new-file",
+            storage_message_id=9,
+            description="desc",
+            source_url="https://www.tiktok.com/@a/video/123",
+            likes=42,
+        )
+        with self.assertRaises(FrozenInstanceError):
+            cache_update.likes = 0
+
+        await queue._finish_video_job(job_id, cache_update)
+
+        async with self.session_factory() as session:
+            item = await session.get(DownloadQueue, job_id)
+            result = await session.execute(
+                select(VideoCache).where(VideoCache.tiktok_id == cache_update.cache_key)
+            )
+            cached = result.scalar_one()
+
+        self.assertIsNone(item)
+        self.assertEqual(cached.file_id, "new-file")
+        self.assertEqual(cached.storage_message_id, 9)
+        self.assertEqual(cached.description, "desc")
+        self.assertEqual(cached.source_url, cache_update.source_url)
+        self.assertEqual(cached.likes, 42)
+
+    async def test_finish_commit_failure_rolls_back_and_leaves_job_recoverable(self):
+        job_id = await self._add_job("recoverable")
+        worker_session = self.session_factory()
+        cache_update = queue.VideoCacheUpdate(
+            cache_key="h264-aac-v2:123",
+            file_id="file",
+            storage_message_id=None,
+            description=None,
+            source_url="https://www.tiktok.com/@a/video/123",
+            likes=None,
+        )
+
+        with (
+            patch.object(queue, "SessionLocal", return_value=worker_session),
+            patch.object(
+                worker_session,
+                "commit",
+                AsyncMock(side_effect=RuntimeError("commit failed")),
+            ),
+            self.assertLogs(level="ERROR"),
+        ):
+            await queue._finish_video_job(job_id, cache_update)
+
+        async with self.session_factory() as session:
+            item = await session.get(DownloadQueue, job_id)
+            result = await session.execute(select(VideoCache))
+
+        self.assertIsNotNone(item)
+        self.assertIsNone(result.scalar_one_or_none())
+
+    async def test_discard_deletes_only_the_selected_job(self):
+        discarded_id = await self._add_job("discarded")
+        kept_id = await self._add_job("kept")
+
+        await queue._discard_job(discarded_id)
+
+        async with self.session_factory() as session:
+            self.assertIsNone(await session.get(DownloadQueue, discarded_id))
+            self.assertIsNotNone(await session.get(DownloadQueue, kept_id))
 
 
 class QueueTimestampMigrationTests(unittest.IsolatedAsyncioTestCase):

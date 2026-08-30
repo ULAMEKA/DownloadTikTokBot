@@ -28,14 +28,17 @@ from gallery_dl.extractor.message import Message as GalleryMessage
 from gallery_dl.extractor.tiktok import TiktokPostExtractor, TiktokVmpostExtractor
 
 from db.session import SessionLocal
-from db.models import DownloadQueue, MusicRequest, VideoCache
+from db.models import DownloadQueue, MusicRequest
 from caption import build_caption, source_link
 from promo import AD_DISPLAY_SECONDS
 from services.media_cache import (
     CachedVideo,
+    VideoCacheUpdate,
     find_cached_video,
+    find_cached_video_by_id,
     invalidate_cached_video,
     is_invalid_cached_file_id_error,
+    upsert_cached_video,
 )
 from utils.media_cookies import cookie_files_for_url
 
@@ -1956,7 +1959,6 @@ async def _get_music_bot_username(bot: Bot) -> str | None:
 
 async def create_music_deep_link(
     bot: Bot,
-    session: AsyncSession,
     tiktok_link: str,
     format_id: str | None,
 ) -> tuple[MusicRequest, str] | None:
@@ -1974,23 +1976,22 @@ async def create_music_deep_link(
         state="ready",
         music_tracks=None,
     )
-    session.add(request)
-    await session.commit()
+    async with SessionLocal() as session:
+        session.add(request)
+        await session.commit()
     return request, f"https://t.me/{username}?start={MUSIC_START_PREFIX}{request.token}"
 
 
 async def prepare_music_caption_link(
     bot: Bot,
-    session: AsyncSession,
     tiktok_link: str,
     format_id: str | None,
 ) -> tuple[str | None, str | None]:
     """Create a caption deep-link without blocking video delivery on failure."""
     try:
-        result = await create_music_deep_link(bot, session, tiktok_link, format_id)
+        result = await create_music_deep_link(bot, tiktok_link, format_id)
     except Exception as error:
         logging.warning("Не удалось подготовить ссылку распознавания: %s", error)
-        await session.rollback()
         return None, None
     if result is None:
         return None, None
@@ -2102,344 +2103,465 @@ async def _wait_for_next_job() -> QueueJob:
             pass
 
 
-async def _process_queue_job_legacy(bot: Bot, job: QueueJob) -> None:
+async def _find_worker_cached_video(
+    canonical_url: str,
+    media_id: str | None = None,
+) -> CachedVideo | None:
     async with SessionLocal() as session:
-        item = await session.get(DownloadQueue, job.id)
-        if item is None:
-            return
-        # Task 7 removes this compatibility loop together with the long session.
-        for item in (item,):
+        try:
+            if media_id is None:
+                return await find_cached_video(session, canonical_url)
+            return await find_cached_video_by_id(session, media_id, canonical_url)
+        except Exception:
+            logging.exception("Cache lookup failed: url=%s media_id=%s", canonical_url, media_id)
+            await session.rollback()
+            return None
 
-            # Защита от битых записей
-            if item.chat_id is None or item.filename is None or item.tiktok_link is None:
-                await session.delete(item)
-                await session.commit()
-                continue
 
-            if (
-                item.inline_message_id
-                and item.inline_message_id.startswith(MUSIC_JOB_PREFIX)
+async def _invalidate_worker_cached_video(cache_key: str) -> None:
+    async with SessionLocal() as session:
+        await invalidate_cached_video(session, cache_key)
+
+
+async def _discard_job(job_id: int) -> None:
+    async with SessionLocal() as session:
+        item = await session.get(DownloadQueue, job_id)
+        if item is not None:
+            await session.delete(item)
+            await session.commit()
+
+
+async def _finish_video_job(
+    job_id: int,
+    cache_update: VideoCacheUpdate | None,
+) -> None:
+    async with SessionLocal() as session:
+        try:
+            item = await session.get(DownloadQueue, job_id)
+            if item is None:
+                return
+            if cache_update is not None:
+                await upsert_cached_video(session, cache_update)
+            await session.delete(item)
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            logging.exception("Не удалось завершить задачу загрузки: job_id=%s", job_id)
+
+
+async def _try_deliver_worker_cache(
+    bot: Bot,
+    job: QueueJob,
+    cached: CachedVideo,
+    *,
+    chat_id: str,
+    inline_message_id: str | None,
+    reply_to_message_id: int | None,
+    placeholder_message_id: int | None,
+    has_spoiler: bool,
+    without_description: bool,
+) -> bool:
+    source_url = cached.source_url or job.tiktok_link
+    music_deep_link: str | None = None
+    if can_attach_music_link(without_description):
+        _, music_deep_link = await prepare_music_caption_link(
+            bot,
+            source_url,
+            job.format_id,
+        )
+    try:
+        await _deliver_video(
+            bot,
+            chat_id,
+            inline_message_id,
+            file_id=cached.file_id,
+            video_path=None,
+            description=cached.description,
+            source_url=source_url,
+            likes=cached.likes,
+            reply_to_message_id=reply_to_message_id,
+            placeholder_message_id=placeholder_message_id,
+            has_spoiler=has_spoiler,
+            without_description=without_description,
+            music_deep_link=music_deep_link,
+        )
+    except TelegramBadRequest as error:
+        if not is_invalid_cached_file_id_error(error):
+            raise
+        await _invalidate_worker_cached_video(cached.cache_key)
+        return False
+
+    _remove_download_files(job.filename)
+    await _finish_video_job(job.id, None)
+    return True
+
+
+async def _process_video_job(bot: Bot, job: QueueJob) -> None:
+    if job.chat_id is None or job.filename is None or job.tiktok_link is None:
+        await _discard_job(job.id)
+        return
+
+    chat_id = job.chat_id
+    filename = job.filename
+    tiktok_link = job.tiktok_link
+    format_id = job.format_id
+    inline_message_id = job.inline_message_id
+    reply_to_message_id = job.reply_to_message_id
+    placeholder_message_id = (
+        -reply_to_message_id
+        if reply_to_message_id is not None and reply_to_message_id < 0
+        else None
+    )
+    if placeholder_message_id:
+        reply_to_message_id = None
+    placeholder_for_cleanup = placeholder_message_id
+    part_dir: Path | None = None
+    source_url = tiktok_link
+    direct_mode = (
+        inline_message_id.removeprefix("direct:")
+        if inline_message_id and inline_message_id.startswith("direct:")
+        else None
+    )
+    has_spoiler = direct_mode in ("spoiler", "no_description_spoiler")
+    without_description = direct_mode in ("no_description", "no_description_spoiler")
+    if direct_mode:
+        inline_message_id = None
+    elif inline_message_id:
+        while True:
+            if inline_message_id.startswith("spoiler:"):
+                has_spoiler = True
+                inline_message_id = inline_message_id.removeprefix("spoiler:")
+            elif inline_message_id.startswith("no_description:"):
+                without_description = True
+                inline_message_id = inline_message_id.removeprefix("no_description:")
+            else:
+                break
+
+    try:
+        loop = asyncio.get_running_loop()
+        if format_id is None:
+            cached = await _find_worker_cached_video(tiktok_link)
+            if cached is not None and await _try_deliver_worker_cache(
+                bot,
+                job,
+                cached,
+                chat_id=chat_id,
+                inline_message_id=inline_message_id,
+                reply_to_message_id=reply_to_message_id,
+                placeholder_message_id=placeholder_message_id,
+                has_spoiler=has_spoiler,
+                without_description=without_description,
             ):
-                await _process_music_job(
-                    bot,
-                    session,
-                    item,
-                    item.inline_message_id.removeprefix(MUSIC_JOB_PREFIX),
-                )
-                continue
+                return
 
-            chat_id: str = item.chat_id
-            filename: str = item.filename
-            tiktok_link: str = item.tiktok_link
-            format_id: str | None = item.format_id
-            inline_message_id: str | None = item.inline_message_id
-            reply_to_message_id: int | None = item.reply_to_message_id
-            placeholder_message_id = (
-                -reply_to_message_id
-                if reply_to_message_id is not None and reply_to_message_id < 0
-                else None
-            )
-            if placeholder_message_id:
-                reply_to_message_id = None
-            placeholder_for_cleanup = placeholder_message_id
-            part_dir: Path | None = None
-            source_url = tiktok_link
-            direct_mode = (
-                inline_message_id.removeprefix("direct:")
-                if inline_message_id and inline_message_id.startswith("direct:")
-                else None
-            )
-            has_spoiler = direct_mode in ("spoiler", "no_description_spoiler")
-            without_description = direct_mode in ("no_description", "no_description_spoiler")
-            if direct_mode:
-                inline_message_id = None
-            elif inline_message_id:
-                while True:
-                    if inline_message_id.startswith("spoiler:"):
-                        has_spoiler = True
-                        inline_message_id = inline_message_id.removeprefix("spoiler:")
-                    elif inline_message_id.startswith("no_description:"):
-                        without_description = True
-                        inline_message_id = inline_message_id.removeprefix("no_description:")
-                    else:
-                        break
+        snapshot = _load_info_snapshot(filename)
+        if snapshot is None:
             try:
-                loop = asyncio.get_running_loop()
+                inspection = await loop.run_in_executor(None, inspect_media, tiktok_link)
+            except Exception as error:
+                raise MediaPreparationError("Не удалось получить метаданные") from error
+            info_path = write_info_snapshot(filename, inspection.info)
+        else:
+            inspection = _inspection_from_snapshot(tiktok_link, snapshot)
+            info_path = _info_snapshot_path(filename)
+        source_url = inspection.source_url
+        likes = inspection.likes
 
-                # 1. ID видео TikTok
-                tiktok_id, source_url, likes = await loop.run_in_executor(
-                    None, _resolve_media, tiktok_link
+        if inspection.media_id and format_id is None:
+            cached = await _find_worker_cached_video(source_url, inspection.media_id)
+            if cached is not None and await _try_deliver_worker_cache(
+                bot,
+                job,
+                cached,
+                chat_id=chat_id,
+                inline_message_id=inline_message_id,
+                reply_to_message_id=reply_to_message_id,
+                placeholder_message_id=placeholder_message_id,
+                has_spoiler=has_spoiler,
+                without_description=without_description,
+            ):
+                return
+
+        outtmpl = str(VIDEO_DIR / f"{filename}.%(ext)s")  # cspell:disable-line
+        slideshow_path = VIDEO_DIR / f"{filename}.mp4"
+        try:
+            downloaded = await loop.run_in_executor(
+                None,
+                _ydl_download_from_info_file,
+                tiktok_link,
+                info_path,
+                outtmpl,
+                format_id,
+            )
+        except VideoTooLargeError:
+            raise
+        except Exception as error:
+            logging.info("Info snapshot download failed, using URL fallback: %s", error)
+            downloaded = await loop.run_in_executor(
+                None,
+                _download_media,
+                tiktok_link,
+                outtmpl,
+                slideshow_path,
+                format_id,
+            )
+        downloaded_id, width, height, description, duration = downloaded
+        final_id = inspection.media_id or downloaded_id
+
+        matches = [
+            path
+            for path in VIDEO_DIR.glob(f"{filename}.*")
+            if path.suffix.lower() in _VIDEO_EXTENSIONS
+        ]
+        if not matches:
+            raise FileNotFoundError(f"Файл после загрузки не найден: {filename}")
+        video_path = matches[0]
+        if video_path.stat().st_size > MAX_SOURCE_VIDEO_BYTES:
+            raise VideoTooLargeError
+
+        video_path, media_probe = await loop.run_in_executor(
+            None,
+            _prepare_telegram_video,
+            video_path,
+        )
+        width = media_probe.width or width
+        height = media_probe.height or height
+        duration = media_probe.duration or duration
+
+        if (
+            not isinstance(duration, (int, float))
+            or not math.isfinite(duration)
+            or duration <= 0
+        ):
+            duration = await loop.run_in_executor(None, _probe_duration, video_path)
+        parts, part_dir = await loop.run_in_executor(None, _split_video, video_path, duration)
+        music_deep_link: str | None = None
+        if len(parts) > 1:
+            if inline_message_id:
+                raise InlineSplitError
+            if can_attach_music_link(without_description):
+                _, music_deep_link = await prepare_music_caption_link(
+                    bot,
+                    source_url,
+                    format_id,
                 )
-                music_deep_link: str | None = None
-
-                # 2. Проверяем кеш
-                cached: VideoCache | None = None
-                if tiktok_id and format_id is None:
-                    cache_key = _media_cache_key(tiktok_id)
-                    cache_res = await session.execute(
-                        select(VideoCache).where(VideoCache.tiktok_id == cache_key)
-                    )
-                    cached = cache_res.scalar()
-                    if cached and cached.file_id:
-                        logging.info("Cache hit: tiktok_id=%s → отправляем без загрузки", tiktok_id)
-                        if can_attach_music_link(without_description):
-                            _, music_deep_link = await prepare_music_caption_link(
-                                bot,
-                                session,
-                                source_url,
-                                format_id,
-                            )
+            for number, part in enumerate(parts, start=1):
+                part_description = f"Часть {number}/{len(parts)}"
+                if number == 1 and description:
+                    part_description = f"{part_description}\n\n{description}"
+                for attempt in range(2):
+                    try:
                         await _deliver_video(
-                            bot, chat_id, inline_message_id,
-                            file_id=cached.file_id, video_path=None,
-                            description=cached.description, source_url=source_url,
-                            likes=likes,
+                            bot,
+                            chat_id,
+                            None,
+                            file_id=None,
+                            video_path=part,
+                            width=width,
+                            height=height,
+                            description=part_description,
+                            source_url=source_url if number == 1 else None,
+                            likes=likes if number == 1 else None,
                             reply_to_message_id=reply_to_message_id,
                             placeholder_message_id=placeholder_message_id,
                             has_spoiler=has_spoiler,
                             without_description=without_description,
-                            music_deep_link=music_deep_link,
+                            music_deep_link=music_deep_link if number == 1 else None,
                         )
-                        await session.delete(item)
-                        await session.commit()
-                        continue
+                        break
+                    except TelegramRetryAfter as error:
+                        if attempt:
+                            raise
+                        await asyncio.sleep(error.retry_after)
+                placeholder_message_id = None
+                part.unlink(missing_ok=True)
+            video_path.unlink(missing_ok=True)
+            _remove_download_files(filename)
+            await _finish_video_job(job.id, None)
+            return
 
-                # 3. Скачиваем
-                outtmpl = str(VIDEO_DIR / f"{filename}.%(ext)s")  # cspell:disable-line
-                slideshow_path = VIDEO_DIR / f"{filename}.mp4"
-                downloaded_id, width, height, description, duration = await loop.run_in_executor(
-                    None, _download_media, tiktok_link, outtmpl, slideshow_path, format_id
+        file_id: str | None = None
+        storage_message_id: int | None = None
+        if STORAGE_CHAT_ID:
+            try:
+                storage_msg = await bot.send_video(
+                    chat_id=STORAGE_CHAT_ID,
+                    video=FSInputFile(str(video_path)),
+                    width=width,
+                    height=height,
+                    supports_streaming=True,
                 )
-
-                # Используем ID из скачивания (актуально для коротких ссылок)
-                final_id: str | None = tiktok_id or downloaded_id
-
-                # Ищем скачанный файл (расширение может отличаться от .mp4)
-                matches = [
-                    path for path in VIDEO_DIR.glob(f"{filename}.*")
-                    if path.suffix.lower() in _VIDEO_EXTENSIONS
-                ]
-                if not matches:
-                    raise FileNotFoundError(f"Файл после загрузки не найден: {filename}")
-                video_path = matches[0]
-                if video_path.stat().st_size > MAX_SOURCE_VIDEO_BYTES:
-                    raise VideoTooLargeError
-
-                video_path, media_probe = await loop.run_in_executor(
-                    None,
-                    _prepare_telegram_video,
-                    video_path,
-                )
-                width = media_probe.width or width
-                height = media_probe.height or height
-                duration = media_probe.duration or duration
-
-                if (
-                    not isinstance(duration, (int, float))
-                    or not math.isfinite(duration)
-                    or duration <= 0
-                ):
-                    duration = await loop.run_in_executor(None, _probe_duration, video_path)
-                parts, part_dir = await loop.run_in_executor(None, _split_video, video_path, duration)
-                if len(parts) > 1:
-                    if inline_message_id:
-                        raise InlineSplitError
-                    if can_attach_music_link(without_description):
-                        _, music_deep_link = await prepare_music_caption_link(
-                            bot,
-                            session,
-                            source_url,
-                            format_id,
-                        )
-                    for number, part in enumerate(parts, start=1):
-                        part_description = f"Часть {number}/{len(parts)}"
-                        if number == 1 and description:
-                            part_description = f"{part_description}\n\n{description}"
-                        for attempt in range(2):
-                            try:
-                                await _deliver_video(
-                                    bot, chat_id, None,
-                                    file_id=None, video_path=part,
-                                    width=width, height=height,
-                                    description=part_description, source_url=source_url if number == 1 else None,
-                                    likes=likes if number == 1 else None,
-                                    reply_to_message_id=reply_to_message_id,
-                                    placeholder_message_id=placeholder_message_id,
-                                    has_spoiler=has_spoiler,
-                                    without_description=without_description,
-                                    music_deep_link=(
-                                        music_deep_link if number == 1 else None
-                                    ),
-                                )
-                                break
-                            except TelegramRetryAfter as error:
-                                if attempt:
-                                    raise
-                                await asyncio.sleep(error.retry_after)
-                        placeholder_message_id = None
-                        part.unlink(missing_ok=True)
-                    video_path.unlink(missing_ok=True)
-                    await session.delete(item)
-                    await session.commit()
-                    continue
-
-                # 4. Отправляем в Storage-канал
-                file_id: str | None = None
-                storage_message_id: int | None = None
-
-                if STORAGE_CHAT_ID:
-                    try:
-                        storage_msg = await bot.send_video(
-                            chat_id=STORAGE_CHAT_ID,
-                            video=FSInputFile(str(video_path)),
-                            width=width,
-                            height=height,
-                            supports_streaming=True,
-                        )
-                        if storage_msg.video:
-                            file_id = storage_msg.video.file_id
-                            storage_message_id = storage_msg.message_id
-                            logging.info(
-                                "Storage: tiktok_id=%s → message_id=%s",
-                                final_id, storage_message_id,
-                            )
-                    except (TelegramBadRequest, TelegramForbiddenError) as e:
-                        logging.warning("Не удалось отправить в Storage-канал: %s", e)
-
-                # 5. Доставляем видео
-                if can_attach_music_link(without_description):
-                    _, music_deep_link = await prepare_music_caption_link(
-                        bot,
-                        session,
-                        source_url,
-                        format_id,
+                if storage_msg.video:
+                    file_id = storage_msg.video.file_id
+                    storage_message_id = storage_msg.message_id
+                    logging.info(
+                        "Storage: tiktok_id=%s → message_id=%s",
+                        final_id,
+                        storage_message_id,
                     )
-                result_file_id = await _deliver_video(
-                    bot, chat_id, inline_message_id,
-                    file_id=file_id, video_path=video_path,
-                    width=width, height=height,
-                    description=description, source_url=source_url,
-                    likes=likes,
-                    reply_to_message_id=reply_to_message_id,
-                    placeholder_message_id=placeholder_message_id,
-                    has_spoiler=has_spoiler,
-                    without_description=without_description,
-                    music_deep_link=music_deep_link,
-                )
-                if result_file_id and not file_id:
-                    file_id = result_file_id  # сохраним для кеша
-                # 6. Удаляем файл и кешируем
-                os.remove(video_path)
+            except (TelegramBadRequest, TelegramForbiddenError) as error:
+                logging.warning("Не удалось отправить в Storage-канал: %s", error)
 
-                if format_id is None and final_id and file_id:
-                    final_cache_key = _media_cache_key(final_id)
-                    if cached and cached.tiktok_id == final_cache_key:
-                        cached.file_id = file_id
-                        cached.storage_message_id = storage_message_id
-                        cached.description = description
-                    else:
-                        session.add(VideoCache(
-                            tiktok_id=final_cache_key,
-                            file_id=file_id,
-                            storage_message_id=storage_message_id,
-                            description=description,
-                            music_tracks=None,
-                        ))
+        if can_attach_music_link(without_description):
+            _, music_deep_link = await prepare_music_caption_link(
+                bot,
+                source_url,
+                format_id,
+            )
+        result_file_id = await _deliver_video(
+            bot,
+            chat_id,
+            inline_message_id,
+            file_id=file_id,
+            video_path=video_path,
+            width=width,
+            height=height,
+            description=description,
+            source_url=source_url,
+            likes=likes,
+            reply_to_message_id=reply_to_message_id,
+            placeholder_message_id=placeholder_message_id,
+            has_spoiler=has_spoiler,
+            without_description=without_description,
+            music_deep_link=music_deep_link,
+        )
+        if result_file_id and not file_id:
+            file_id = result_file_id
 
-                await session.delete(item)
-                await session.commit()
+        cache_update = None
+        if format_id is None and final_id and file_id:
+            cache_update = VideoCacheUpdate(
+                cache_key=_media_cache_key(final_id),
+                file_id=file_id,
+                storage_message_id=storage_message_id,
+                description=description,
+                source_url=source_url,
+                likes=likes,
+            )
+        _remove_download_files(filename)
+        await _finish_video_job(job.id, cache_update)
 
-            except MissingAudioError:
-                logging.warning("Источник не отдал аудиодорожку: chat=%s url=%s", chat_id, tiktok_link)
-                await session.rollback()
-                _remove_download_files(filename)
-                await _show_download_error(
-                    bot, chat_id, inline_message_id, placeholder_message_id,
-                    "❌ TikTok не отдал аудиодорожку. Видео не отправлено без звука — попробуйте позже.",
-                    source_url,
-                )
-                await session.delete(item)
-                await session.commit()
+    except MissingAudioError:
+        logging.warning("Источник не отдал аудиодорожку: chat=%s url=%s", chat_id, tiktok_link)
+        _remove_download_files(filename)
+        await _show_download_error(
+            bot,
+            chat_id,
+            inline_message_id,
+            placeholder_message_id,
+            "❌ TikTok не отдал аудиодорожку. Видео не отправлено без звука — попробуйте позже.",
+            source_url,
+        )
+        await _discard_job(job.id)
 
-            except MediaPreparationError:
-                logging.exception("Не удалось подготовить совместимое видео: chat=%s url=%s", chat_id, tiktok_link)
-                await session.rollback()
-                _remove_download_files(filename)
-                await _show_download_error(
-                    bot, chat_id, inline_message_id, placeholder_message_id,
-                    "❌ Не удалось загрузить видео.",
-                    source_url,
-                )
-                await session.delete(item)
-                await session.commit()
+    except MediaPreparationError:
+        logging.exception("Не удалось подготовить совместимое видео: chat=%s url=%s", chat_id, tiktok_link)
+        _remove_download_files(filename)
+        await _show_download_error(
+            bot,
+            chat_id,
+            inline_message_id,
+            placeholder_message_id,
+            "❌ Не удалось загрузить видео.",
+            source_url,
+        )
+        await _discard_job(job.id)
 
-            except VideoTooLargeError:
-                logging.info("Видео больше 1 GB: chat=%s url=%s", chat_id, tiktok_link)
-                await session.rollback()
-                _remove_download_files(filename)
-                await _show_download_error(
-                    bot, chat_id, inline_message_id, placeholder_message_id,
-                    "❌ Видео больше 1 ГБ. Выберите другое качество.",
-                    source_url,
-                )
-                await session.delete(item)
-                await session.commit()
+    except VideoTooLargeError:
+        logging.info("Видео больше 1 GB: chat=%s url=%s", chat_id, tiktok_link)
+        _remove_download_files(filename)
+        await _show_download_error(
+            bot,
+            chat_id,
+            inline_message_id,
+            placeholder_message_id,
+            "❌ Видео больше 1 ГБ. Выберите другое качество.",
+            source_url,
+        )
+        await _discard_job(job.id)
 
-            except InlineSplitError:
-                _remove_download_files(filename)
-                await _show_download_error(
-                    bot, chat_id, inline_message_id, placeholder_message_id,
-                    "❌ Большие видео отправляются частями только в личном чате с ботом.",
-                    source_url,
-                )
-                await session.delete(item)
-                await session.commit()
+    except InlineSplitError:
+        _remove_download_files(filename)
+        await _show_download_error(
+            bot,
+            chat_id,
+            inline_message_id,
+            placeholder_message_id,
+            "❌ Большие видео отправляются частями только в личном чате с ботом.",
+            source_url,
+        )
+        await _discard_job(job.id)
 
-            except VideoSplitError:
-                logging.warning("Не удалось разделить видео: chat=%s url=%s", chat_id, tiktok_link)
-                _remove_download_files(filename)
-                await _show_download_error(
-                    bot, chat_id, inline_message_id, placeholder_message_id,
-                    "❌ Не удалось безопасно разделить видео. Выберите другое качество.",
-                    source_url,
-                )
-                await session.delete(item)
-                await session.commit()
+    except VideoSplitError:
+        logging.warning("Не удалось разделить видео: chat=%s url=%s", chat_id, tiktok_link)
+        _remove_download_files(filename)
+        await _show_download_error(
+            bot,
+            chat_id,
+            inline_message_id,
+            placeholder_message_id,
+            "❌ Не удалось безопасно разделить видео. Выберите другое качество.",
+            source_url,
+        )
+        await _discard_job(job.id)
 
-            except (TelegramBadRequest, TelegramForbiddenError) as e:
-                logging.warning("Telegram delivery error for chat %s: %s", chat_id, e)
-                _remove_download_files(filename)
-                await _show_download_error(
-                    bot, chat_id, inline_message_id, placeholder_message_id,
-                    "❌ Не удалось доставить видео. Возможно, оно слишком большое.",
-                    source_url,
-                )
-                await session.delete(item)
-                await session.commit()
+    except (TelegramBadRequest, TelegramForbiddenError) as error:
+        logging.warning("Telegram delivery error for chat %s: %s", chat_id, error)
+        _remove_download_files(filename)
+        await _show_download_error(
+            bot,
+            chat_id,
+            inline_message_id,
+            placeholder_message_id,
+            "❌ Не удалось доставить видео. Возможно, оно слишком большое.",
+            source_url,
+        )
+        await _discard_job(job.id)
 
-            except Exception:
-                logging.exception("Ошибка загрузки: chat=%s url=%s", chat_id, tiktok_link)
-                await session.rollback()
-                _remove_download_files(filename)
-                await _show_download_error(
-                    bot, chat_id, inline_message_id, placeholder_message_id,
-                    "❌ Не удалось скачать видео. Попробуй ещё раз.",
-                    source_url,
-                )
-                await asyncio.sleep(3)
-                await session.delete(item)
-                await session.commit()
-            finally:
-                if part_dir:
-                    shutil.rmtree(part_dir, ignore_errors=True)
-                if placeholder_for_cleanup:
-                    _placeholder_ready_at.pop((chat_id, placeholder_for_cleanup), None)
-                if inline_message_id:
-                    _inline_placeholder_ready_at.pop(inline_message_id, None)
+    except Exception:
+        logging.exception("Ошибка загрузки: chat=%s url=%s", chat_id, tiktok_link)
+        _remove_download_files(filename)
+        await _show_download_error(
+            bot,
+            chat_id,
+            inline_message_id,
+            placeholder_message_id,
+            "❌ Не удалось скачать видео. Попробуй ещё раз.",
+            source_url,
+        )
+        await asyncio.sleep(3)
+        await _discard_job(job.id)
+    finally:
+        if part_dir:
+            shutil.rmtree(part_dir, ignore_errors=True)
+        if placeholder_for_cleanup:
+            _placeholder_ready_at.pop((chat_id, placeholder_for_cleanup), None)
+        if inline_message_id:
+            _inline_placeholder_ready_at.pop(inline_message_id, None)
+
+
+async def _process_music_job_legacy(bot: Bot, job: QueueJob) -> None:
+    async with SessionLocal() as session:
+        item = await session.get(DownloadQueue, job.id)
+        if item is None:
+            return
+        if item.chat_id is None or item.filename is None or item.tiktok_link is None:
+            await session.delete(item)
+            await session.commit()
+            return
+        await _process_music_job(
+            bot,
+            session,
+            item,
+            job.inline_message_id.removeprefix(MUSIC_JOB_PREFIX),
+        )
 
 
 async def process_queue(bot: Bot) -> None:
     """Фоновый цикл обработки очереди загрузок."""
     while True:
         job = await _wait_for_next_job()
-        await _process_queue_job_legacy(bot, job)
+        if job.is_music:
+            await _process_music_job_legacy(bot, job)
+        else:
+            await _process_video_job(bot, job)

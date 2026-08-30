@@ -1,6 +1,5 @@
 import unittest
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 from aiogram.enums import ParseMode
 
@@ -57,40 +56,19 @@ class ErrorSourceLinkTests(unittest.IsolatedAsyncioTestCase):
 
 
 class QueueErrorMessageTests(unittest.IsolatedAsyncioTestCase):
-    async def test_media_preparation_failure_reports_video_download_failure(self):
+    async def test_inspection_failure_reports_video_download_failure(self):
         source_url = "https://www.tiktok.com/@author/video/123"
-        item = SimpleNamespace(
-            id=1,
-            chat_id="123",
-            user_id="456",
-            filename="failed-download",
-            tiktok_link=source_url,
-            format_id=None,
-            inline_message_id=None,
-            reply_to_message_id=None,
-            enqueued_at=None,
-        )
         job = queue.QueueJob(
-            item.id,
-            item.chat_id,
-            item.user_id,
-            item.filename,
-            item.tiktok_link,
-            item.format_id,
-            item.reply_to_message_id,
-            item.inline_message_id,
-            item.enqueued_at,
+            1,
+            "123",
+            "456",
+            "failed-inspection",
+            source_url,
+            None,
+            None,
+            None,
+            None,
         )
-
-        class QueueStopped(Exception):
-            pass
-
-        session = AsyncMock()
-        session.get.return_value = item
-        session_context = MagicMock()
-        session_context.__aenter__ = AsyncMock(return_value=session)
-        session_context.__aexit__ = AsyncMock(return_value=False)
-        session_factory = MagicMock(return_value=session_context)
 
         class BotStub:
             message_args = None
@@ -100,18 +78,83 @@ class QueueErrorMessageTests(unittest.IsolatedAsyncioTestCase):
 
         bot = BotStub()
         with (
-            patch.object(queue, "SessionLocal", session_factory),
+            patch.object(
+                queue,
+                "_find_worker_cached_video",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(queue, "_load_info_snapshot", return_value=None),
+            patch.object(queue, "inspect_media", side_effect=RuntimeError("inspect failed")),
+            patch.object(queue, "_discard_job", AsyncMock()),
+            patch.object(queue, "_remove_download_files"),
+            patch.object(queue.asyncio, "sleep", AsyncMock()),
+            self.assertLogs(level="ERROR"),
+        ):
+            await queue._process_video_job(bot, job)
+
+        self.assertTrue(
+            bot.message_args["text"].startswith("❌ Не удалось загрузить видео.\n\n")
+        )
+
+    async def test_media_preparation_failure_reports_video_download_failure(self):
+        source_url = "https://www.tiktok.com/@author/video/123"
+        job = queue.QueueJob(
+            1,
+            "123",
+            "456",
+            "failed-download",
+            source_url,
+            None,
+            None,
+            None,
+            None,
+        )
+        inspection = queue.MediaInspection(
+            "123",
+            source_url,
+            None,
+            None,
+            None,
+            None,
+            None,
+            (),
+            {"id": "123", "webpage_url": source_url},
+        )
+
+        class QueueStopped(Exception):
+            pass
+
+        class BotStub:
+            message_args = None
+
+            async def send_message(self, **kwargs):
+                self.message_args = kwargs
+
+        bot = BotStub()
+        with (
             patch.object(
                 queue,
                 "_wait_for_next_job",
                 AsyncMock(side_effect=[job, QueueStopped()]),
             ),
-            patch.object(queue, "_resolve_media", return_value=(None, source_url, None)),
+            patch.object(
+                queue,
+                "_find_worker_cached_video",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(queue, "_load_info_snapshot", return_value=inspection.info),
+            patch.object(queue, "_inspection_from_snapshot", return_value=inspection),
+            patch.object(
+                queue,
+                "_ydl_download_from_info_file",
+                side_effect=queue.MediaPreparationError("snapshot failed"),
+            ),
             patch.object(
                 queue,
                 "_download_media",
                 side_effect=queue.MediaPreparationError("download failed"),
             ),
+            patch.object(queue, "_discard_job", AsyncMock()),
             patch.object(queue, "_remove_download_files"),
         ):
             with self.assertLogs(level="ERROR"):

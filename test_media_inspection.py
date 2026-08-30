@@ -151,6 +151,78 @@ class MediaInspectionTests(unittest.TestCase):
             self.assertFalse(any(Path(directory).iterdir()))
 
 
+class InfoSnapshotWorkerFallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stale_info_snapshot_falls_back_to_url_downloader(self):
+        job = queue.QueueJob(
+            1,
+            "1",
+            "1",
+            "job",
+            SOURCE_URL,
+            None,
+            None,
+            None,
+            None,
+        )
+        inspection = queue.MediaInspection(
+            "123",
+            SOURCE_URL,
+            9,
+            "desc",
+            720,
+            1280,
+            10.0,
+            (),
+            {"id": "123", "webpage_url": SOURCE_URL},
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            video_path = Path(directory) / "job.mp4"
+
+            def fallback_download(*_args):
+                video_path.write_bytes(b"video")
+                return "123", 720, 1280, "desc", 10.0
+
+            with (
+                patch.object(queue, "VIDEO_DIR", Path(directory)),
+                patch.object(
+                    queue,
+                    "_find_worker_cached_video",
+                    AsyncMock(side_effect=[None, None]),
+                ),
+                patch.object(queue, "_load_info_snapshot", return_value=inspection.info),
+                patch.object(queue, "_inspection_from_snapshot", return_value=inspection),
+                patch.object(
+                    queue,
+                    "_ydl_download_from_info_file",
+                    side_effect=queue.MediaPreparationError("stale snapshot"),
+                ) as snapshot_download,
+                patch.object(
+                    queue,
+                    "_download_media",
+                    side_effect=fallback_download,
+                ) as url_download,
+                patch.object(
+                    queue,
+                    "_prepare_telegram_video",
+                    side_effect=queue.MediaPreparationError("stop after fallback"),
+                ),
+                patch.object(queue, "_discard_job", AsyncMock()),
+                patch.object(queue, "_show_download_error", AsyncMock()),
+                patch.object(queue, "_remove_download_files"),
+                self.assertLogs(level="ERROR"),
+            ):
+                await queue._process_video_job(MagicMock(), job)
+
+        snapshot_download.assert_called_once()
+        url_download.assert_called_once_with(
+            SOURCE_URL,
+            str(Path(directory) / "job.%(ext)s"),
+            Path(directory) / "job.mp4",
+            None,
+        )
+
+
 class PrivateInspectionTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         link_handler._pending.clear()

@@ -20,6 +20,16 @@ class CachedVideo:
     likes: int | None
 
 
+@dataclass(frozen=True)
+class VideoCacheUpdate:
+    cache_key: str
+    file_id: str
+    storage_message_id: int | None
+    description: str | None
+    source_url: str
+    likes: int | None
+
+
 def media_cache_key(media_id: str) -> str:
     return f"{MEDIA_CACHE_PROFILE}:{media_id}"
 
@@ -67,3 +77,32 @@ async def find_cached_video_by_id(
 async def invalidate_cached_video(session: AsyncSession, cache_key: str) -> None:
     await session.execute(delete(VideoCache).where(VideoCache.tiktok_id == cache_key))
     await session.commit()
+
+
+async def upsert_cached_video(
+    session: AsyncSession,
+    update: VideoCacheUpdate,
+) -> None:
+    result = await session.execute(
+        select(VideoCache).where(VideoCache.tiktok_id == update.cache_key)
+    )
+    cached = result.scalar_one_or_none()
+    if cached is None:
+        session.add(
+            VideoCache(
+                tiktok_id=update.cache_key,
+                file_id=update.file_id,
+                storage_message_id=update.storage_message_id,
+                description=update.description,
+                music_tracks=None,
+                source_url=update.source_url,
+                likes=update.likes,
+            )
+        )
+        return
+
+    cached.file_id = update.file_id
+    cached.storage_message_id = update.storage_message_id
+    cached.description = update.description
+    cached.source_url = update.source_url
+    cached.likes = update.likes
