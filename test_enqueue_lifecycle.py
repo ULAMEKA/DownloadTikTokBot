@@ -4,6 +4,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from aiogram.exceptions import TelegramNetworkError
+
 import handlers.link as link_handler
 import routers.inline_router as inline_handler
 import services.queue as queue
@@ -205,6 +207,53 @@ class PreEnqueueFailureLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 )
                 link_handler._pending.clear()
 
+    async def test_private_unexpected_snapshot_runtime_error_restores_pending_and_ui(self):
+        """Fails if an ordinary unexpected snapshot error loses taken private ownership."""
+        token = "unexpected-runtime"
+        callback, placeholder = self._private_callback(token)
+        pending = link_handler.PendingDownload(42, SOURCE_URL)
+        link_handler._pending[token] = pending
+        inspection = queue.MediaInspection(
+            identity=queue.MediaIdentity(queue.MediaProvider.TIKTOK, "123"),
+            source_url=SOURCE_URL,
+            likes=None,
+            description=None,
+            width=None,
+            height=None,
+            duration=None,
+            qualities=(),
+            info={"id": "123", "webpage_url": SOURCE_URL},
+        )
+        escaped = None
+
+        with (
+            patch("handlers.link.try_deliver_cached_video", AsyncMock(return_value=False)),
+            patch("handlers.link.inspect_media", return_value=inspection),
+            patch(
+                "handlers.link.write_info_snapshot",
+                side_effect=RuntimeError("unexpected serializer failure"),
+            ),
+            patch("handlers.link.logging.warning"),
+        ):
+            try:
+                await link_handler.handle_download_option(
+                    callback,
+                    SimpleNamespace(),
+                    SimpleNamespace(),
+                )
+            except RuntimeError as error:
+                escaped = error
+
+        self.assertIsNone(escaped)
+        self.assertIs(link_handler._pending[token], pending)
+        self.assertIsNone(pending.snapshot_path)
+        callback.message.answer_photo.assert_not_awaited()
+        self.assertEqual(
+            callback.message.answer.await_args.args[0],
+            "❌ Не удалось загрузить видео.",
+        )
+        self.assertFalse(queue._placeholder_ready_at)
+
     async def test_group_commit_failure_cleans_deadline_and_renders_terminal_error(self):
         """Fails if a group commit exception leaves a queue-owned placeholder behind."""
         placeholder = SimpleNamespace(message_id=17, delete=AsyncMock(), edit_caption=AsyncMock())
@@ -285,6 +334,45 @@ class PreEnqueueFailureLifecycleTests(unittest.IsolatedAsyncioTestCase):
             else bot.edit_message_text.await_args.kwargs.get("text")
         )
         self.assertIn("❌ Не удалось загрузить видео.", rendered)
+
+    async def test_inline_placeholder_network_error_is_terminal_and_never_enqueues(self):
+        """Fails if preliminary inline media edit escapes the pre-enqueue lifecycle."""
+        result = SimpleNamespace(
+            query=SOURCE_URL,
+            inline_message_id="network-inline-id",
+            result_id="download",
+            from_user=SimpleNamespace(id=42),
+        )
+        network_error = TelegramNetworkError(MagicMock(), "network failed")
+        caption_network_error = TelegramNetworkError(MagicMock(), "caption network failed")
+        bot = SimpleNamespace(
+            edit_message_media=AsyncMock(side_effect=network_error),
+            edit_message_caption=AsyncMock(side_effect=caption_network_error),
+            edit_message_text=AsyncMock(),
+            send_message=AsyncMock(),
+        )
+        enqueue = AsyncMock()
+        escaped = None
+
+        with (
+            patch("routers.inline_router._canonical_url", AsyncMock(return_value=SOURCE_URL)),
+            patch("routers.inline_router.try_deliver_cached_video", AsyncMock(return_value=False)),
+            patch("routers.inline_router.AD_PLACEHOLDER_PHOTO_FILE_ID", "placeholder-file-id"),
+            patch("routers.inline_router.enqueue_download", enqueue),
+            patch("routers.inline_router.logging.exception"),
+        ):
+            try:
+                await inline_handler.chosen_download(result, SimpleNamespace(), bot)
+            except TelegramNetworkError as error:
+                escaped = error
+
+        self.assertIsNone(escaped)
+        enqueue.assert_not_awaited()
+        self.assertNotIn("network-inline-id", queue._inline_placeholder_ready_at)
+        self.assertEqual(
+            bot.edit_message_text.await_args.kwargs["text"].split("\n", 1)[0],
+            "❌ Не удалось загрузить видео.",
+        )
 
 
 class PendingLifecycleTests(unittest.IsolatedAsyncioTestCase):

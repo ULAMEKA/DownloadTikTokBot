@@ -321,7 +321,7 @@ async def handle_download_option(callback: CallbackQuery, session: AsyncSession,
                 f"pending_{token}",
                 inspection.info,
             )
-        except (OSError, TypeError, ValueError) as error:
+        except Exception as error:
             logging.warning("Не удалось сохранить pending info snapshot: %s", error)
             _store_pending(token, pending)
             await _render_private_enqueue_error(

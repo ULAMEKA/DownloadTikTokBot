@@ -89,7 +89,7 @@ async def _render_inline_download_error(
             reply_markup=None,
         )
         return
-    except (TelegramBadRequest, TelegramForbiddenError):
+    except Exception:
         pass
     try:
         await bot.edit_message_text(
@@ -99,7 +99,7 @@ async def _render_inline_download_error(
             reply_markup=None,
         )
         return
-    except (TelegramBadRequest, TelegramForbiddenError):
+    except Exception:
         pass
     try:
         await bot.send_message(
@@ -107,7 +107,7 @@ async def _render_inline_download_error(
             text=error_text,
             parse_mode="HTML",
         )
-    except (TelegramBadRequest, TelegramForbiddenError):
+    except Exception:
         pass
 
 
@@ -186,8 +186,8 @@ async def chosen_download(result: ChosenInlineResult, session: AsyncSession, bot
         inline_message_id=inline_message_id,
     )
 
-    if raw_inline_message_id and AD_PLACEHOLDER_PHOTO_FILE_ID:
-        try:
+    try:
+        if raw_inline_message_id and AD_PLACEHOLDER_PHOTO_FILE_ID:
             await bot.edit_message_media(
                 inline_message_id=raw_inline_message_id,
                 media=InputMediaPhoto(
@@ -198,12 +198,8 @@ async def chosen_download(result: ChosenInlineResult, session: AsyncSession, bot
                 ),
                 reply_markup=_placeholder_markup(),
             )
-        except (TelegramBadRequest, TelegramForbiddenError):
-            pass
-
-    if raw_inline_message_id:
-        hold_inline_placeholder(raw_inline_message_id)
-    try:
+        if raw_inline_message_id:
+            hold_inline_placeholder(raw_inline_message_id)
         enqueued = await enqueue_download(session, queue_item, str(result.from_user.id))
     except Exception as error:
         logging.exception("Не удалось поставить inline-загрузку в очередь: %s", error)
