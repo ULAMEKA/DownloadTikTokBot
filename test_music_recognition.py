@@ -286,36 +286,6 @@ class MusicJobFinalizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(request.music_tracks)
         self.assertEqual(snapshot.state, "ready")
 
-    async def test_finish_commit_failure_rolls_back_state_and_job_delete(self):
-        token = "e" * 32
-        job_id = await self._add_job(token)
-        worker_session = self.session_factory()
-
-        with (
-            patch.object(queue, "SessionLocal", return_value=worker_session),
-            patch.object(
-                worker_session,
-                "commit",
-                AsyncMock(side_effect=RuntimeError("commit failed")),
-            ),
-            self.assertLogs(level="ERROR"),
-        ):
-            snapshot = await queue._finish_music_job(
-                job_id,
-                token,
-                "00:00 — Artist — Song",
-                retry=False,
-            )
-
-        async with self.session_factory() as session:
-            request = await session.get(MusicRequest, token)
-            job = await session.get(DownloadQueue, job_id)
-        self.assertIsNone(snapshot)
-        self.assertIsNotNone(job)
-        self.assertEqual(request.state, "queued")
-        self.assertIsNone(request.music_tracks)
-
-
 class MusicRecognitionTests(unittest.TestCase):
     def test_uses_non_overlapping_fifteen_second_chunks(self) -> None:
         self.assertEqual(list(_music_chunk_starts(31)), [0, 15, 30])

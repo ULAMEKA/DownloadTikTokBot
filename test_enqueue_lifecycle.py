@@ -189,6 +189,7 @@ class PreEnqueueFailureLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     patch("handlers.link.try_deliver_cached_video", AsyncMock(return_value=False)),
                     patch("handlers.link.inspect_media", return_value=inspection),
                     patch("handlers.link.write_info_snapshot", side_effect=error),
+                    self.assertLogs(level="WARNING"),
                 ):
                     await link_handler.handle_download_option(
                         callback,
@@ -220,6 +221,7 @@ class PreEnqueueFailureLifecycleTests(unittest.IsolatedAsyncioTestCase):
             patch("handlers.link._video_url_from_text", AsyncMock(return_value=SOURCE_URL)),
             patch("handlers.link.try_deliver_cached_video", AsyncMock(return_value=False)),
             patch("handlers.link.enqueue_download", AsyncMock(side_effect=OSError("commit failed"))),
+            self.assertLogs(level="ERROR"),
         ):
             await link_handler.handle_video_link_group(message, SimpleNamespace(), SimpleNamespace())
 
@@ -250,6 +252,7 @@ class PreEnqueueFailureLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 "routers.inline_router.enqueue_download",
                 AsyncMock(side_effect=OSError("commit failed")),
             ),
+            self.assertLogs(level="ERROR"),
         ):
             await inline_handler.chosen_download(result, SimpleNamespace(), bot)
 
@@ -299,27 +302,37 @@ class PendingLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_pending_is_bounded_globally(self):
         """Fails if private menus can grow beyond the global 256-entry cap."""
-        token_number = 0
+        created_tasks = []
 
-        def next_uuid():
-            nonlocal token_number
-            token_number += 1
-            return SimpleNamespace(hex=f"token-{token_number}")
+        class TaskStub:
+            def __init__(self, coroutine):
+                self.coroutine = coroutine
+                self.cancelled = False
 
-        with (
-            patch("handlers.link._video_url_from_text", AsyncMock(return_value=SOURCE_URL)),
-            patch("handlers.link.uuid.uuid4", side_effect=next_uuid),
-        ):
+            def cancel(self):
+                if not self.cancelled:
+                    self.cancelled = True
+                    self.coroutine.close()
+
+            def done(self):
+                return self.cancelled
+
+        def create_task(coroutine):
+            task = TaskStub(coroutine)
+            created_tasks.append(task)
+            return task
+
+        with patch("handlers.link.asyncio.create_task", side_effect=create_task):
             for user_id in range(257):
-                message = SimpleNamespace(
-                    text=SOURCE_URL,
-                    chat=SimpleNamespace(id=user_id),
-                    answer=AsyncMock(),
+                link_handler._store_pending(
+                    f"token-{user_id + 1}",
+                    link_handler.PendingDownload(user_id, SOURCE_URL),
                 )
-                await link_handler.handle_video_link_private(message)
 
         self.assertEqual(len(link_handler._pending), 256)
         self.assertNotIn("token-1", link_handler._pending)
+        for task in created_tasks:
+            task.cancel()
 
     async def test_expiry_deletes_disk_snapshot_without_wall_clock_sleep(self):
         """Fails if TTL expiry removes metadata but leaves its info JSON on disk."""

@@ -92,15 +92,28 @@ class MediaInspectionTests(unittest.TestCase):
             self.assertFalse(temporary_path.exists())
 
             path.write_text("[]", encoding="utf-8")
-            self.assertIsNone(queue._load_info_snapshot("job"))
+            with self.assertRaises(queue.StaleInfoSnapshotError):
+                queue._load_info_snapshot("job")
 
-    def test_corrupt_snapshot_returns_none(self):
+    def test_corrupt_snapshot_raises_typed_stale_error(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(
             queue, "VIDEO_DIR", Path(directory)
         ):
             (Path(directory) / "job.info.json").write_text("{broken", encoding="utf-8")
 
-            self.assertIsNone(queue._load_info_snapshot("job"))
+            with self.assertRaises(queue.StaleInfoSnapshotError):
+                queue._load_info_snapshot("job")
+
+    def test_permission_error_is_not_classified_as_stale_snapshot(self):
+        """Fails if a local permission/ENOSPC error triggers a second extractor path."""
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            queue, "VIDEO_DIR", Path(directory)
+        ):
+            snapshot = Path(directory) / "job.info.json"
+            snapshot.write_text("{}", encoding="utf-8")
+            with patch.object(Path, "read_text", side_effect=PermissionError("denied")):
+                with self.assertRaises(PermissionError):
+                    queue._load_info_snapshot("job")
 
     def test_download_from_info_file_uses_snapshot_and_rejects_nonzero_exit(self):
         info = {
@@ -158,7 +171,7 @@ class MediaInspectionTests(unittest.TestCase):
 
 
 class InfoSnapshotWorkerFallbackTests(unittest.IsolatedAsyncioTestCase):
-    async def test_stale_info_snapshot_falls_back_to_url_downloader(self):
+    async def test_typed_snapshot_download_failure_calls_gallery_directly(self):
         job = queue.QueueJob(
             1,
             "1",
@@ -201,13 +214,14 @@ class InfoSnapshotWorkerFallbackTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(
                     queue,
                     "_ydl_download_from_info_file",
-                    side_effect=queue.MediaPreparationError("stale snapshot"),
+                    side_effect=queue.InfoSnapshotDownloadError("stale snapshot"),
                 ) as snapshot_download,
                 patch.object(
                     queue,
-                    "_download_media",
+                    "_gallery_download",
                     side_effect=fallback_download,
-                ) as url_download,
+                ) as gallery_download,
+                patch.object(queue, "_download_media") as url_download,
                 patch.object(
                     queue,
                     "_prepare_telegram_video",
@@ -221,12 +235,82 @@ class InfoSnapshotWorkerFallbackTests(unittest.IsolatedAsyncioTestCase):
                 await queue._process_video_job(MagicMock(), job)
 
         snapshot_download.assert_called_once()
-        url_download.assert_called_once_with(
+        gallery_download.assert_called_once_with(
             SOURCE_URL,
-            str(Path(directory) / "job.%(ext)s"),
             Path(directory) / "job.mp4",
-            None,
         )
+        url_download.assert_not_called()
+
+    async def test_unexpected_snapshot_error_never_starts_a_second_downloader(self):
+        """Fails if programming/local errors are mistaken for an expiring media URL."""
+        job = queue.QueueJob(2, "1", "1", "job", SOURCE_URL, None, None, None, None)
+        inspection = queue.MediaInspection(
+            queue.MediaIdentity(queue.MediaProvider.TIKTOK, "123"),
+            SOURCE_URL,
+            None,
+            None,
+            None,
+            None,
+            None,
+            (),
+            {"id": "123", "webpage_url": SOURCE_URL},
+        )
+        show_error = AsyncMock()
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(queue, "VIDEO_DIR", Path(directory)),
+                patch.object(queue, "_find_worker_cached_video", AsyncMock(return_value=None)),
+                patch.object(queue, "_load_info_snapshot", return_value=inspection.info),
+                patch.object(queue, "_inspection_from_snapshot", return_value=inspection),
+                patch.object(
+                    queue,
+                    "_ydl_download_from_info_file",
+                    side_effect=RuntimeError("programming error"),
+                ),
+                patch.object(queue, "_download_media") as url_download,
+                patch.object(queue, "_gallery_download") as gallery_download,
+                patch.object(queue, "_discard_job", AsyncMock()),
+                patch.object(queue, "_show_download_error", show_error),
+                patch.object(queue, "_remove_download_files"),
+                patch.object(queue.asyncio, "sleep", AsyncMock()),
+                self.assertLogs(level="ERROR"),
+            ):
+                await queue._process_video_job(MagicMock(), job)
+
+        url_download.assert_not_called()
+        gallery_download.assert_not_called()
+        self.assertEqual(show_error.await_args.args[4], "❌ Не удалось загрузить видео.")
+
+    async def test_snapshot_permission_error_never_reextracts(self):
+        """Fails if _load_info_snapshot swallows a local OSError as a restart miss."""
+        job = queue.QueueJob(3, "1", "1", "job", SOURCE_URL, None, None, None, None)
+        inspect = MagicMock()
+        show_error = AsyncMock()
+
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "job.info.json").write_text("{}", encoding="utf-8")
+            with (
+                patch.object(queue, "VIDEO_DIR", Path(directory)),
+                patch.object(queue, "_find_worker_cached_video", AsyncMock(return_value=None)),
+                patch.object(Path, "read_text", side_effect=PermissionError("denied")),
+                patch.object(queue, "inspect_media", inspect),
+                patch.object(queue, "_ydl_download_from_info_file") as snapshot_download,
+                patch.object(queue, "_download_media") as url_download,
+                patch.object(queue, "_gallery_download") as gallery_download,
+                patch.object(queue, "_discard_job", AsyncMock()),
+                patch.object(queue, "_show_download_error", show_error),
+                patch.object(queue, "_remove_download_files"),
+                patch.object(queue.asyncio, "sleep", AsyncMock()),
+                self.assertLogs(level="ERROR"),
+            ):
+                await queue._process_video_job(MagicMock(), job)
+
+        inspect.assert_not_called()
+        snapshot_download.assert_not_called()
+        url_download.assert_not_called()
+        gallery_download.assert_not_called()
+        self.assertEqual(show_error.await_args.args[4], "❌ Не удалось загрузить видео.")
 
 
 class PrivateInspectionTests(unittest.IsolatedAsyncioTestCase):

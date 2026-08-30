@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import services.queue as queue
@@ -217,6 +219,31 @@ class VideoQualityTests(unittest.TestCase):
             _next_segment_time_seconds(60, MAX_TELEGRAM_PART_BYTES * 2),
             28,
         )
+
+    def test_split_reports_real_ffmpeg_attempt_count(self):
+        """Fails if adaptive split retries are absent from required telemetry."""
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            queue,
+            "VIDEO_DIR",
+            Path(directory),
+        ), patch.object(queue, "MAX_TELEGRAM_PART_BYTES", 10):
+            video = Path(directory) / "large.mp4"
+            video.write_bytes(b"x" * 100)
+            ffmpeg_calls = 0
+
+            def split_once(command, **_kwargs):
+                nonlocal ffmpeg_calls
+                ffmpeg_calls += 1
+                output_dir = Path(command[-1]).parent
+                size = 20 if ffmpeg_calls == 1 else 5
+                (output_dir / "part_000.mp4").write_bytes(b"x" * size)
+
+            with patch.object(queue.subprocess, "run", side_effect=split_once):
+                outcome = queue._split_video(video, duration=10.0)
+
+            self.assertEqual(outcome.attempts, 2)
+            self.assertEqual(len(outcome.parts), 1)
+            self.assertEqual(outcome.parts[0].stat().st_size, 5)
 
 
 if __name__ == "__main__":

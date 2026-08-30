@@ -52,6 +52,11 @@ class CachedDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(queue, "find_cached_video", AsyncMock(return_value=cached)),
+            patch.object(
+                queue,
+                "prepare_music_caption_link",
+                AsyncMock(return_value=(None, None)),
+            ),
             patch.object(queue, "deliver_cached_video", AsyncMock(side_effect=error)),
             patch.object(queue, "invalidate_cached_video", AsyncMock()) as invalidate,
         ):
@@ -70,6 +75,11 @@ class CachedDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(queue, "find_cached_video", AsyncMock(return_value=cached)),
+            patch.object(
+                queue,
+                "prepare_music_caption_link",
+                AsyncMock(return_value=(None, None)),
+            ),
             patch.object(queue, "deliver_cached_video", AsyncMock(side_effect=error)),
             patch.object(queue, "invalidate_cached_video", AsyncMock()) as invalidate,
         ):

@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
+from typing import Awaitable, Callable, TypeVar
 
 import imageio_ffmpeg
 import yt_dlp
@@ -79,6 +80,8 @@ MUSIC_JOB_PREFIX = "music:"
 MUSIC_PAGE_PREFIX = "music_page:"
 MUSIC_START_PREFIX = "music_"
 QUEUE_WAKEUP_TIMEOUT_SECONDS = 60.0
+FINALIZATION_RETRY_INITIAL_SECONDS = 0.25
+FINALIZATION_RETRY_MAX_SECONDS = 5.0
 VIDEO_TRANSCODE_CRF = 18
 QUEUE_LIMIT_MESSAGE = (
     "Можно поставить в очередь не больше 2 видео одновременно. "
@@ -136,6 +139,13 @@ class PreparedVideo:
 
 
 @dataclass(frozen=True)
+class VideoSplitOutcome:
+    parts: list[Path]
+    part_dir: Path | None
+    attempts: int
+
+
+@dataclass(frozen=True)
 class QueueJob:
     id: int
     chat_id: str
@@ -173,6 +183,7 @@ _METRIC_STAGE_NAMES = (
     "inspect",
     "download",
     "prepare",
+    "split",
     "storage",
     "delivery",
 )
@@ -183,6 +194,9 @@ class JobStageMetrics:
     job_id: int
     started_at: float = field(default_factory=lambda: time.monotonic())
     durations_ms: dict[str, int] = field(default_factory=dict)
+    download_backend: str = "none"
+    download_fallback: str = "none"
+    split_attempts: int = 0
 
     @contextmanager
     def stage(self, name: str):
@@ -211,11 +225,31 @@ class JobStageMetrics:
             safe_ffmpeg_bypassed = "false"
         else:
             safe_ffmpeg_bypassed = "null"
+        safe_download_backend = (
+            self.download_backend
+            if self.download_backend in {"none", "info_snapshot", "url", "gallery"}
+            else "unknown"
+        )
+        safe_download_fallback = (
+            self.download_fallback
+            if self.download_fallback in {"none", "gallery"}
+            else "unknown"
+        )
+        safe_split_attempts = (
+            min(12, self.split_attempts)
+            if isinstance(self.split_attempts, int)
+            and not isinstance(self.split_attempts, bool)
+            and self.split_attempts > 0
+            else 0
+        )
         fields = [
             "job_stage_summary",
             f"job_id={self.job_id}",
             f"cache_status={safe_cache_status}",
             f"ffmpeg_bypassed={safe_ffmpeg_bypassed}",
+            f"download_backend={safe_download_backend}",
+            f"download_fallback={safe_download_fallback}",
+            f"split_attempts={safe_split_attempts}",
         ]
         if queue_wait_ms is not None:
             fields.append(f"queue_wait_ms={queue_wait_ms}")
@@ -255,6 +289,7 @@ def _queue_wait_ms(
 
 
 MusicTrack = tuple[int, str, str]
+_FinalizationResult = TypeVar("_FinalizationResult")
 
 
 class VideoTooLargeError(Exception):
@@ -274,6 +309,14 @@ class MissingAudioError(Exception):
 
 
 class MediaPreparationError(Exception):
+    pass
+
+
+class StaleInfoSnapshotError(MediaPreparationError):
+    pass
+
+
+class InfoSnapshotDownloadError(MediaPreparationError):
     pass
 
 
@@ -620,12 +663,16 @@ def move_info_snapshot(snapshot_path: Path, filename: str) -> Path:
     return destination
 
 
-def _load_info_snapshot(filename: str) -> dict[str, object] | None:
+def _load_info_snapshot(filename: str) -> dict[str, object]:
     try:
         loaded = json.loads(_info_snapshot_path(filename).read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return None
-    return loaded if isinstance(loaded, dict) else None
+    except FileNotFoundError as error:
+        raise StaleInfoSnapshotError("Info snapshot отсутствует") from error
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise StaleInfoSnapshotError("Info snapshot повреждён") from error
+    if not isinstance(loaded, dict):
+        raise StaleInfoSnapshotError("Info snapshot имеет неверный тип")
+    return loaded
 
 
 def _resolve_media(url: str) -> tuple[str | None, str, int | None]:
@@ -721,12 +768,10 @@ def _ydl_download_from_info_file(
                 with _ydl_lock, yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore[arg-type]
                     return_code = ydl.download_with_info_file(str(info_path))
                 if return_code:
-                    raise MediaPreparationError(
+                    raise InfoSnapshotDownloadError(
                         f"yt-dlp завершился с кодом {return_code}"
                     )
                 info = _load_info_snapshot(info_path.name.removesuffix(".info.json"))
-                if info is None:
-                    raise MediaPreparationError("Не удалось прочитать метаданные загрузки")
                 expected_size = _to_int(info.get("filesize") or info.get("filesize_approx"))
                 if expected_size is not None and expected_size > MAX_SOURCE_VIDEO_BYTES:
                     raise VideoTooLargeError
@@ -740,11 +785,17 @@ def _ydl_download_from_info_file(
                 )
             except VideoTooLargeError:
                 raise
-            except Exception as error:
+            except (
+                InfoSnapshotDownloadError,
+                StaleInfoSnapshotError,
+                yt_dlp.utils.DownloadError,
+            ) as error:
                 last_error = error
                 if index + 1 < len(variants):
                     logging.info("yt-dlp: повторяем загрузку info-файла с cookies")
-    raise MediaPreparationError("yt-dlp не смог скачать медиа из info-файла") from last_error
+    raise InfoSnapshotDownloadError(
+        "yt-dlp не смог скачать медиа из info-файла"
+    ) from last_error
 
 
 def _parse_frame_rate(value: object) -> float | None:
@@ -1390,13 +1441,20 @@ def _download_media(
     outtmpl: str,
     slideshow_path: Path,
     format_id: str | None = None,
+    metrics: JobStageMetrics | None = None,
 ) -> tuple[str | None, int | None, int | None, str | None, float | None]:
+    if metrics is not None:
+        metrics.download_backend = "url"
     try:
-        return _ydl_download(url, outtmpl, format_id)
+        downloaded = _ydl_download(url, outtmpl, format_id)
+        return downloaded
     except VideoTooLargeError:
         raise
     except Exception as error:
         logging.info("yt-dlp не скачал медиа, используем fallback: %s", error)
+        if metrics is not None:
+            metrics.download_backend = "gallery"
+            metrics.download_fallback = "gallery"
         downloaded = _gallery_download(url, slideshow_path)
         if downloaded is not None:
             return downloaded
@@ -1419,16 +1477,16 @@ def _next_segment_time_seconds(part_seconds: int, largest_size: int) -> int:
     return min(part_seconds - 1, max(1, estimate))
 
 
-def _split_video(video_path: Path, duration: float | None) -> tuple[list[Path], Path | None]:
+def _split_video(video_path: Path, duration: float | None) -> VideoSplitOutcome:
     size = video_path.stat().st_size
     if size <= MAX_TELEGRAM_PART_BYTES:
-        return [video_path], None
+        return VideoSplitOutcome([video_path], None, 0)
 
     part_dir = Path(tempfile.mkdtemp(dir=VIDEO_DIR, prefix=f"{video_path.stem}_parts_"))
     part_seconds = _segment_time_seconds(size, duration)
     suffix = video_path.suffix
     try:
-        for _ in range(6):
+        for attempt in range(1, 7):
             for part in part_dir.iterdir():
                 part.unlink()
             output = part_dir / f"part_%03d{suffix}"
@@ -1447,7 +1505,7 @@ def _split_video(video_path: Path, duration: float | None) -> tuple[list[Path], 
             subprocess.run(command, check=True, capture_output=True)
             parts = sorted(part_dir.glob(f"part_*{suffix}"))
             if parts and all(part.stat().st_size <= MAX_TELEGRAM_PART_BYTES for part in parts):
-                return parts, part_dir
+                return VideoSplitOutcome(parts, part_dir, attempt)
             largest_size = max((part.stat().st_size for part in parts), default=0)
             part_seconds = _next_segment_time_seconds(part_seconds, largest_size)
     except Exception:
@@ -2061,7 +2119,13 @@ async def _recognize_music_from_source(
         loop = asyncio.get_running_loop()
         with _job_stage(metrics, "download"):
             _, _, _, _, duration = await loop.run_in_executor(
-                None, _download_media, tiktok_link, outtmpl, slideshow_path, format_id
+                None,
+                _download_media,
+                tiktok_link,
+                outtmpl,
+                slideshow_path,
+                format_id,
+                metrics,
             )
         matches = [
             path for path in VIDEO_DIR.glob(f"{filename}.*")
@@ -2099,31 +2163,61 @@ async def _load_music_request(token: str) -> MusicRequestSnapshot | None:
         return _music_request_snapshot(request)
 
 
+async def _retry_finalization_transaction(
+    job_id: int,
+    operation_name: str,
+    operation: Callable[[AsyncSession], Awaitable[_FinalizationResult]],
+) -> _FinalizationResult:
+    """Retry only a completed job's short DB transaction, with capped backoff."""
+    failures = 0
+    delay = FINALIZATION_RETRY_INITIAL_SECONDS
+    while True:
+        try:
+            async with SessionLocal() as session:
+                try:
+                    return await operation(session)
+                except Exception:
+                    try:
+                        await session.rollback()
+                    except Exception:
+                        logging.exception(
+                            "Не удалось откатить DB finalization: operation=%s job_id=%s",
+                            operation_name,
+                            job_id,
+                        )
+                    raise
+        except Exception:
+            failures += 1
+            logging.exception(
+                "DB finalization retry: operation=%s job_id=%s attempt=%s delay=%.2f",
+                operation_name,
+                job_id,
+                failures,
+                delay,
+            )
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, FINALIZATION_RETRY_MAX_SECONDS)
+
+
 async def _finish_music_job(
     job_id: int,
     token: str,
     music_tracks: str | None,
     retry: bool,
 ) -> MusicRequestSnapshot | None:
-    async with SessionLocal() as session:
-        try:
-            request = await session.get(MusicRequest, token)
-            item = await session.get(DownloadQueue, job_id)
-            if request is not None:
-                request.state = "ready" if retry else "done"
-                if not retry:
-                    request.music_tracks = music_tracks or ""
-            if item is not None:
-                await session.delete(item)
-            await session.commit()
-            return _music_request_snapshot(request) if request is not None else None
-        except Exception:
-            await session.rollback()
-            logging.exception(
-                "Не удалось завершить задачу распознавания: job_id=%s",
-                job_id,
-            )
-            return None
+    async def finish(session: AsyncSession) -> MusicRequestSnapshot | None:
+        request = await session.get(MusicRequest, token)
+        item = await session.get(DownloadQueue, job_id)
+        if request is not None:
+            request.state = "ready" if retry else "done"
+            if not retry:
+                request.music_tracks = music_tracks or ""
+        if item is not None:
+            await session.delete(item)
+        await session.commit()
+        return _music_request_snapshot(request) if request is not None else None
+
+    return await _retry_finalization_transaction(job_id, "finish_music", finish)
 
 
 async def _process_music_job(
@@ -2376,29 +2470,29 @@ async def _invalidate_worker_cached_video(cache_key: str) -> None:
 
 
 async def _discard_job(job_id: int) -> None:
-    async with SessionLocal() as session:
+    async def discard(session: AsyncSession) -> None:
         item = await session.get(DownloadQueue, job_id)
         if item is not None:
             await session.delete(item)
             await session.commit()
+
+    await _retry_finalization_transaction(job_id, "discard", discard)
 
 
 async def _finish_video_job(
     job_id: int,
     cache_update: VideoCacheUpdate | None,
 ) -> None:
-    async with SessionLocal() as session:
-        try:
-            item = await session.get(DownloadQueue, job_id)
-            if item is None:
-                return
-            if cache_update is not None:
-                await upsert_cached_video(session, cache_update)
-            await session.delete(item)
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            logging.exception("Не удалось завершить задачу загрузки: job_id=%s", job_id)
+    async def finish(session: AsyncSession) -> None:
+        item = await session.get(DownloadQueue, job_id)
+        if item is None:
+            return
+        if cache_update is not None:
+            await upsert_cached_video(session, cache_update)
+        await session.delete(item)
+        await session.commit()
+
+    await _retry_finalization_transaction(job_id, "finish_video", finish)
 
 
 async def _try_deliver_worker_cache(
@@ -2451,7 +2545,7 @@ async def _try_deliver_worker_cache(
 async def _process_video_job(bot: Bot, job: QueueJob) -> None:
     metrics = JobStageMetrics(job_id=job.id)
     queue_wait_ms = _queue_wait_ms(job.enqueued_at)
-    cache_status = "miss"
+    cache_status = "not_applicable" if job.format_id is not None else "miss"
     ffmpeg_bypassed: bool | None = None
     if job.chat_id is None or job.filename is None or job.tiktok_link is None:
         try:
@@ -2523,7 +2617,10 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                     return
 
         with metrics.stage("inspect"):
-            snapshot = _load_info_snapshot(filename)
+            try:
+                snapshot = _load_info_snapshot(filename)
+            except StaleInfoSnapshotError:
+                snapshot = None
             if snapshot is None:
                 try:
                     inspection = await loop.run_in_executor(None, inspect_media, tiktok_link)
@@ -2560,6 +2657,7 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
         slideshow_path = VIDEO_DIR / f"{filename}.mp4"
         with metrics.stage("download"):
             try:
+                metrics.download_backend = "info_snapshot"
                 downloaded = await loop.run_in_executor(
                     None,
                     _ydl_download_from_info_file,
@@ -2570,16 +2668,18 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                 )
             except VideoTooLargeError:
                 raise
-            except Exception as error:
-                logging.info("Info snapshot download failed, using URL fallback: %s", error)
+            except InfoSnapshotDownloadError as error:
+                logging.info("Info snapshot download failed, using gallery fallback: %s", error)
+                metrics.download_backend = "gallery"
+                metrics.download_fallback = "gallery"
                 downloaded = await loop.run_in_executor(
                     None,
-                    _download_media,
+                    _gallery_download,
                     tiktok_link,
-                    outtmpl,
                     slideshow_path,
-                    format_id,
                 )
+                if downloaded is None:
+                    raise MediaPreparationError("Fallback не скачал медиа") from error
         downloaded_id, width, height, description, duration = downloaded
         final_identity = (
             inspection.identity
@@ -2615,19 +2715,23 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
             height = media_probe.height or height
             duration = media_probe.duration or duration
 
-            with metrics.stage("prepare"):
-                if (
-                    not isinstance(duration, (int, float))
-                    or not math.isfinite(duration)
-                    or duration <= 0
-                ):
+            if (
+                not isinstance(duration, (int, float))
+                or not math.isfinite(duration)
+                or duration <= 0
+            ):
+                with metrics.stage("prepare"):
                     duration = await loop.run_in_executor(None, _probe_duration, video_path)
-                parts, part_dir = await loop.run_in_executor(
+            with metrics.stage("split"):
+                split_outcome = await loop.run_in_executor(
                     None,
                     _split_video,
                     video_path,
                     duration,
                 )
+            parts = split_outcome.parts
+            part_dir = split_outcome.part_dir
+            metrics.split_attempts += split_outcome.attempts
             successful_sends = 0
             try:
                 if len(parts) > 1:
@@ -2858,7 +2962,7 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                 chat_id,
                 inline_message_id,
                 placeholder_message_id,
-                "❌ Не удалось скачать видео. Попробуй ещё раз.",
+                "❌ Не удалось загрузить видео.",
                 source_url,
             )
         await asyncio.sleep(3)

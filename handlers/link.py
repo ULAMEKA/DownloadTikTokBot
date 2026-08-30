@@ -18,7 +18,6 @@ from services.queue import (
     QUEUE_LIMIT_MESSAGE,
     MUSIC_JOB_PREFIX,
     MUSIC_PAGE_PREFIX,
-    MediaInspection,
     VideoQuality,
     enqueue_download,
     hold_placeholder,

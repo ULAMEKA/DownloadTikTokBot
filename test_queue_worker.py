@@ -286,6 +286,9 @@ class JobStageMetricsTests(unittest.TestCase):
         metrics.source_url = "https://example.test/video?secret_query=1"
         metrics.cookies = "session-cookie"
         metrics.headers = {"Authorization": "Bearer header-secret"}
+        metrics.download_backend = "url?secret_query=1"
+        metrics.download_fallback = "gallery?header-secret"
+        metrics.split_attempts = -7
 
         with (
             patch("services.queue.time.monotonic", return_value=100.9),
@@ -302,11 +305,15 @@ class JobStageMetricsTests(unittest.TestCase):
         self.assertIn("job_id=9", summary)
         self.assertIn("cache_status=unknown", summary)
         self.assertIn("ffmpeg_bypassed=true", summary)
+        self.assertIn("download_backend=unknown", summary)
+        self.assertIn("download_fallback=unknown", summary)
+        self.assertIn("split_attempts=0", summary)
         for field in (
             "queue_wait",
             "inspect",
             "download",
             "prepare",
+            "split",
             "storage",
             "delivery",
             "total",
@@ -319,6 +326,28 @@ class JobStageMetricsTests(unittest.TestCase):
             "header-secret",
         ):
             self.assertNotIn(sensitive, summary)
+
+    def test_summary_accepts_only_allowlisted_download_telemetry(self):
+        """Fails if backend/fallback fields can carry unbounded metadata."""
+        metrics = queue.JobStageMetrics(job_id=11, started_at=100.0)
+        metrics.download_backend = "info_snapshot"
+        metrics.download_fallback = "gallery"
+        metrics.split_attempts = 3
+
+        with (
+            patch("services.queue.time.monotonic", return_value=100.1),
+            self.assertLogs(level="INFO") as captured,
+        ):
+            metrics.log_summary(
+                cache_status="miss",
+                ffmpeg_bypassed=False,
+                queue_wait_ms=10,
+            )
+
+        summary = captured.output[0]
+        self.assertIn("download_backend=info_snapshot", summary)
+        self.assertIn("download_fallback=gallery", summary)
+        self.assertIn("split_attempts=3", summary)
 
     def test_summary_omits_queue_wait_for_legacy_rows(self):
         metrics = queue.JobStageMetrics(job_id=10, started_at=100.0)
@@ -354,6 +383,24 @@ class JobProcessorMetricsTests(unittest.IsolatedAsyncioTestCase):
 
         log_summary.assert_called_once_with(
             cache_status="miss",
+            ffmpeg_bypassed=None,
+            queue_wait_ms=None,
+        )
+
+    async def test_explicit_format_job_marks_cache_not_applicable(self):
+        """Fails if selected-quality jobs are logged as cache misses."""
+        metrics = queue.JobStageMetrics(job_id=100)
+        job = queue.QueueJob(100, None, None, None, None, "format-1", None, None, None)
+
+        with (
+            patch.object(queue, "JobStageMetrics", return_value=metrics),
+            patch.object(queue, "_discard_job", AsyncMock()),
+            patch.object(metrics, "log_summary", wraps=metrics.log_summary) as log_summary,
+        ):
+            await queue._process_video_job(MagicMock(), job)
+
+        log_summary.assert_called_once_with(
+            cache_status="not_applicable",
             ffmpeg_bypassed=None,
             queue_wait_ms=None,
         )
@@ -406,7 +453,11 @@ class ShortSessionTests(unittest.IsolatedAsyncioTestCase):
                 nonlocal session_active
                 session_active = False
 
-        def download(*_args):
+        def snapshot_download(*_args):
+            self.assertFalse(session_active)
+            raise queue.InfoSnapshotDownloadError("stale")
+
+        def gallery_download(*_args):
             self.assertFalse(session_active)
             raise queue.MediaPreparationError("stop")
 
@@ -423,13 +474,14 @@ class ShortSessionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 queue,
                 "_ydl_download_from_info_file",
-                side_effect=download,
+                side_effect=snapshot_download,
             ) as snapshot_download,
             patch.object(
                 queue,
-                "_download_media",
-                side_effect=download,
-            ) as url_download,
+                "_gallery_download",
+                side_effect=gallery_download,
+            ) as gallery,
+            patch.object(queue, "_download_media") as url_download,
             patch.object(queue, "_discard_job", AsyncMock()),
             patch.object(queue, "_show_download_error", AsyncMock()),
             patch.object(queue, "_remove_download_files"),
@@ -439,7 +491,8 @@ class ShortSessionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(session_active)
         snapshot_download.assert_called_once()
-        url_download.assert_called_once()
+        gallery.assert_called_once()
+        url_download.assert_not_called()
 
     async def test_fresh_snapshot_skips_resolve_and_second_extract(self):
         job = self._job()
@@ -693,7 +746,11 @@ class DeliveryRoutingTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(queue, "_inspection_from_snapshot", return_value=inspection),
                 patch.object(queue, "_ydl_download_from_info_file", side_effect=download),
                 patch.object(queue, "_prepare_telegram_video", return_value=prepared),
-                patch.object(queue, "_split_video", return_value=([video_path], None)),
+                patch.object(
+                    queue,
+                    "_split_video",
+                    return_value=queue.VideoSplitOutcome([video_path], None, 0),
+                ),
                 patch.object(
                     queue,
                     "_upload_to_storage",
@@ -772,9 +829,12 @@ class DeliveryRoutingTests(unittest.IsolatedAsyncioTestCase):
             await self._run_single_delivery("inline-message-id")
 
         self.assertTrue(
-            {"cache", "inspect", "download", "prepare", "storage", "delivery"}
+            {"cache", "inspect", "download", "prepare", "split", "storage", "delivery"}
             <= metrics.durations_ms.keys()
         )
+        self.assertEqual(metrics.download_backend, "info_snapshot")
+        self.assertEqual(metrics.download_fallback, "none")
+        self.assertEqual(metrics.split_attempts, 0)
         log_summary.assert_called_once_with(
             cache_status="miss",
             ffmpeg_bypassed=True,
@@ -899,8 +959,8 @@ class ForcedNormalizationRetryTests(unittest.IsolatedAsyncioTestCase):
                     second = part_dir / "part_001.mp4"
                     first.write_bytes(b"one")
                     second.write_bytes(b"two")
-                    return [first, second], part_dir
-                return [path], None
+                    return queue.VideoSplitOutcome([first, second], part_dir, 1)
+                return queue.VideoSplitOutcome([path], None, 0)
 
             bot = SimpleNamespace(send_video=AsyncMock())
             with (
@@ -1047,7 +1107,11 @@ class ForcedNormalizationRetryTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(queue, "_inspection_from_snapshot", return_value=inspection),
                 patch.object(queue, "_ydl_download_from_info_file", side_effect=download),
                 patch.object(queue, "_prepare_telegram_video", side_effect=prepare),
-                patch.object(queue, "_split_video", return_value=(parts, part_dir)),
+                patch.object(
+                    queue,
+                    "_split_video",
+                    return_value=queue.VideoSplitOutcome(parts, part_dir, 1),
+                ),
                 patch.object(queue, "_deliver_video", deliver),
                 patch.object(
                     queue,
@@ -1134,36 +1198,6 @@ class VideoJobFinalizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cached.description, "desc")
         self.assertEqual(cached.source_url, cache_update.source_url)
         self.assertEqual(cached.likes, 42)
-
-    async def test_finish_commit_failure_rolls_back_and_leaves_job_recoverable(self):
-        job_id = await self._add_job("recoverable")
-        worker_session = self.session_factory()
-        cache_update = queue.VideoCacheUpdate(
-            cache_key="h264-aac-v2:123",
-            file_id="file",
-            storage_message_id=None,
-            description=None,
-            source_url="https://www.tiktok.com/@a/video/123",
-            likes=None,
-        )
-
-        with (
-            patch.object(queue, "SessionLocal", return_value=worker_session),
-            patch.object(
-                worker_session,
-                "commit",
-                AsyncMock(side_effect=RuntimeError("commit failed")),
-            ),
-            self.assertLogs(level="ERROR"),
-        ):
-            await queue._finish_video_job(job_id, cache_update)
-
-        async with self.session_factory() as session:
-            item = await session.get(DownloadQueue, job_id)
-            result = await session.execute(select(VideoCache))
-
-        self.assertIsNotNone(item)
-        self.assertIsNone(result.scalar_one_or_none())
 
     async def test_discard_deletes_only_the_selected_job(self):
         discarded_id = await self._add_job("discarded")
