@@ -15,7 +15,11 @@ Telegram-бот на `aiogram` для загрузки видео из TikTok и
 - Работает в личных сообщениях, группах и inline-режиме.
 - В личном чате и inline-режиме позволяет убрать описание, скрыть видео под
   спойлером или применить оба варианта.
-- Обрабатывает загрузки через постоянную FIFO-очередь в SQLite.
+- Кешированные видео отправляются по Telegram `file_id` сразу после выбора режима
+  и не попадают в очередь; в группах они отправляются сразу после ссылки. Для
+  новых загрузок рекламная заглушка показывается минимум пять секунд.
+- Обычные видео имеют приоритет над ещё не начатым распознаванием музыки, при этом
+  внутри каждого типа сохраняется FIFO и одновременно работает одна тяжёлая задача.
 - Не принимает больше двух незавершённых загрузок от одного пользователя.
 - Повторно использует Telegram `file_id`, чтобы не скачивать уже известные видео заново.
 - Показывает выбор качества только для больших исходников и отправляет их частями
@@ -116,15 +120,19 @@ Linux/macOS:
 
 - Запускайте только один экземпляр бота: получение заданий из очереди не
   синхронизировано между несколькими процессами.
+- Одна тяжёлая задача выполняется за раз; параллельные загрузки или распознавания
+  музыки не запускаются.
 - Кнопки выбора в личном чате действуют 10 минут и сбрасываются при перезапуске.
 - Из одного сообщения обрабатывается только первая поддерживаемая ссылка.
 
 ### Как это работает
 
-1. Обработчик проверяет ссылку и добавляет задание в таблицу
-   `BotDownloadQueue`.
-2. Фоновый воркер последовательно читает FIFO-очередь.
-3. Для известного ID медиа бот сначала ищет сохранённый Telegram `file_id`.
+1. Обработчик проверяет ссылку и для известного ID медиа ищет сохранённый
+   Telegram `file_id`.
+2. Кешированный ролик отправляется сразу и не добавляется в `BotDownloadQueue`;
+   для новой загрузки рекламная заглушка остаётся видимой не меньше пяти секунд.
+3. Воркер берёт обычные видео раньше ожидающих задач распознавания музыки,
+   сохраняя FIFO внутри каждого типа, и выполняет только одну тяжёлую задачу.
 4. Новое видео сначала загружается через `yt-dlp`; при ошибке используется
    `gallery-dl`, а фотопост TikTok преобразуется в слайдшоу.
 5. После доставки бот сохраняет доступный `file_id`, удаляет временный файл и
@@ -147,8 +155,8 @@ Linux/macOS:
 | `utils/links.py` | Поиск и проверка поддерживаемых ссылок |
 
 Во время работы создаются `DownloadTT.db`, каталог `videos/` для временных
-файлов и `bot.log`. Автоматизированного набора тестов в репозитории пока нет;
-`test.py` — ручной скрипт для проверки одной загрузки.
+файлов и `bot.log`. Автоматизированные тесты имеют имена `test_*.py`; `test.py`
+— ручной скрипт для проверки одной загрузки.
 
 ---
 
@@ -162,7 +170,12 @@ Linux/macOS:
 - Works in private chats, groups, and inline mode.
 - In private chats and inline mode, it can omit the description, hide the video
   behind a spoiler, or apply both options.
-- Processes downloads through a persistent FIFO queue stored in SQLite.
+- Cached videos are sent with Telegram `file_id` immediately after a delivery
+  mode is chosen and do not enter the queue; in groups, they are sent immediately
+  after the link. New downloads show an advertising placeholder for at least five
+  seconds.
+- Regular video jobs take priority over music recognition that has not started;
+  FIFO is preserved within each type and only one heavy job runs at a time.
 - Limits each user to two unfinished downloads in the queue.
 - Reuses Telegram `file_id` values instead of downloading known videos again.
 - Shows quality choices only for large source files and sends them in parts of
@@ -261,14 +274,20 @@ Supported links include `tiktok.com`, `vm.tiktok.com`, `vt.tiktok.com`, and
 
 - Run only one bot instance: queue jobs are not claimed atomically across
   multiple processes.
+- One heavy job runs at a time; parallel downloads or music recognition jobs are
+  not started.
 - Private-chat option buttons expire after 10 minutes and are lost on restart.
 - Only the first supported link in each message is processed.
 
 ### How it works
 
-1. A handler validates the link and inserts a job into `BotDownloadQueue`.
-2. A background worker consumes the persistent FIFO queue one job at a time.
-3. For a known media ID, the bot first looks for a cached Telegram `file_id`.
+1. A handler validates the link and looks up a cached Telegram `file_id` for a
+   known media ID.
+2. A cached video is sent immediately and is not inserted into `BotDownloadQueue`;
+   for a new download, the advertising placeholder remains visible for at least
+   five seconds.
+3. A worker takes regular video jobs before waiting music-recognition jobs,
+   preserves FIFO within each type, and runs only one heavy job.
 4. New videos are downloaded with `yt-dlp` first; `gallery-dl` is used as a
    fallback, and TikTok photo posts are converted into a slideshow.
 5. After delivery, the bot stores an available `file_id`, deletes the temporary
@@ -291,5 +310,5 @@ Supported links include `tiktok.com`, `vm.tiktok.com`, `vt.tiktok.com`, and
 | `utils/links.py` | Supported-link matching and extraction |
 
 At runtime, the project creates `DownloadTT.db`, a `videos/` directory for
-temporary files, and `bot.log`. There is currently no automated test suite;
-`test.py` is a manual single-download script.
+temporary files, and `bot.log`. Automated tests are named `test_*.py`; `test.py`
+is a manual single-download script.
