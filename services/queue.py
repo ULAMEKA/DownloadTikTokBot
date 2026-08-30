@@ -12,6 +12,7 @@ import threading
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import imageio_ffmpeg
@@ -20,7 +21,7 @@ from aiogram import Bot, html
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaVideo
-from sqlalchemy import func, select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gallery_dl.extractor.message import Message as GalleryMessage
@@ -68,6 +69,7 @@ MUSIC_MESSAGE_LIMIT = 4096
 MUSIC_JOB_PREFIX = "music:"
 MUSIC_PAGE_PREFIX = "music_page:"
 MUSIC_START_PREFIX = "music_"
+QUEUE_WAKEUP_TIMEOUT_SECONDS = 60.0
 MEDIA_CACHE_PROFILE = "h264-aac-v2"
 VIDEO_TRANSCODE_CRF = 18
 QUEUE_LIMIT_MESSAGE = (
@@ -77,6 +79,7 @@ QUEUE_LIMIT_MESSAGE = (
 _placeholder_ready_at: dict[tuple[str, int], float] = {}
 _inline_placeholder_ready_at: dict[str, float] = {}
 _enqueue_lock = asyncio.Lock()
+_queue_wakeup = asyncio.Event()
 _ydl_lock = threading.Lock()
 _music_bot_username_cache: str | None = None
 _music_bot_username_lock = asyncio.Lock()
@@ -115,6 +118,26 @@ class MediaProbe:
     pixel_format: str | None = None
     sample_aspect_ratio: str | None = None
     rotation: int = 0
+
+
+@dataclass(frozen=True)
+class QueueJob:
+    id: int
+    chat_id: str
+    user_id: str | None
+    filename: str
+    tiktok_link: str
+    format_id: str | None
+    reply_to_message_id: int | None
+    inline_message_id: str | None
+    enqueued_at: datetime | None
+
+    @property
+    def is_music(self) -> bool:
+        return bool(
+            self.inline_message_id
+            and self.inline_message_id.startswith(MUSIC_JOB_PREFIX)
+        )
 
 
 MusicTrack = tuple[int, str, str]
@@ -157,7 +180,12 @@ async def enqueue_download(
         item.user_id = user_id
         session.add(item)
         await session.commit()
+        notify_queue_enqueued()
         return True
+
+
+def notify_queue_enqueued() -> None:
+    _queue_wakeup.set()
 
 
 def hold_placeholder(chat_id: str, message_id: int) -> None:
@@ -2027,17 +2055,60 @@ async def queue_music_deep_link(
     return False
 
 
-async def process_queue(bot: Bot) -> None:
-    """Фоновый цикл обработки очереди загрузок."""
-    while True:
-        async with SessionLocal() as session:
-            stmt = select(DownloadQueue).order_by(DownloadQueue.id).limit(1)
-            result = await session.execute(stmt)
-            item = result.scalar()
+async def _load_next_job() -> QueueJob | None:
+    async with SessionLocal() as session:
+        priority = case(
+            (DownloadQueue.inline_message_id.startswith(MUSIC_JOB_PREFIX), 1),
+            else_=0,
+        )
+        result = await session.execute(
+            select(DownloadQueue)
+            .order_by(priority, DownloadQueue.id)
+            .limit(1)
+        )
+        item = result.scalar()
+        if item is None:
+            return None
+        return QueueJob(
+            id=item.id,
+            chat_id=item.chat_id,
+            user_id=item.user_id,
+            filename=item.filename,
+            tiktok_link=item.tiktok_link,
+            format_id=item.format_id,
+            reply_to_message_id=item.reply_to_message_id,
+            inline_message_id=item.inline_message_id,
+            enqueued_at=item.enqueued_at,
+        )
 
-            if item is None:
-                await asyncio.sleep(1)
-                continue
+
+async def _wait_for_next_job() -> QueueJob:
+    while True:
+        job = await _load_next_job()
+        if job is not None:
+            return job
+
+        _queue_wakeup.clear()
+        job = await _load_next_job()
+        if job is not None:
+            return job
+
+        try:
+            await asyncio.wait_for(
+                _queue_wakeup.wait(),
+                timeout=QUEUE_WAKEUP_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            pass
+
+
+async def _process_queue_job_legacy(bot: Bot, job: QueueJob) -> None:
+    async with SessionLocal() as session:
+        item = await session.get(DownloadQueue, job.id)
+        if item is None:
+            return
+        # Task 7 removes this compatibility loop together with the long session.
+        for item in (item,):
 
             # Защита от битых записей
             if item.chat_id is None or item.filename is None or item.tiktok_link is None:
@@ -2365,3 +2436,10 @@ async def process_queue(bot: Bot) -> None:
                     _placeholder_ready_at.pop((chat_id, placeholder_for_cleanup), None)
                 if inline_message_id:
                     _inline_placeholder_ready_at.pop(inline_message_id, None)
+
+
+async def process_queue(bot: Bot) -> None:
+    """Фоновый цикл обработки очереди загрузок."""
+    while True:
+        job = await _wait_for_next_job()
+        await _process_queue_job_legacy(bot, job)

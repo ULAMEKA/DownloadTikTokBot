@@ -69,6 +69,14 @@ async def init_db() -> None:
             ))
             logging.info("BotDownloadQueue: добавлена колонка format_id")
 
+        try:
+            await conn.execute(text("SELECT enqueued_at FROM BotDownloadQueue LIMIT 1"))
+        except Exception:  # noqa: BLE001
+            await conn.execute(text(
+                "ALTER TABLE BotDownloadQueue ADD COLUMN enqueued_at DATETIME"
+            ))
+            logging.info("BotDownloadQueue: добавлена колонка enqueued_at")
+
         # 4. Повторный create_all пересоздаёт VideoCache, если миграция её удалила.
         await conn.run_sync(Base.metadata.create_all)
 

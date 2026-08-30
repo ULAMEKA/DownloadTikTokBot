@@ -1,4 +1,6 @@
-from sqlalchemy import Column, Integer, String
+from datetime import datetime, timezone
+
+from sqlalchemy import Column, DateTime, Integer, String
 from .base import Base
 
 
@@ -14,6 +16,11 @@ class DownloadQueue(Base):
     # Для inline-режима: ID отправленного сообщения в чате.
     # Если задан — очередь редактирует это сообщение, вставляя видео прямо в чат.
     inline_message_id = Column(String, nullable=True)
+    enqueued_at = Column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=lambda: datetime.now(timezone.utc),
+    )
 
 
 class VideoCache(Base):

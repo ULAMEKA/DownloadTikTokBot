@@ -60,25 +60,37 @@ class QueueErrorMessageTests(unittest.IsolatedAsyncioTestCase):
     async def test_media_preparation_failure_reports_video_download_failure(self):
         source_url = "https://www.tiktok.com/@author/video/123"
         item = SimpleNamespace(
+            id=1,
             chat_id="123",
+            user_id="456",
             filename="failed-download",
             tiktok_link=source_url,
             format_id=None,
             inline_message_id=None,
             reply_to_message_id=None,
+            enqueued_at=None,
+        )
+        job = queue.QueueJob(
+            item.id,
+            item.chat_id,
+            item.user_id,
+            item.filename,
+            item.tiktok_link,
+            item.format_id,
+            item.reply_to_message_id,
+            item.inline_message_id,
+            item.enqueued_at,
         )
 
         class QueueStopped(Exception):
             pass
 
-        result = MagicMock()
-        result.scalar.return_value = item
         session = AsyncMock()
-        session.execute.return_value = result
+        session.get.return_value = item
         session_context = MagicMock()
         session_context.__aenter__ = AsyncMock(return_value=session)
         session_context.__aexit__ = AsyncMock(return_value=False)
-        session_factory = MagicMock(side_effect=[session_context, QueueStopped()])
+        session_factory = MagicMock(return_value=session_context)
 
         class BotStub:
             message_args = None
@@ -89,6 +101,11 @@ class QueueErrorMessageTests(unittest.IsolatedAsyncioTestCase):
         bot = BotStub()
         with (
             patch.object(queue, "SessionLocal", session_factory),
+            patch.object(
+                queue,
+                "_wait_for_next_job",
+                AsyncMock(side_effect=[job, QueueStopped()]),
+            ),
             patch.object(queue, "_resolve_media", return_value=(None, source_url, None)),
             patch.object(
                 queue,
