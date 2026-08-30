@@ -2098,7 +2098,7 @@ async def _wait_for_next_job() -> QueueJob:
                 _queue_wakeup.wait(),
                 timeout=QUEUE_WAKEUP_TIMEOUT_SECONDS,
             )
-        except TimeoutError:
+        except asyncio.TimeoutError:
             pass
 
 

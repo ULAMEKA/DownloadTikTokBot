@@ -35,6 +35,35 @@ class QueueWakeupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(load.await_count, 2)
         wait.assert_not_awaited()
 
+    async def test_python_310_asyncio_timeout_reloads_the_queue(self):
+        class Python310AsyncioTimeoutError(Exception):
+            pass
+
+        job = queue.QueueJob(
+            1, "1", "1", "job", "https://example", None, None, None, None
+        )
+
+        async def expire(waiter, *, timeout):
+            waiter.close()
+            raise Python310AsyncioTimeoutError
+
+        with (
+            patch.object(
+                queue,
+                "_load_next_job",
+                AsyncMock(side_effect=[None, None, job]),
+            ) as load,
+            patch.object(
+                queue.asyncio,
+                "TimeoutError",
+                Python310AsyncioTimeoutError,
+            ),
+            patch.object(queue.asyncio, "wait_for", new=expire),
+        ):
+            self.assertEqual(await queue._wait_for_next_job(), job)
+
+        self.assertEqual(load.await_count, 3)
+
     async def test_failed_enqueue_does_not_signal(self):
         result = MagicMock()
         result.scalar_one.return_value = queue.MAX_ACTIVE_DOWNLOADS_PER_USER
