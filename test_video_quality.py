@@ -1,4 +1,7 @@
 import unittest
+from unittest.mock import patch
+
+import services.queue as queue
 
 from services.queue import (
     MAX_SOURCE_VIDEO_BYTES,
@@ -15,6 +18,25 @@ from services.queue import (
 
 
 class VideoQualityTests(unittest.TestCase):
+    def test_list_video_qualities_remains_a_compatibility_wrapper(self):
+        inspection = queue.MediaInspection(
+            media_id="123",
+            source_url="https://www.tiktok.com/@a/video/123",
+            likes=None,
+            description=None,
+            width=None,
+            height=None,
+            duration=None,
+            qualities=(VideoQuality("format", "quality", 1),),
+            info={"id": "123"},
+        )
+
+        with patch.object(queue, "inspect_media", return_value=inspection) as inspect:
+            qualities = queue.list_video_qualities(inspection.source_url)
+
+        inspect.assert_called_once_with(inspection.source_url)
+        self.assertEqual(qualities, list(inspection.qualities))
+
     def test_ytdlp_prioritizes_source_fps_before_resolution(self):
         self.assertEqual(_ydl_base_options()["format_sort"], ["fps", "res", "br"])
 

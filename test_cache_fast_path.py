@@ -117,7 +117,7 @@ class HandlerCacheFastPathTests(unittest.IsolatedAsyncioTestCase):
                 )
                 with (
                     patch("handlers.link.try_deliver_cached_video", AsyncMock(return_value=True)) as deliver,
-                    patch("handlers.link.list_video_qualities") as qualities,
+                    patch("handlers.link.inspect_media") as inspection,
                     patch("handlers.link.enqueue_download", AsyncMock()) as enqueue,
                 ):
                     await link_handler.handle_download_option(callback, session, bot)
@@ -125,7 +125,7 @@ class HandlerCacheFastPathTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(deliver.await_args.args[2], "https://www.tiktok.com/@a/video/123")
                 self.assertEqual(deliver.await_args.kwargs["without_description"], without_description)
                 self.assertEqual(deliver.await_args.kwargs["has_spoiler"], has_spoiler)
-                qualities.assert_not_called()
+                inspection.assert_not_called()
                 enqueue.assert_not_awaited()
                 callback.message.delete.assert_awaited_once()
                 self.assertNotIn(token, link_handler._pending)
@@ -141,12 +141,25 @@ class HandlerCacheFastPathTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("handlers.link.try_deliver_cached_video", AsyncMock(return_value=False)),
-            patch("handlers.link.list_video_qualities", return_value=[]) as qualities,
+            patch(
+                "handlers.link.inspect_media",
+                return_value=queue.MediaInspection(
+                    media_id="123",
+                    source_url="https://www.tiktok.com/@a/video/123",
+                    likes=None,
+                    description=None,
+                    width=None,
+                    height=None,
+                    duration=None,
+                    qualities=(),
+                    info={"id": "123"},
+                ),
+            ) as inspection,
             patch("handlers.link._start_pending_download", AsyncMock()) as start,
         ):
             await link_handler.handle_download_option(callback, session, SimpleNamespace())
 
-        qualities.assert_called_once_with("https://www.tiktok.com/@a/video/123")
+        inspection.assert_called_once_with("https://www.tiktok.com/@a/video/123")
         start.assert_awaited_once()
 
     async def test_group_cache_hit_skips_placeholder_queue_and_hold(self):

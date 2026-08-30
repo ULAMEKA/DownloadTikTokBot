@@ -90,6 +90,19 @@ class VideoQuality:
 
 
 @dataclass(frozen=True)
+class MediaInspection:
+    media_id: str | None
+    source_url: str
+    likes: int | None
+    description: str | None
+    width: int | None
+    height: int | None
+    duration: float | None
+    qualities: tuple[VideoQuality, ...]
+    info: dict[str, object]
+
+
+@dataclass(frozen=True)
 class MediaProbe:
     has_video: bool
     has_audio: bool
@@ -277,21 +290,54 @@ def _quality_options(formats: object) -> list[VideoQuality]:
     return [option for _, option in ranked_options[:MAX_QUALITY_OPTIONS]]
 
 
-def list_video_qualities(url: str) -> list[VideoQuality]:
+def _inspection_from_snapshot(url: str, info: dict[str, object]) -> MediaInspection:
+    match = _TIKTOK_ID_RE.search(url)
+    fallback_id = match.group(1) if match else None
+    media_id = str(info["id"]) if info.get("id") else fallback_id
+    source_url = (
+        str(info.get("webpage_url") or url)
+        if "tiktok.com/" in url.lower()
+        else url
+    )
+    raw_description = info.get("description")
+    width, height = _extract_dimensions(info)
+    return MediaInspection(
+        media_id=media_id,
+        source_url=source_url,
+        likes=_to_int(info.get("like_count")),
+        description=str(raw_description) if raw_description else None,
+        width=width,
+        height=height,
+        duration=_to_float(info.get("duration")),
+        qualities=tuple(_quality_options(info.get("formats"))),
+        info=info,
+    )
+
+
+def inspect_media(url: str) -> MediaInspection:
     last_error: Exception | None = None
     with _ydl_option_variants(url) as variants:
         for index, opts in enumerate(variants):
             try:
                 with _ydl_lock, yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore[arg-type]
                     info = ydl.extract_info(url, download=False)
-                return _quality_options(info.get("formats") if info else None)
+                    if not isinstance(info, dict):
+                        raise MediaPreparationError("yt-dlp не вернул метаданные")
+                    sanitized = ydl.sanitize_info(info)
+                if not isinstance(sanitized, dict):
+                    raise MediaPreparationError("yt-dlp вернул некорректные метаданные")
+                return _inspection_from_snapshot(url, sanitized)
             except Exception as error:
                 last_error = error
                 if index + 1 < len(variants):
-                    logging.info("yt-dlp: повторяем получение форматов с cookies")
+                    logging.info("yt-dlp: повторяем получение метаданных с cookies")
     if last_error is not None:
         raise last_error
-    return []
+    raise MediaPreparationError("yt-dlp не вернул метаданные")
+
+
+def list_video_qualities(url: str) -> list[VideoQuality]:
+    return list(inspect_media(url).qualities)
 
 
 def needs_quality_choice(qualities: list[VideoQuality]) -> bool:
@@ -360,6 +406,39 @@ def _ydl_option_variants(url: str):
     finally:
         for cookie_copy in cookie_copies:
             cookie_copy.unlink(missing_ok=True)
+
+
+def _info_snapshot_path(filename: str) -> Path:
+    return VIDEO_DIR / f"{filename}.info.json"
+
+
+def write_info_snapshot(filename: str, info: dict[str, object]) -> Path:
+    VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=VIDEO_DIR,
+        prefix=f"{filename}.",
+        suffix=".info.tmp",
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    destination = _info_snapshot_path(filename)
+    try:
+        temporary_path.write_text(
+            json.dumps(info, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        os.replace(temporary_path, destination)
+        return destination
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _load_info_snapshot(filename: str) -> dict[str, object] | None:
+    try:
+        loaded = json.loads(_info_snapshot_path(filename).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
 
 
 def _media_cache_key(media_id: str) -> str:
@@ -438,6 +517,51 @@ def _ydl_download(
                 if index + 1 < len(variants):
                     logging.info("yt-dlp: повторяем загрузку с cookies")
     raise MediaPreparationError("yt-dlp не смог скачать медиа") from last_error
+
+
+def _ydl_download_from_info_file(
+    url: str,
+    info_path: Path,
+    outtmpl: str,
+    format_id: str | None,
+) -> tuple[str | None, int | None, int | None, str | None, float | None]:
+    last_error: Exception | None = None
+    with _ydl_option_variants(url) as variants:
+        for index, base_options in enumerate(variants):
+            opts = {
+                **base_options,
+                "outtmpl": outtmpl,  # cspell:disable-line
+                "format": format_id or DEFAULT_FORMAT,
+                "max_filesize": MAX_SOURCE_VIDEO_BYTES,
+            }
+            try:
+                with _ydl_lock, yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore[arg-type]
+                    return_code = ydl.download_with_info_file(str(info_path))
+                if return_code:
+                    raise MediaPreparationError(
+                        f"yt-dlp завершился с кодом {return_code}"
+                    )
+                info = _load_info_snapshot(info_path.name.removesuffix(".info.json"))
+                if info is None:
+                    raise MediaPreparationError("Не удалось прочитать метаданные загрузки")
+                expected_size = _to_int(info.get("filesize") or info.get("filesize_approx"))
+                if expected_size is not None and expected_size > MAX_SOURCE_VIDEO_BYTES:
+                    raise VideoTooLargeError
+                inspection = _inspection_from_snapshot(url, info)
+                return (
+                    inspection.media_id,
+                    inspection.width,
+                    inspection.height,
+                    inspection.description,
+                    inspection.duration,
+                )
+            except VideoTooLargeError:
+                raise
+            except Exception as error:
+                last_error = error
+                if index + 1 < len(variants):
+                    logging.info("yt-dlp: повторяем загрузку info-файла с cookies")
+    raise MediaPreparationError("yt-dlp не смог скачать медиа из info-файла") from last_error
 
 
 def _parse_frame_rate(value: object) -> float | None:
@@ -1424,6 +1548,9 @@ def _remove_download_files(filename: str) -> None:
     for path in VIDEO_DIR.glob(f"{filename}.*"):
         if path.is_file():
             path.unlink(missing_ok=True)
+    for path in VIDEO_DIR.glob(f"{filename}_parts_*"):
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
 
 
 def can_offer_music(without_description: bool, _inline_message_id: str | None) -> bool:

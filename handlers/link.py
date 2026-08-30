@@ -16,15 +16,17 @@ from services.queue import (
     QUEUE_LIMIT_MESSAGE,
     MUSIC_JOB_PREFIX,
     MUSIC_PAGE_PREFIX,
+    MediaInspection,
     VideoQuality,
     enqueue_download,
     hold_placeholder,
-    list_video_qualities,
+    inspect_media,
     needs_quality_choice,
     show_music_request_page,
     show_music_request_result,
     try_deliver_cached_video,
     update_music_request_message,
+    write_info_snapshot,
 )
 from utils.links import SUPPORTED_URL_RE, canonicalize_video_url, find_video_url
 
@@ -37,6 +39,7 @@ class PendingDownload:
     url: str
     mode: str | None = None
     qualities: list[VideoQuality] | None = None
+    inspection: MediaInspection | None = None
 
 
 _pending: dict[str, PendingDownload] = {}
@@ -95,7 +98,20 @@ async def _start_pending_download(
         reply_to_message_id=-placeholder.message_id if placeholder else None,
         inline_message_id=f"direct:{pending.mode}" if pending.mode != "normal" else None,
     )
-    if not await enqueue_download(session, queue_item, str(callback.from_user.id)):
+    snapshot_path = (
+        write_info_snapshot(queue_item.filename, pending.inspection.info)
+        if pending.inspection is not None
+        else None
+    )
+    try:
+        enqueued = await enqueue_download(session, queue_item, str(callback.from_user.id))
+    except Exception:
+        if snapshot_path is not None:
+            snapshot_path.unlink(missing_ok=True)
+        raise
+    if not enqueued:
+        if snapshot_path is not None:
+            snapshot_path.unlink(missing_ok=True)
         _pending[token] = pending
         if placeholder:
             await placeholder.delete()
@@ -201,9 +217,13 @@ async def handle_download_option(callback: CallbackQuery, session: AsyncSession,
         return
     try:
         loop = asyncio.get_running_loop()
-        qualities = await loop.run_in_executor(None, list_video_qualities, pending.url)
+        inspection = await loop.run_in_executor(None, inspect_media, pending.url)
     except Exception:
+        inspection = None
         qualities = []
+    else:
+        pending.inspection = inspection
+        qualities = list(inspection.qualities)
     if not needs_quality_choice(qualities):
         await _start_pending_download(
             callback,
