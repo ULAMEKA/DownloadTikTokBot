@@ -210,6 +210,35 @@ class QueueSelectionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(item.enqueued_at)
 
+    async def test_video_position_ignores_older_music_jobs(self):
+        """Fails if displayed video position contradicts video-over-music priority."""
+        async with self.session_factory() as session:
+            music = DownloadQueue(
+                chat_id="music",
+                user_id="1",
+                filename="music",
+                tiktok_link="https://example/music",
+                inline_message_id="music:token",
+            )
+            first_video = DownloadQueue(
+                chat_id="video-1",
+                user_id="2",
+                filename="video-1",
+                tiktok_link="https://example/video-1",
+            )
+            current_video = DownloadQueue(
+                chat_id="video-2",
+                user_id="3",
+                filename="video-2",
+                tiktok_link="https://example/video-2",
+            )
+            session.add_all((music, first_video, current_video))
+            await session.commit()
+
+            position = await queue.video_queue_position(session, current_video.id)
+
+        self.assertEqual(position, 2)
+
 
 class JobStageMetricsTests(unittest.TestCase):
     def test_stage_metrics_use_monotonic_deltas(self):
@@ -348,7 +377,7 @@ class ShortSessionTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _inspection(job: queue.QueueJob) -> queue.MediaInspection:
         return queue.MediaInspection(
-            "123",
+            queue.MediaIdentity(queue.MediaProvider.TIKTOK, "123"),
             job.tiktok_link,
             9,
             "desc",
@@ -386,7 +415,7 @@ class ShortSessionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(queue, "find_cached_video", AsyncMock(return_value=None)),
             patch.object(
                 queue,
-                "find_cached_video_by_id",
+                "find_cached_video_by_identity",
                 AsyncMock(return_value=None),
             ),
             patch.object(queue, "_load_info_snapshot", return_value=inspection.info),
@@ -432,7 +461,7 @@ class ShortSessionTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(queue, "find_cached_video", AsyncMock(return_value=None)),
                 patch.object(
                     queue,
-                    "find_cached_video_by_id",
+                    "find_cached_video_by_identity",
                     AsyncMock(return_value=None),
                 ),
                 patch.object(queue, "_load_info_snapshot", return_value=inspection.info),
@@ -527,7 +556,7 @@ class ShortSessionTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(queue, "VIDEO_DIR", Path(directory)),
                 patch.object(queue, "SessionLocal", return_value=session_context),
                 patch.object(queue, "find_cached_video", AsyncMock(return_value=None)),
-                patch.object(queue, "find_cached_video_by_id", cache_by_id),
+                patch.object(queue, "find_cached_video_by_identity", cache_by_id),
                 patch.object(queue, "_load_info_snapshot", return_value=None),
                 patch.object(queue, "inspect_media", return_value=inspection) as inspect,
                 patch.object(
@@ -558,7 +587,7 @@ class ShortSessionTests(unittest.IsolatedAsyncioTestCase):
         write_snapshot.assert_called_once_with(job.filename, inspection.info)
         cache_by_id.assert_awaited_once_with(
             session,
-            inspection.media_id,
+            inspection.identity,
             inspection.source_url,
         )
         download_from_snapshot.assert_called_once_with(
@@ -613,7 +642,7 @@ class DeliveryRoutingTests(unittest.IsolatedAsyncioTestCase):
         job = self._job(inline_message_id, enqueued_at)
         probe = self._probe()
         inspection = queue.MediaInspection(
-            "123",
+            queue.MediaIdentity(queue.MediaProvider.TIKTOK, "123"),
             job.tiktok_link,
             9,
             "description",
@@ -819,7 +848,7 @@ class ForcedNormalizationRetryTests(unittest.IsolatedAsyncioTestCase):
         job = self._job(inline_message_id)
         probe = self._probe()
         inspection = queue.MediaInspection(
-            "123",
+            queue.MediaIdentity(queue.MediaProvider.TIKTOK, "123"),
             job.tiktok_link,
             None,
             None,
@@ -975,7 +1004,7 @@ class ForcedNormalizationRetryTests(unittest.IsolatedAsyncioTestCase):
         job = self._job()
         probe = self._probe()
         inspection = queue.MediaInspection(
-            "123",
+            queue.MediaIdentity(queue.MediaProvider.TIKTOK, "123"),
             job.tiktok_link,
             None,
             None,

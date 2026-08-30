@@ -80,6 +80,72 @@ class CachedDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
         invalidate.assert_not_awaited()
 
+    async def test_captioned_private_group_and_inline_cache_hits_get_music_deep_links(self):
+        """Fails if any captioned handler cache route omits the opt-in music link."""
+        cached = CachedVideo(
+            "h264-aac-v2:tiktok:123",
+            "file-id",
+            "desc",
+            "https://www.tiktok.com/@a/video/123",
+            7,
+        )
+        routes = (
+            {"chat_id": "42"},
+            {"chat_id": "-100", "reply_to_message_id": 321},
+            {"chat_id": "42", "inline_message_id": "inline-id"},
+        )
+
+        for route in routes:
+            with self.subTest(route=route):
+                events = []
+                session = AsyncMock()
+                session.rollback.side_effect = lambda: events.append("read-released")
+
+                async def prepare(*_args):
+                    self.assertEqual(events, ["read-released"])
+                    return "token", "https://t.me/testbot?start=music_token"
+
+                with (
+                    patch.object(queue, "find_cached_video", AsyncMock(return_value=cached)),
+                    patch.object(queue, "prepare_music_caption_link", side_effect=prepare) as link,
+                    patch.object(queue, "deliver_cached_video", AsyncMock()) as deliver,
+                ):
+                    delivered = await queue.try_deliver_cached_video(
+                        SimpleNamespace(),
+                        session,
+                        "https://www.tiktok.com/@a/video/123",
+                        **route,
+                    )
+
+                self.assertTrue(delivered)
+                link.assert_awaited_once()
+                self.assertEqual(
+                    deliver.await_args.kwargs["music_deep_link"],
+                    "https://t.me/testbot?start=music_token",
+                )
+
+    async def test_no_description_cache_hit_never_creates_music_deep_link(self):
+        """Fails if no-description cache delivery creates an unused MusicRequest."""
+        cached = CachedVideo("h264-aac-v2:tiktok:123", "file-id", "desc", None, 7)
+        session = AsyncMock()
+
+        with (
+            patch.object(queue, "find_cached_video", AsyncMock(return_value=cached)),
+            patch.object(queue, "prepare_music_caption_link", AsyncMock()) as link,
+            patch.object(queue, "deliver_cached_video", AsyncMock()) as deliver,
+        ):
+            delivered = await queue.try_deliver_cached_video(
+                SimpleNamespace(),
+                session,
+                "https://www.tiktok.com/@a/video/123",
+                chat_id="42",
+                without_description=True,
+            )
+
+        self.assertTrue(delivered)
+        link.assert_not_awaited()
+        self.assertIsNone(deliver.await_args.kwargs["music_deep_link"])
+
 
 class HandlerCacheFastPathTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -144,7 +210,7 @@ class HandlerCacheFastPathTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "handlers.link.inspect_media",
                 return_value=queue.MediaInspection(
-                    media_id="123",
+                    identity=queue.MediaIdentity(queue.MediaProvider.TIKTOK, "123"),
                     source_url="https://www.tiktok.com/@a/video/123",
                     likes=None,
                     description=None,

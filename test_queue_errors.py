@@ -110,7 +110,7 @@ class QueueErrorMessageTests(unittest.IsolatedAsyncioTestCase):
             None,
         )
         inspection = queue.MediaInspection(
-            "123",
+            queue.MediaIdentity(queue.MediaProvider.TIKTOK, "123"),
             source_url,
             None,
             None,

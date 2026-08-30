@@ -1,14 +1,38 @@
+import re
 from dataclasses import dataclass
+from enum import Enum
+from urllib.parse import urlsplit
 
 from aiogram.exceptions import TelegramBadRequest
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import VideoCache
-from utils.links import cache_media_id
 
 
 MEDIA_CACHE_PROFILE = "h264-aac-v2"
+_TIKTOK_PATH_RE = re.compile(r"^/@[^/]+/(?:video|photo)/(\d+)/?$")
+_INSTAGRAM_PATH_RE = re.compile(r"^/reels?/([A-Za-z0-9_-]+)/?$")
+
+
+class MediaProvider(str, Enum):
+    TIKTOK = "tiktok"
+    INSTAGRAM = "instagram"
+
+
+@dataclass(frozen=True)
+class MediaIdentity:
+    provider: MediaProvider
+    media_id: str
+
+    def __post_init__(self) -> None:
+        valid = (
+            self.media_id.isdigit()
+            if self.provider is MediaProvider.TIKTOK
+            else bool(re.fullmatch(r"[A-Za-z0-9_-]+", self.media_id))
+        )
+        if not valid:
+            raise ValueError("Некорректный идентификатор медиа")
 
 
 @dataclass(frozen=True)
@@ -30,8 +54,46 @@ class VideoCacheUpdate:
     likes: int | None
 
 
-def media_cache_key(media_id: str) -> str:
-    return f"{MEDIA_CACHE_PROFILE}:{media_id}"
+def cache_media_identity(canonical_url: str) -> MediaIdentity | None:
+    """Return a validated, provider-aware identity without network access."""
+    parts = urlsplit(canonical_url)
+    host = (parts.hostname or "").lower()
+    if host in {"tiktok.com", "www.tiktok.com"}:
+        match = _TIKTOK_PATH_RE.fullmatch(parts.path)
+        provider = MediaProvider.TIKTOK
+    elif host in {"instagram.com", "www.instagram.com"}:
+        match = _INSTAGRAM_PATH_RE.fullmatch(parts.path)
+        provider = MediaProvider.INSTAGRAM
+    else:
+        return None
+    if match is None:
+        return None
+    return MediaIdentity(provider, match.group(1))
+
+
+def media_identity_from_source(
+    source_url: str,
+    extracted_id: object = None,
+) -> MediaIdentity | None:
+    """Prefer canonical URL identity; only TikTok may use a numeric extractor ID."""
+    identity = cache_media_identity(source_url)
+    if identity is not None:
+        return identity
+    host = (urlsplit(source_url).hostname or "").lower()
+    media_id = str(extracted_id) if extracted_id is not None else ""
+    if host in {"tiktok.com", "www.tiktok.com"} and media_id.isdigit():
+        return MediaIdentity(MediaProvider.TIKTOK, media_id)
+    return None
+
+
+def media_cache_key(identity: MediaIdentity) -> str:
+    return f"{MEDIA_CACHE_PROFILE}:{identity.provider.value}:{identity.media_id}"
+
+
+def _legacy_tiktok_cache_key(identity: MediaIdentity) -> str | None:
+    if identity.provider is not MediaProvider.TIKTOK:
+        return None
+    return f"{MEDIA_CACHE_PROFILE}:{identity.media_id}"
 
 
 def is_invalid_cached_file_id_error(error: TelegramBadRequest) -> bool:
@@ -47,31 +109,36 @@ async def find_cached_video(
     session: AsyncSession,
     canonical_url: str,
 ) -> CachedVideo | None:
-    media_id = cache_media_id(canonical_url)
-    if media_id is None:
+    identity = cache_media_identity(canonical_url)
+    if identity is None:
         return None
-    return await find_cached_video_by_id(session, media_id, canonical_url)
+    return await find_cached_video_by_identity(session, identity, canonical_url)
 
 
-async def find_cached_video_by_id(
+async def find_cached_video_by_identity(
     session: AsyncSession,
-    media_id: str,
+    identity: MediaIdentity,
     fallback_url: str,
 ) -> CachedVideo | None:
-    cache_key = media_cache_key(media_id)
-    result = await session.execute(
-        select(VideoCache).where(VideoCache.tiktok_id == cache_key)
-    )
-    cached = result.scalar_one_or_none()
-    if cached is None or not cached.file_id:
-        return None
-    return CachedVideo(
-        cache_key=cache_key,
-        file_id=cached.file_id,
-        description=cached.description,
-        source_url=cached.source_url or fallback_url,
-        likes=cached.likes,
-    )
+    cache_keys = [media_cache_key(identity)]
+    legacy_key = _legacy_tiktok_cache_key(identity)
+    if legacy_key is not None:
+        cache_keys.append(legacy_key)
+    for cache_key in cache_keys:
+        result = await session.execute(
+            select(VideoCache).where(VideoCache.tiktok_id == cache_key)
+        )
+        cached = result.scalar_one_or_none()
+        if cached is None or not cached.file_id:
+            continue
+        return CachedVideo(
+            cache_key=cache_key,
+            file_id=cached.file_id,
+            description=cached.description,
+            source_url=cached.source_url or fallback_url,
+            likes=cached.likes,
+        )
+    return None
 
 
 async def invalidate_cached_video(session: AsyncSession, cache_key: str) -> None:

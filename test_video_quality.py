@@ -20,7 +20,7 @@ from services.queue import (
 class VideoQualityTests(unittest.TestCase):
     def test_list_video_qualities_remains_a_compatibility_wrapper(self):
         inspection = queue.MediaInspection(
-            media_id="123",
+            identity=queue.MediaIdentity(queue.MediaProvider.TIKTOK, "123"),
             source_url="https://www.tiktok.com/@a/video/123",
             likes=None,
             description=None,

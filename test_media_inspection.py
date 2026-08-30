@@ -34,7 +34,10 @@ class MediaInspectionTests(unittest.TestCase):
 
         ydl.extract_info.assert_called_once_with(SOURCE_URL, download=False)
         ydl.sanitize_info.assert_called_once_with(ydl.extract_info.return_value)
-        self.assertEqual(inspection.media_id, "123")
+        self.assertEqual(
+            inspection.identity,
+            queue.MediaIdentity(queue.MediaProvider.TIKTOK, "123"),
+        )
         self.assertEqual(inspection.info["id"], "123")
 
     def test_inspection_from_snapshot_restores_application_fields(self):
@@ -61,7 +64,10 @@ class MediaInspectionTests(unittest.TestCase):
 
         inspection = queue._inspection_from_snapshot(SOURCE_URL, info)
 
-        self.assertEqual(inspection.media_id, "123")
+        self.assertEqual(
+            inspection.identity,
+            queue.MediaIdentity(queue.MediaProvider.TIKTOK, "123"),
+        )
         self.assertEqual(inspection.source_url, SOURCE_URL)
         self.assertEqual(inspection.likes, 9)
         self.assertEqual(inspection.description, "desc")
@@ -165,7 +171,7 @@ class InfoSnapshotWorkerFallbackTests(unittest.IsolatedAsyncioTestCase):
             None,
         )
         inspection = queue.MediaInspection(
-            "123",
+            queue.MediaIdentity(queue.MediaProvider.TIKTOK, "123"),
             SOURCE_URL,
             9,
             "desc",
@@ -239,7 +245,7 @@ class PrivateInspectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_one_inspection_supplies_quality_choice_and_enqueued_snapshot(self):
         token = "private-inspection"
         inspection = queue.MediaInspection(
-            media_id="123",
+            identity=queue.MediaIdentity(queue.MediaProvider.TIKTOK, "123"),
             source_url=SOURCE_URL,
             likes=9,
             description="desc",

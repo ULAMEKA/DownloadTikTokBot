@@ -14,7 +14,6 @@ from aiogram.types import (
     InlineKeyboardButton,
     ChosenInlineResult,
 )
-from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import DownloadQueue, MusicRequest
@@ -27,6 +26,7 @@ from services.queue import (
     music_button_markup,
     release_inline_placeholder,
     try_deliver_cached_video,
+    video_queue_position,
 )
 from utils.links import canonicalize_video_url, find_video_url
 
@@ -221,8 +221,7 @@ async def chosen_download(result: ChosenInlineResult, session: AsyncSession, bot
             release_inline_placeholder(raw_inline_message_id)
         await _render_inline_download_error(bot, result, url, QUEUE_LIMIT_MESSAGE)
         return
-    stmt = select(func.count()).select_from(DownloadQueue).where(DownloadQueue.id <= queue_item.id)
-    position = (await session.execute(stmt)).scalar_one()
+    position = await video_queue_position(session, queue_item.id)
     if raw_inline_message_id:
         caption = loading_placeholder_caption(position)
         try:

@@ -8,7 +8,7 @@ from aiogram import Bot, F, Router
 from aiogram.enums import ChatType, ParseMode
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
-from sqlalchemy import func, select, update
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from caption import source_link
@@ -30,6 +30,7 @@ from services.queue import (
     show_music_request_result,
     try_deliver_cached_video,
     update_music_request_message,
+    video_queue_position,
     write_info_snapshot,
 )
 from utils.links import SUPPORTED_URL_RE, canonicalize_video_url, find_video_url
@@ -221,8 +222,7 @@ async def _start_pending_download(
     if callback.message:
         await callback.message.delete()
 
-    stmt = select(func.count()).select_from(DownloadQueue).where(DownloadQueue.id <= queue_item.id)
-    position = (await session.execute(stmt)).scalar_one()
+    position = await video_queue_position(session, queue_item.id)
     if placeholder:
         await placeholder.edit_caption(
             caption=loading_placeholder_caption(position),
@@ -569,8 +569,7 @@ async def handle_video_link_group(message: Message, session: AsyncSession, bot: 
             logging.exception("Не удалось удалить group placeholder после отказа enqueue")
         await message.reply(QUEUE_LIMIT_MESSAGE)
         return
-    stmt = select(func.count()).select_from(DownloadQueue).where(DownloadQueue.id <= queue_item.id)
-    position = (await session.execute(stmt)).scalar_one()
+    position = await video_queue_position(session, queue_item.id)
     await placeholder.edit_caption(
         caption=loading_placeholder_caption(position),
         parse_mode=ParseMode.HTML,

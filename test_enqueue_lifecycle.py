@@ -167,7 +167,7 @@ class PreEnqueueFailureLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_private_snapshot_write_failures_restore_retryable_pending(self):
         """Fails if ENOSPC/serialization loses private retry state or leaks a placeholder."""
         inspection = queue.MediaInspection(
-            media_id="123",
+            identity=queue.MediaIdentity(queue.MediaProvider.TIKTOK, "123"),
             source_url=SOURCE_URL,
             likes=None,
             description=None,
@@ -340,7 +340,7 @@ class PendingLifecycleTests(unittest.IsolatedAsyncioTestCase):
         """Fails if the temporary-pop race reinserts a large item without a live TTL."""
         token = "large-quality"
         inspection = queue.MediaInspection(
-            media_id="123",
+            identity=queue.MediaIdentity(queue.MediaProvider.TIKTOK, "123"),
             source_url=SOURCE_URL,
             likes=9,
             description="desc",

@@ -23,7 +23,7 @@ from aiogram import Bot, html
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaVideo
-from sqlalchemy import case, func, select, update
+from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gallery_dl.extractor.message import Message as GalleryMessage
@@ -35,11 +35,15 @@ from caption import build_caption, source_link
 from promo import AD_DISPLAY_SECONDS
 from services.media_cache import (
     CachedVideo,
+    MediaIdentity,
+    MediaProvider,
     VideoCacheUpdate,
     find_cached_video,
-    find_cached_video_by_id,
+    find_cached_video_by_identity,
     invalidate_cached_video,
     is_invalid_cached_file_id_error,
+    media_cache_key,
+    media_identity_from_source,
     upsert_cached_video,
 )
 from utils.media_cookies import cookie_files_for_url
@@ -75,7 +79,6 @@ MUSIC_JOB_PREFIX = "music:"
 MUSIC_PAGE_PREFIX = "music_page:"
 MUSIC_START_PREFIX = "music_"
 QUEUE_WAKEUP_TIMEOUT_SECONDS = 60.0
-MEDIA_CACHE_PROFILE = "h264-aac-v2"
 VIDEO_TRANSCODE_CRF = 18
 QUEUE_LIMIT_MESSAGE = (
     "Можно поставить в очередь не больше 2 видео одновременно. "
@@ -99,7 +102,7 @@ class VideoQuality:
 
 @dataclass(frozen=True)
 class MediaInspection:
-    media_id: str | None
+    identity: MediaIdentity | None
     source_url: str
     likes: int | None
     description: str | None
@@ -295,6 +298,22 @@ async def enqueue_download(
         return True
 
 
+async def video_queue_position(session: AsyncSession, job_id: int) -> int:
+    """Return the visible position in the worker's video-priority class."""
+    result = await session.execute(
+        select(func.count())
+        .select_from(DownloadQueue)
+        .where(
+            DownloadQueue.id <= job_id,
+            or_(
+                DownloadQueue.inline_message_id.is_(None),
+                ~DownloadQueue.inline_message_id.startswith(MUSIC_JOB_PREFIX),
+            ),
+        )
+    )
+    return result.scalar_one()
+
+
 def notify_queue_enqueued() -> None:
     _queue_wakeup.set()
 
@@ -451,18 +470,19 @@ def _quality_options(formats: object) -> list[VideoQuality]:
 
 
 def _inspection_from_snapshot(url: str, info: dict[str, object]) -> MediaInspection:
-    match = _TIKTOK_ID_RE.search(url)
-    fallback_id = match.group(1) if match else None
-    media_id = str(info["id"]) if info.get("id") else fallback_id
     source_url = (
         str(info.get("webpage_url") or url)
         if "tiktok.com/" in url.lower()
         else url
     )
+    identity = (
+        media_identity_from_source(source_url, info.get("id"))
+        or media_identity_from_source(url, info.get("id"))
+    )
     raw_description = info.get("description")
     width, height = _extract_dimensions(info)
     return MediaInspection(
-        media_id=media_id,
+        identity=identity,
         source_url=source_url,
         likes=_to_int(info.get("like_count")),
         description=str(raw_description) if raw_description else None,
@@ -608,10 +628,6 @@ def _load_info_snapshot(filename: str) -> dict[str, object] | None:
     return loaded if isinstance(loaded, dict) else None
 
 
-def _media_cache_key(media_id: str) -> str:
-    return f"{MEDIA_CACHE_PROFILE}:{media_id}"
-
-
 def _resolve_media(url: str) -> tuple[str | None, str, int | None]:
     m = _TIKTOK_ID_RE.search(url)
     fallback_id = m.group(1) if m else None
@@ -716,7 +732,7 @@ def _ydl_download_from_info_file(
                     raise VideoTooLargeError
                 inspection = _inspection_from_snapshot(url, info)
                 return (
-                    inspection.media_id,
+                    inspection.identity.media_id if inspection.identity else None,
                     inspection.width,
                     inspection.height,
                     inspection.description,
@@ -1684,6 +1700,7 @@ async def deliver_cached_video(
     reply_to_message_id: int | None = None,
     has_spoiler: bool = False,
     without_description: bool = False,
+    music_deep_link: str | None = None,
 ) -> None:
     """Доставляет сохранённое Telegram-видео без локального файла и плейсхолдера."""
     await _deliver_video(
@@ -1699,6 +1716,7 @@ async def deliver_cached_video(
         placeholder_message_id=None,
         has_spoiler=has_spoiler,
         without_description=without_description,
+        music_deep_link=music_deep_link,
         wait_for_placeholder=False,
     )
 
@@ -1726,6 +1744,13 @@ async def try_deliver_cached_video(
         return False
 
     await session.rollback()
+    music_deep_link: str | None = None
+    if can_attach_music_link(without_description):
+        _, music_deep_link = await prepare_music_caption_link(
+            bot,
+            cached.source_url or canonical_url,
+            None,
+        )
     try:
         await deliver_cached_video(
             bot,
@@ -1736,6 +1761,7 @@ async def try_deliver_cached_video(
             reply_to_message_id=reply_to_message_id,
             has_spoiler=has_spoiler,
             without_description=without_description,
+            music_deep_link=music_deep_link,
         )
         return True
     except TelegramBadRequest as error:
@@ -2331,15 +2357,15 @@ async def _wait_for_next_job() -> QueueJob:
 
 async def _find_worker_cached_video(
     canonical_url: str,
-    media_id: str | None = None,
+    identity: MediaIdentity | None = None,
 ) -> CachedVideo | None:
     async with SessionLocal() as session:
         try:
-            if media_id is None:
+            if identity is None:
                 return await find_cached_video(session, canonical_url)
-            return await find_cached_video_by_id(session, media_id, canonical_url)
+            return await find_cached_video_by_identity(session, identity, canonical_url)
         except Exception:
-            logging.exception("Cache lookup failed: url=%s media_id=%s", canonical_url, media_id)
+            logging.exception("Cache lookup failed: url=%s", canonical_url)
             await session.rollback()
             return None
 
@@ -2510,9 +2536,9 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
         source_url = inspection.source_url
         likes = inspection.likes
 
-        if inspection.media_id and format_id is None:
+        if inspection.identity and format_id is None:
             with metrics.stage("cache"):
-                cached = await _find_worker_cached_video(source_url, inspection.media_id)
+                cached = await _find_worker_cached_video(source_url, inspection.identity)
             if cached is not None:
                 with metrics.stage("delivery"):
                     delivered_from_cache = await _try_deliver_worker_cache(
@@ -2555,7 +2581,11 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                     format_id,
                 )
         downloaded_id, width, height, description, duration = downloaded
-        final_id = inspection.media_id or downloaded_id
+        final_identity = (
+            inspection.identity
+            or media_identity_from_source(source_url, downloaded_id)
+            or media_identity_from_source(tiktok_link, downloaded_id)
+        )
 
         matches = [
             path
@@ -2723,9 +2753,9 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                 continue
 
             cache_update = None
-            if format_id is None and final_id and file_id:
+            if format_id is None and final_identity and file_id:
                 cache_update = VideoCacheUpdate(
-                    cache_key=_media_cache_key(final_id),
+                    cache_key=media_cache_key(final_identity),
                     file_id=file_id,
                     storage_message_id=storage_message_id,
                     description=description,

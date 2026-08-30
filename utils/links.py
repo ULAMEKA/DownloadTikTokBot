@@ -22,12 +22,6 @@ _SUPPORTED_HOSTS = {
     "www.instagram.com",
     "www.tiktok.com",
 }
-_TIKTOK_CACHE_MEDIA_PATH_RE = re.compile(
-    r"^/@[^/]+/(?:video|photo)/([^/]+)/?$",
-)
-_INSTAGRAM_CACHE_MEDIA_PATH_RE = re.compile(r"^/reels?/([^/]+)/?$")
-
-
 def clean_video_url(url: str) -> str:
     """Очищает пользовательскую ссылку до безопасного URL без трекинга."""
     url = html.unescape(url).strip().replace("\\_", "_")
@@ -77,16 +71,11 @@ def canonicalize_video_url(url: str) -> str:
 
 
 def cache_media_id(url: str) -> str | None:
-    """Возвращает стабильный ID медиа для канонической ссылки без сети."""
-    parts = urlsplit(url)
-    host = (parts.hostname or "").lower()
-    if host in {"tiktok.com", "www.tiktok.com"}:
-        match = _TIKTOK_CACHE_MEDIA_PATH_RE.fullmatch(parts.path)
-    elif host in {"instagram.com", "www.instagram.com"}:
-        match = _INSTAGRAM_CACHE_MEDIA_PATH_RE.fullmatch(parts.path)
-    else:
-        return None
-    return match.group(1) if match else None
+    """Compatibility wrapper; provider-aware identity lives in media_cache."""
+    from services.media_cache import cache_media_identity
+
+    identity = cache_media_identity(url)
+    return identity.media_id if identity is not None else None
 
 
 def find_video_url(text: str) -> str | None:
