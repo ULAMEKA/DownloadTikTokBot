@@ -229,6 +229,28 @@ class PreEnqueueFailureLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(("-100", 17), queue._placeholder_ready_at)
         self.assertIn("❌ Не удалось загрузить видео.", message.reply.await_args.args[0])
 
+    async def test_group_placeholder_failure_renders_terminal_error_without_enqueue(self):
+        """Fails if a pre-enqueue Telegram error escapes without a terminal group reply."""
+        message = SimpleNamespace(
+            text=SOURCE_URL,
+            chat=SimpleNamespace(id=-100, type="group"),
+            from_user=SimpleNamespace(id=42),
+            message_id=321,
+            reply_photo=AsyncMock(side_effect=OSError("placeholder failed")),
+            reply=AsyncMock(),
+        )
+
+        with (
+            patch("handlers.link._video_url_from_text", AsyncMock(return_value=SOURCE_URL)),
+            patch("handlers.link.try_deliver_cached_video", AsyncMock(return_value=False)),
+            patch("handlers.link.enqueue_download", AsyncMock()) as enqueue,
+            self.assertLogs(level="ERROR"),
+        ):
+            await link_handler.handle_video_link_group(message, SimpleNamespace(), SimpleNamespace())
+
+        enqueue.assert_not_awaited()
+        self.assertIn("❌ Не удалось загрузить видео.", message.reply.await_args.args[0])
+
     async def test_inline_commit_failure_cleans_deadline_and_renders_terminal_error(self):
         """Fails if an inline commit exception leaves its placeholder spinning forever."""
         result = SimpleNamespace(

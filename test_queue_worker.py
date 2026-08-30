@@ -101,6 +101,22 @@ class QueueWakeupTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(accepted)
         self.assertTrue(queue._queue_wakeup.is_set())
 
+    async def test_commit_failure_rolls_back_without_signalling(self):
+        """Fails if enqueue leaves a failed transaction after lifecycle cleanup."""
+        result = MagicMock()
+        result.scalar_one.return_value = 0
+        session = MagicMock()
+        session.execute = AsyncMock(return_value=result)
+        session.commit = AsyncMock(side_effect=OSError("commit failed"))
+        session.rollback = AsyncMock()
+        queue._queue_wakeup.clear()
+
+        with self.assertRaisesRegex(OSError, "commit failed"):
+            await queue.enqueue_download(session, MagicMock(), "user-1")
+
+        session.rollback.assert_awaited_once()
+        self.assertFalse(queue._queue_wakeup.is_set())
+
 
 class QueueSelectionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -532,7 +548,6 @@ class ShortSessionTests(unittest.IsolatedAsyncioTestCase):
                     "_prepare_telegram_video",
                     side_effect=queue.MediaPreparationError("stop after download"),
                 ),
-                patch.object(queue, "_resolve_media") as resolve,
                 patch.object(queue, "_discard_job", AsyncMock()),
                 patch.object(queue, "_show_download_error", AsyncMock()),
                 patch.object(queue, "_remove_download_files"),
@@ -549,7 +564,6 @@ class ShortSessionTests(unittest.IsolatedAsyncioTestCase):
             None,
         )
         fallback_download.assert_not_called()
-        resolve.assert_not_called()
 
     async def test_music_username_lookup_precedes_its_short_insert_session(self):
         session_opened = False
@@ -628,7 +642,6 @@ class ShortSessionTests(unittest.IsolatedAsyncioTestCase):
                     "_prepare_telegram_video",
                     side_effect=queue.MediaPreparationError("stop after download"),
                 ),
-                patch.object(queue, "_resolve_media") as resolve,
                 patch.object(queue, "_discard_job", AsyncMock()),
                 patch.object(queue, "_show_download_error", AsyncMock()),
                 patch.object(queue, "_remove_download_files"),
@@ -650,7 +663,6 @@ class ShortSessionTests(unittest.IsolatedAsyncioTestCase):
             None,
         )
         fallback_download.assert_not_called()
-        resolve.assert_not_called()
 
 
 class DeliveryRoutingTests(unittest.IsolatedAsyncioTestCase):
@@ -691,6 +703,7 @@ class DeliveryRoutingTests(unittest.IsolatedAsyncioTestCase):
         *,
         enqueued_at: datetime | None = None,
         on_download=None,
+        split_error: Exception | None = None,
     ):
         job = self._job(inline_message_id, enqueued_at)
         probe = self._probe()
@@ -723,6 +736,10 @@ class DeliveryRoutingTests(unittest.IsolatedAsyncioTestCase):
         finish = AsyncMock()
         discard = AsyncMock()
         show_error = AsyncMock()
+        split_video = MagicMock(
+            return_value=queue.VideoSplitOutcome([], None, 0),
+            side_effect=split_error,
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             video_path = Path(directory) / f"{job.filename}.mp4"
@@ -746,11 +763,7 @@ class DeliveryRoutingTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(queue, "_inspection_from_snapshot", return_value=inspection),
                 patch.object(queue, "_ydl_download_from_info_file", side_effect=download),
                 patch.object(queue, "_prepare_telegram_video", return_value=prepared),
-                patch.object(
-                    queue,
-                    "_split_video",
-                    return_value=queue.VideoSplitOutcome([video_path], None, 0),
-                ),
+                patch.object(queue, "_split_video", split_video),
                 patch.object(
                     queue,
                     "_upload_to_storage",
@@ -768,6 +781,8 @@ class DeliveryRoutingTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(queue, "_remove_download_files"),
                 patch.object(queue.asyncio, "sleep", AsyncMock()),
             ):
+                if split_error is None:
+                    split_video.return_value = queue.VideoSplitOutcome([video_path], None, 0)
                 await queue._process_video_job(bot, job)
 
             sent_video = (
@@ -840,6 +855,19 @@ class DeliveryRoutingTests(unittest.IsolatedAsyncioTestCase):
             ffmpeg_bypassed=True,
             queue_wait_ms=None,
         )
+
+    async def test_split_failure_records_attempts_in_terminal_summary(self):
+        """Fails if failed FFmpeg split attempts disappear from telemetry."""
+        metrics = queue.JobStageMetrics(job_id=1)
+        split_error = queue.VideoSplitError(attempts=4)
+
+        with (
+            patch.object(queue, "JobStageMetrics", return_value=metrics),
+            self.assertLogs(level="WARNING"),
+        ):
+            await self._run_single_delivery(None, split_error=split_error)
+
+        self.assertEqual(metrics.split_attempts, 4)
 
     async def test_queue_wait_is_snapshotted_before_video_processing(self):
         enqueued_at = datetime(2026, 8, 30, 12, 0, 0, tzinfo=timezone.utc)

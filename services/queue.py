@@ -62,9 +62,6 @@ FFPROBE_EXE = shutil.which("ffprobe")
 # ID канала-хранилища (отрицательное число для каналов, например -1001234567890)
 STORAGE_CHAT_ID: str | None = os.getenv("STORAGE_CHAT_ID")
 
-# Regex для извлечения ID видео из полного URL TikTok
-_TIKTOK_ID_RE = re.compile(r'/(?:video|photo)/(\d+)')
-
 _IMAGE_EXTENSIONS = {".avif", ".jpeg", ".jpg", ".png", ".webp"}
 _AUDIO_EXTENSIONS = {".aac", ".m4a", ".mp3", ".ogg", ".opus", ".wav"}
 _VIDEO_EXTENSIONS = {".m4v", ".mkv", ".mov", ".mp4", ".webm"}
@@ -297,7 +294,9 @@ class VideoTooLargeError(Exception):
 
 
 class VideoSplitError(Exception):
-    pass
+    def __init__(self, message: str = "Не удалось разделить видео", *, attempts: int = 0):
+        super().__init__(message)
+        self.attempts = attempts
 
 
 class InlineSplitError(Exception):
@@ -336,7 +335,11 @@ async def enqueue_download(
 
         item.user_id = user_id
         session.add(item)
-        await session.commit()
+        try:
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
         notify_queue_enqueued()
         return True
 
@@ -673,28 +676,6 @@ def _load_info_snapshot(filename: str) -> dict[str, object]:
     if not isinstance(loaded, dict):
         raise StaleInfoSnapshotError("Info snapshot имеет неверный тип")
     return loaded
-
-
-def _resolve_media(url: str) -> tuple[str | None, str, int | None]:
-    m = _TIKTOK_ID_RE.search(url)
-    fallback_id = m.group(1) if m else None
-    with _ydl_option_variants(url) as variants:
-        for index, opts in enumerate(variants):
-            try:
-                with _ydl_lock, yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore[arg-type]
-                    info = ydl.extract_info(url, download=False)
-                    if info:
-                        source_url = (
-                            str(info.get("webpage_url") or url)
-                            if "tiktok.com/" in url.lower()
-                            else url
-                        )
-                        media_id = str(info["id"]) if info.get("id") else fallback_id
-                        return media_id, source_url, _to_int(info.get("like_count"))
-            except Exception:
-                if index + 1 < len(variants):
-                    logging.info("yt-dlp: повторяем получение метаданных с cookies")
-    return fallback_id, url, None
 
 
 def _extract_dimensions(info: dict[str, object]) -> tuple[int | None, int | None]:
@@ -1350,6 +1331,8 @@ def _gallery_download(
     url: str,
     output: Path,
 ) -> tuple[str | None, int | None, int | None, str | None, float | None] | None:
+    local_identity = media_identity_from_source(url)
+    local_media_id = local_identity.media_id if local_identity is not None else None
     try:
         tiktok_video = _gallery_tiktok_video_download(url, output)
         if tiktok_video is not None:
@@ -1406,7 +1389,7 @@ def _gallery_download(
                 if not probe.has_audio and audio is not None:
                     _mux_external_audio(target, audio)
                     probe = _probe_media(target)
-                return _resolve_media(url)[0], probe.width, probe.height, None, probe.duration
+                return local_media_id, probe.width, probe.height, None, probe.duration
 
             images = sorted(
                 (path for path in files if path.suffix.lower() in _IMAGE_EXTENSIONS),
@@ -1421,7 +1404,7 @@ def _gallery_download(
                     raise VideoTooLargeError
                 probe = _probe_media(output)
                 return (
-                    _resolve_media(url)[0],
+                    local_media_id,
                     SLIDESHOW_WIDTH,
                     SLIDESHOW_HEIGHT,
                     None,
@@ -1485,6 +1468,7 @@ def _split_video(video_path: Path, duration: float | None) -> VideoSplitOutcome:
     part_dir = Path(tempfile.mkdtemp(dir=VIDEO_DIR, prefix=f"{video_path.stem}_parts_"))
     part_seconds = _segment_time_seconds(size, duration)
     suffix = video_path.suffix
+    attempt = 0
     try:
         for attempt in range(1, 7):
             for part in part_dir.iterdir():
@@ -1508,12 +1492,14 @@ def _split_video(video_path: Path, duration: float | None) -> VideoSplitOutcome:
                 return VideoSplitOutcome(parts, part_dir, attempt)
             largest_size = max((part.stat().st_size for part in parts), default=0)
             part_seconds = _next_segment_time_seconds(part_seconds, largest_size)
-    except Exception:
+    except Exception as error:
         shutil.rmtree(part_dir, ignore_errors=True)
-        raise
+        if isinstance(error, VideoSplitError):
+            raise
+        raise VideoSplitError(attempts=attempt) from error
 
     shutil.rmtree(part_dir, ignore_errors=True)
-    raise VideoSplitError
+    raise VideoSplitError(attempts=attempt)
 
 
 async def _show_download_error(
@@ -2723,12 +2709,16 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                 with metrics.stage("prepare"):
                     duration = await loop.run_in_executor(None, _probe_duration, video_path)
             with metrics.stage("split"):
-                split_outcome = await loop.run_in_executor(
-                    None,
-                    _split_video,
-                    video_path,
-                    duration,
-                )
+                try:
+                    split_outcome = await loop.run_in_executor(
+                        None,
+                        _split_video,
+                        video_path,
+                        duration,
+                    )
+                except VideoSplitError as error:
+                    metrics.split_attempts += error.attempts
+                    raise
             parts = split_outcome.parts
             part_dir = split_outcome.part_dir
             metrics.split_attempts += split_outcome.attempts

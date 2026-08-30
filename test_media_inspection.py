@@ -169,6 +169,41 @@ class MediaInspectionTests(unittest.TestCase):
 
             self.assertFalse(any(Path(directory).iterdir()))
 
+    def test_gallery_fallback_uses_local_identity_without_ytdlp_resolve(self):
+        """Fails if direct gallery fallback performs another yt-dlp URL extraction."""
+        instagram_url = "https://www.instagram.com/reel/AbC_123"
+        probe = queue.MediaProbe(
+            has_video=True,
+            has_audio=True,
+            width=640,
+            height=360,
+            duration=5.0,
+        )
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            queue,
+            "VIDEO_DIR",
+            Path(directory),
+        ):
+            output = Path(directory) / "job.mp4"
+
+            def gallery_cli(command, **_kwargs):
+                work_dir = Path(command[command.index("--directory") + 1])
+                (work_dir / "1_video.mp4").write_bytes(b"video")
+                return SimpleNamespace(returncode=0)
+
+            with (
+                patch.object(queue, "_gallery_tiktok_video_download", return_value=None),
+                patch.object(queue, "cookie_files_for_url", return_value=[]),
+                patch.object(queue.subprocess, "run", side_effect=gallery_cli),
+                patch.object(queue, "_probe_media", return_value=probe),
+                patch.object(queue.yt_dlp, "YoutubeDL") as youtube_dl,
+            ):
+                result = queue._gallery_download(instagram_url, output)
+
+        self.assertEqual(result[0], "AbC_123")
+        youtube_dl.assert_not_called()
+
 
 class InfoSnapshotWorkerFallbackTests(unittest.IsolatedAsyncioTestCase):
     async def test_typed_snapshot_download_failure_calls_gallery_directly(self):

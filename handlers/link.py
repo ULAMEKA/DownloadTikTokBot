@@ -536,28 +536,30 @@ async def handle_video_link_group(message: Message, session: AsyncSession, bot: 
     ):
         return
 
-    placeholder = await message.reply_photo(
-        photo=FSInputFile(str(AD_PLACEHOLDER_IMAGE)),
-        caption=loading_placeholder_caption(),
-        parse_mode=ParseMode.HTML,
-    )
-    queue_item = DownloadQueue(
-        chat_id=str(message.chat.id),
-        filename=str(uuid.uuid4()),
-        tiktok_link=url,
-        reply_to_message_id=-placeholder.message_id,
-    )
+    placeholder = None
     user_id = str(message.from_user.id if message.from_user else message.chat.id)
-    hold_placeholder(str(message.chat.id), placeholder.message_id)
     try:
+        placeholder = await message.reply_photo(
+            photo=FSInputFile(str(AD_PLACEHOLDER_IMAGE)),
+            caption=loading_placeholder_caption(),
+            parse_mode=ParseMode.HTML,
+        )
+        queue_item = DownloadQueue(
+            chat_id=str(message.chat.id),
+            filename=str(uuid.uuid4()),
+            tiktok_link=url,
+            reply_to_message_id=-placeholder.message_id,
+        )
+        hold_placeholder(str(message.chat.id), placeholder.message_id)
         enqueued = await enqueue_download(session, queue_item, user_id)
     except Exception as error:
         logging.exception("Не удалось поставить group-загрузку в очередь: %s", error)
-        release_placeholder(str(message.chat.id), placeholder.message_id)
-        try:
-            await placeholder.delete()
-        except Exception:
-            logging.exception("Не удалось удалить group placeholder после ошибки enqueue")
+        if placeholder is not None:
+            release_placeholder(str(message.chat.id), placeholder.message_id)
+            try:
+                await placeholder.delete()
+            except Exception:
+                logging.exception("Не удалось удалить group placeholder после ошибки enqueue")
         await message.reply("❌ Не удалось загрузить видео.")
         return
     if not enqueued:

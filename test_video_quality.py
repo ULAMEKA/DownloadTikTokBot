@@ -245,6 +245,26 @@ class VideoQualityTests(unittest.TestCase):
             self.assertEqual(len(outcome.parts), 1)
             self.assertEqual(outcome.parts[0].stat().st_size, 5)
 
+    def test_exhausted_split_reports_all_six_attempts(self):
+        """Fails if failed split jobs log zero attempts after six FFmpeg runs."""
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            queue,
+            "VIDEO_DIR",
+            Path(directory),
+        ), patch.object(queue, "MAX_TELEGRAM_PART_BYTES", 10):
+            video = Path(directory) / "large.mp4"
+            video.write_bytes(b"x" * 100)
+
+            def always_oversized(command, **_kwargs):
+                output_dir = Path(command[-1]).parent
+                (output_dir / "part_000.mp4").write_bytes(b"x" * 20)
+
+            with patch.object(queue.subprocess, "run", side_effect=always_oversized):
+                with self.assertRaises(queue.VideoSplitError) as captured:
+                    queue._split_video(video, duration=10.0)
+
+            self.assertEqual(captured.exception.attempts, 6)
+
 
 if __name__ == "__main__":
     unittest.main()
