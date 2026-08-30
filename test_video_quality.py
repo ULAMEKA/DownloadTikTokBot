@@ -16,10 +16,42 @@ from services.queue import (
     _tiktok_video_candidates,
     _ydl_base_options,
     needs_quality_choice,
+    select_fast_h264_format,
 )
 
 
 class VideoQualityTests(unittest.TestCase):
+    def test_fast_h264_selector_prefers_combined_aac_before_separate_streams(self):
+        formats = [
+            {"format_id": "hevc", "vcodec": "h265", "acodec": "aac", "fps": 60,
+             "width": 1080, "height": 1920, "tbr": 1200, "filesize": 20_000_000},
+            {"format_id": "h264-aac", "vcodec": "h264", "acodec": "aac", "fps": 30,
+             "width": 576, "height": 1024, "tbr": 381, "filesize": 8_400_000},
+            {"format_id": "h264-video", "vcodec": "h264", "acodec": "none", "fps": 60,
+             "width": 720, "height": 1280, "tbr": 600, "filesize": 9_000_000},
+            {"format_id": "aac", "vcodec": "none", "acodec": "aac", "abr": 128,
+             "filesize": 1_000_000},
+        ]
+
+        self.assertEqual(select_fast_h264_format(formats), "h264-aac")
+
+    def test_fast_h264_selector_uses_best_aac_when_no_combined_mp4_exists(self):
+        formats = [
+            {"format_id": "video", "vcodec": "avc1.640028", "acodec": "none", "fps": 60,
+             "width": 720, "height": 1280, "tbr": 700, "filesize": 9_000_000},
+            {"format_id": "aac-low", "vcodec": "none", "acodec": "aac", "abr": 64,
+             "filesize": 400_000},
+            {"format_id": "aac-high", "vcodec": "none", "acodec": "aac", "abr": 128,
+             "filesize": 800_000},
+        ]
+
+        self.assertEqual(select_fast_h264_format(formats), "video+aac-high")
+
+    def test_fast_h264_selector_returns_none_for_hevc_only(self):
+        self.assertIsNone(select_fast_h264_format([
+            {"format_id": "hevc", "vcodec": "h265", "acodec": "aac"},
+        ]))
+
     def test_list_video_qualities_remains_a_compatibility_wrapper(self):
         inspection = queue.MediaInspection(
             identity=queue.MediaIdentity(queue.MediaProvider.TIKTOK, "123"),

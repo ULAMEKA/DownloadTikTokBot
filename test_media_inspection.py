@@ -76,6 +76,36 @@ class MediaInspectionTests(unittest.TestCase):
         self.assertEqual([quality.format_id for quality in inspection.qualities], ["combined"])
         self.assertIs(inspection.info, info)
 
+    def test_inspection_snapshot_selects_fast_h264_format(self):
+        info = {
+            "id": "123",
+            "webpage_url": SOURCE_URL,
+            "formats": [
+                {"format_id": "hevc", "vcodec": "h265", "acodec": "aac", "fps": 60},
+                {"format_id": "h264-aac", "vcodec": "avc1.4d401f", "acodec": "aac", "fps": 30},
+            ],
+        }
+
+        inspection = queue._inspection_from_snapshot(SOURCE_URL, info)
+
+        self.assertEqual(inspection.fast_format_id, "h264-aac")
+
+    def test_require_fast_h264_format_rejects_snapshot_without_h264(self):
+        inspection = queue.MediaInspection(
+            identity=None,
+            source_url=SOURCE_URL,
+            likes=None,
+            description=None,
+            width=None,
+            height=None,
+            duration=None,
+            qualities=(),
+            info={"formats": [{"format_id": "hevc", "vcodec": "h265", "acodec": "aac"}]},
+        )
+
+        with self.assertRaises(queue.NoFastH264FormatError):
+            queue.require_fast_h264_format(inspection)
+
     def test_snapshot_write_is_atomic_and_loads_only_json_objects(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(
             queue, "VIDEO_DIR", Path(directory)
@@ -144,16 +174,18 @@ class MediaInspectionTests(unittest.TestCase):
             options = youtube_dl.call_args.args[0]
             self.assertEqual(options["format"], "format-1")
             self.assertEqual(options["max_filesize"], queue.MAX_SOURCE_VIDEO_BYTES)
+            ydl.extract_info.assert_not_called()
 
             ydl.download_with_info_file.return_value = 1
-            with patch.object(queue.yt_dlp, "YoutubeDL", return_value=ydl):
-                with self.assertRaises(queue.MediaPreparationError):
+            with patch.object(queue.yt_dlp, "YoutubeDL", return_value=ydl) as youtube_dl:
+                with self.assertRaises(queue.NoFastH264FormatError):
                     queue._ydl_download_from_info_file(
                         SOURCE_URL,
                         info_path,
                         str(Path(directory) / "job.%(ext)s"),
                         None,
                     )
+            youtube_dl.assert_not_called()
 
     def test_cleanup_removes_snapshot_remux_temp_and_part_directories(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(
@@ -228,6 +260,7 @@ class InfoSnapshotWorkerFallbackTests(unittest.IsolatedAsyncioTestCase):
             10.0,
             (),
             {"id": "123", "webpage_url": SOURCE_URL},
+            "h264-aac",
         )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -289,6 +322,7 @@ class InfoSnapshotWorkerFallbackTests(unittest.IsolatedAsyncioTestCase):
             None,
             (),
             {"id": "123", "webpage_url": SOURCE_URL},
+            "h264-aac",
         )
         show_error = AsyncMock()
 

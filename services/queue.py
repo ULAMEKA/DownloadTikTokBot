@@ -111,6 +111,7 @@ class MediaInspection:
     duration: float | None
     qualities: tuple[VideoQuality, ...]
     info: dict[str, object]
+    fast_format_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -311,6 +312,10 @@ class MediaPreparationError(Exception):
     pass
 
 
+class NoFastH264FormatError(MediaPreparationError):
+    pass
+
+
 class StaleInfoSnapshotError(MediaPreparationError):
     pass
 
@@ -435,6 +440,57 @@ def _audio_quality_key(item: dict[str, object]) -> tuple[int, int, int]:
     )
 
 
+def _fast_h264_rank(item: dict[str, object]) -> tuple[float, int, int, int]:
+    return (
+        _to_float(item.get("fps")) or 0.0,
+        (_to_int(item.get("width")) or 0) * (_to_int(item.get("height")) or 0),
+        _to_int(item.get("tbr")) or 0,
+        _to_int(item.get("filesize") or item.get("filesize_approx")) or 0,
+    )
+
+
+def select_fast_h264_format(formats: object) -> str | None:
+    if not isinstance(formats, list):
+        return None
+    typed = [item for item in formats if isinstance(item, dict)]
+    audio = [
+        item
+        for item in typed
+        if not _has_video(item) and _has_audio(item) and isinstance(item.get("format_id"), str)
+    ]
+    best_aac = max(
+        (
+            item
+            for item in audio
+            if str(item.get("acodec", "")).lower().startswith("aac")
+        ),
+        key=_audio_quality_key,
+        default=None,
+    )
+    best_audio = max(audio, key=_audio_quality_key, default=None)
+    classes = (
+        lambda item: _is_h264(item.get("vcodec")) and _has_audio(item)
+        and str(item.get("acodec", "")).lower().startswith("aac"),
+        lambda item: _is_h264(item.get("vcodec")) and not _has_audio(item) and best_aac,
+        lambda item: _is_h264(item.get("vcodec")) and not _has_audio(item) and best_audio,
+    )
+    for allowed in classes:
+        candidates = [item for item in typed if _has_video(item) and allowed(item)]
+        if not candidates:
+            continue
+        selected = max(candidates, key=_fast_h264_rank)
+        video_id = selected.get("format_id")
+        if not isinstance(video_id, str):
+            continue
+        if _has_audio(selected):
+            return video_id
+        audio_item = best_aac or best_audio
+        audio_id = audio_item.get("format_id") if audio_item else None
+        if isinstance(audio_id, str):
+            return f"{video_id}+{audio_id}"
+    return None
+
+
 def _codec_label(codec: object) -> str | None:
     if not isinstance(codec, str):
         return None
@@ -537,7 +593,14 @@ def _inspection_from_snapshot(url: str, info: dict[str, object]) -> MediaInspect
         duration=_to_float(info.get("duration")),
         qualities=tuple(_quality_options(info.get("formats"))),
         info=info,
+        fast_format_id=select_fast_h264_format(info.get("formats")),
     )
+
+
+def require_fast_h264_format(inspection: MediaInspection) -> str:
+    if inspection.fast_format_id:
+        return inspection.fast_format_id
+    raise NoFastH264FormatError("Источник не содержит совместимый H.264/AAC поток")
 
 
 def inspect_media(url: str) -> MediaInspection:
@@ -736,13 +799,15 @@ def _ydl_download_from_info_file(
     outtmpl: str,
     format_id: str | None,
 ) -> tuple[str | None, int | None, int | None, str | None, float | None]:
+    if not format_id:
+        raise NoFastH264FormatError("Не выбран совместимый H.264/AAC поток")
     last_error: Exception | None = None
     with _ydl_option_variants(url) as variants:
         for index, base_options in enumerate(variants):
             opts = {
                 **base_options,
                 "outtmpl": outtmpl,  # cspell:disable-line
-                "format": format_id or DEFAULT_FORMAT,
+                "format": format_id,
                 "max_filesize": MAX_SOURCE_VIDEO_BYTES,
             }
             try:
@@ -2650,7 +2715,7 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                     tiktok_link,
                     info_path,
                     outtmpl,
-                    format_id,
+                    require_fast_h264_format(inspection),
                 )
             except VideoTooLargeError:
                 raise
