@@ -14,7 +14,6 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from functools import partial
 from pathlib import Path
 from typing import Awaitable, Callable, TypeVar
 
@@ -79,7 +78,6 @@ MUSIC_START_PREFIX = "music_"
 QUEUE_WAKEUP_TIMEOUT_SECONDS = 60.0
 FINALIZATION_RETRY_INITIAL_SECONDS = 0.25
 FINALIZATION_RETRY_MAX_SECONDS = 5.0
-VIDEO_TRANSCODE_CRF = 18
 QUEUE_LIMIT_MESSAGE = (
     "Можно поставить в очередь не больше 2 видео одновременно. "
     "Дождись завершения текущих загрузок."
@@ -134,6 +132,7 @@ class PreparedVideo:
     path: Path
     probe: MediaProbe
     bypassed_ffmpeg: bool
+    preparation_mode: str = "direct"
 
 
 @dataclass(frozen=True)
@@ -407,7 +406,7 @@ def _is_h264(vcodec: object) -> bool:
     return isinstance(vcodec, str) and vcodec.lower().startswith(("h264", "avc"))
 
 
-def _can_bypass_telegram_normalization(path: Path, probe: MediaProbe) -> bool:
+def _is_fast_h264_direct(path: Path, probe: MediaProbe) -> bool:
     return (
         path.suffix.lower() == ".mp4"
         and probe.has_video
@@ -1098,12 +1097,16 @@ def _tiktok_video_candidates(post: dict[str, object]) -> list[dict[str, object]]
             "audio_id": None,
         })
 
+    candidates = [
+        candidate
+        for candidate in candidates
+        if _is_h264(candidate.get("codec"))
+    ]
     candidates.sort(
         key=lambda item: (
             _to_float(item.get("fps")) or 0.0,
             (_to_int(item.get("width")) or 0) * (_to_int(item.get("height")) or 0),
             _to_int(item.get("bitrate")) or 0,
-            1 if _is_h264(item.get("codec")) else 0,
         ),
         reverse=True,
     )
@@ -1220,6 +1223,10 @@ def _download_tiktok_post(
             _download_gallery_stream(extractor, urls, output)
 
             probe = _probe_media(output)
+            if not probe.has_video or not _is_h264(probe.video_codec):
+                raise NoFastH264FormatError(
+                    "gallery-dl скачал видео без совместимого H.264 потока"
+                )
             if not probe.has_audio:
                 selected_audio_id = selected.get("audio_id")
                 audio_urls = (
@@ -1294,52 +1301,19 @@ def _gallery_tiktok_video_download(
     return None
 
 
-def _prepare_telegram_video(
-    path: Path,
-    *,
-    force_normalize: bool = False,
-) -> PreparedVideo:
-    source_probe = _probe_media(path)
-    if not source_probe.has_video:
-        raise MediaPreparationError("В файле отсутствует видеодорожка")
-    if not source_probe.has_audio:
-        raise MissingAudioError
-    if (
-        not force_normalize
-        and _can_bypass_telegram_normalization(path, source_probe)
-    ):
-        return PreparedVideo(path, source_probe, True)
-
-    needs_video_transcode = (
-        not _is_h264(source_probe.video_codec)
-        or source_probe.pixel_format not in (None, "yuv420p")
-        or source_probe.sample_aspect_ratio not in (None, "1:1")
-        or bool(source_probe.rotation)
-    )
-    needs_audio_transcode = source_probe.audio_codec != "aac"
+def _fast_remux_h264(path: Path, probe: MediaProbe) -> PreparedVideo:
     output = path.with_name(f"{path.stem}.telegram.mp4")
     final_path = path.with_suffix(".mp4")
+    audio_to_aac = probe.audio_codec != "aac"
     command = [
         FFMPEG_EXE, "-loglevel", "error", "-y",
         "-i", str(path),
         "-map", "0:v:0",
         "-map", "0:a:0",
         "-map_metadata", "-1",
+        "-c:v", "copy",
     ]
-    if needs_video_transcode:
-        command.extend((
-            "-vf", "setsar=1",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", str(VIDEO_TRANSCODE_CRF),
-            "-pix_fmt", "yuv420p",
-            "-threads", "1",
-            "-fps_mode", "vfr",
-            "-metadata:s:v:0", "rotate=0",
-        ))
-    else:
-        command.extend(("-c:v", "copy"))
-    if needs_audio_transcode:
+    if audio_to_aac:
         command.extend(("-c:a", "aac", "-b:a", "192k"))
     else:
         command.extend(("-c:a", "copy"))
@@ -1351,15 +1325,39 @@ def _prepare_telegram_video(
         if not prepared_probe.has_video or not prepared_probe.has_audio:
             raise MediaPreparationError("FFmpeg создал неполный файл")
         if not _is_h264(prepared_probe.video_codec):
-            raise MediaPreparationError("Не удалось привести видео к H.264")
+            raise MediaPreparationError("FFmpeg не сохранил H.264 видеопоток")
+        if prepared_probe.audio_codec != "aac":
+            raise MediaPreparationError("FFmpeg не подготовил AAC аудиопоток")
         if output.stat().st_size > MAX_SOURCE_VIDEO_BYTES:
             raise VideoTooLargeError
         os.replace(output, final_path)
         if path != final_path:
             path.unlink(missing_ok=True)
-        return PreparedVideo(final_path, prepared_probe, False)
+        return PreparedVideo(
+            final_path,
+            prepared_probe,
+            False,
+            "audio_to_aac" if audio_to_aac else "remux_copy",
+        )
     finally:
         output.unlink(missing_ok=True)
+
+
+def _prepare_telegram_video(path: Path) -> PreparedVideo:
+    probe = _probe_media(path)
+    if not probe.has_video:
+        raise MediaPreparationError("В файле отсутствует видеодорожка")
+    if not probe.has_audio:
+        raise MissingAudioError
+    if not _is_h264(probe.video_codec):
+        raise NoFastH264FormatError("Источник не содержит H.264 видеопоток")
+    if probe.pixel_format not in (None, "yuv420p"):
+        raise NoFastH264FormatError("H.264 видеопоток использует несовместимый pixel format")
+    if probe.sample_aspect_ratio not in (None, "1:1") or probe.rotation:
+        raise NoFastH264FormatError("H.264 видеопоток требует геометрической нормализации")
+    if _is_fast_h264_direct(path, probe):
+        return PreparedVideo(path, probe, True, "direct")
+    return _fast_remux_h264(path, probe)
 
 
 def _build_slideshow(images: list[Path], audio: Path | None, output: Path) -> None:
@@ -1444,6 +1442,10 @@ def _gallery_download(
             )
             if video:
                 probe = _probe_media(video)
+                if not probe.has_video or not _is_h264(probe.video_codec):
+                    raise NoFastH264FormatError(
+                        "gallery-dl скачал видео без совместимого H.264 потока"
+                    )
                 if not probe.has_audio and audio is None and index + 1 < len(cookie_variants):
                     logging.info("gallery-dl: повторяем загрузку видео с cookies")
                     continue
@@ -2758,172 +2760,138 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
         ffmpeg_bypassed = prepared_video.bypassed_ffmpeg
         music_deep_link: str | None = None
         music_deep_link_prepared = False
-        forced_normalization_attempted = False
-        while True:
-            video_path = prepared_video.path
-            media_probe = prepared_video.probe
-            width = media_probe.width or width
-            height = media_probe.height or height
-            duration = media_probe.duration or duration
+        video_path = prepared_video.path
+        media_probe = prepared_video.probe
+        width = media_probe.width or width
+        height = media_probe.height or height
+        duration = media_probe.duration or duration
 
-            if (
-                not isinstance(duration, (int, float))
-                or not math.isfinite(duration)
-                or duration <= 0
-            ):
-                with metrics.stage("prepare"):
-                    duration = await loop.run_in_executor(None, _probe_duration, video_path)
-            with metrics.stage("split"):
-                try:
-                    split_outcome = await loop.run_in_executor(
-                        None,
-                        _split_video,
-                        video_path,
-                        duration,
-                    )
-                except VideoSplitError as error:
-                    metrics.split_attempts += error.attempts
-                    raise
-            parts = split_outcome.parts
-            part_dir = split_outcome.part_dir
-            metrics.split_attempts += split_outcome.attempts
-            successful_sends = 0
+        if (
+            not isinstance(duration, (int, float))
+            or not math.isfinite(duration)
+            or duration <= 0
+        ):
+            with metrics.stage("prepare"):
+                duration = await loop.run_in_executor(None, _probe_duration, video_path)
+        with metrics.stage("split"):
             try:
-                if len(parts) > 1:
-                    if inline_message_id:
-                        raise InlineSplitError
-                    if (
-                        can_attach_music_link(without_description)
-                        and not music_deep_link_prepared
-                    ):
-                        _, music_deep_link = await prepare_music_caption_link(
-                            bot,
-                            source_url,
-                            format_id,
-                        )
-                        music_deep_link_prepared = True
-                    for number, part in enumerate(parts, start=1):
-                        part_description = f"Часть {number}/{len(parts)}"
-                        if number == 1 and description:
-                            part_description = f"{part_description}\n\n{description}"
-                        for attempt in range(2):
-                            try:
-                                with metrics.stage("delivery"):
-                                    await _deliver_video(
-                                        bot,
-                                        chat_id,
-                                        None,
-                                        file_id=None,
-                                        video_path=part,
-                                        width=width,
-                                        height=height,
-                                        description=part_description,
-                                        source_url=source_url if number == 1 else None,
-                                        likes=likes if number == 1 else None,
-                                        reply_to_message_id=reply_to_message_id,
-                                        placeholder_message_id=placeholder_message_id,
-                                        has_spoiler=has_spoiler,
-                                        without_description=without_description,
-                                        music_deep_link=(
-                                            music_deep_link if number == 1 else None
-                                        ),
-                                    )
-                                successful_sends += 1
-                                break
-                            except TelegramRetryAfter as error:
-                                if attempt:
-                                    raise
-                                await asyncio.sleep(error.retry_after)
-                        placeholder_message_id = None
-                        part.unlink(missing_ok=True)
-                    video_path.unlink(missing_ok=True)
-                    _remove_download_files(filename)
-                    await _finish_video_job(job.id, None)
-                    return
-
-                file_id: str | None = None
-                storage_message_id: int | None = None
-                if inline_message_id:
-                    with metrics.stage("storage"):
-                        file_id, storage_message_id = await _upload_to_storage(
-                            bot,
-                            video_path,
-                            width,
-                            height,
-                        )
-
-                if (
-                    can_attach_music_link(without_description)
-                    and not music_deep_link_prepared
-                ):
-                    _, music_deep_link = await prepare_music_caption_link(
-                        bot,
-                        source_url,
-                        format_id,
-                    )
-                    music_deep_link_prepared = True
-                with metrics.stage("delivery"):
-                    result_file_id = await _deliver_video(
-                        bot,
-                        chat_id,
-                        inline_message_id,
-                        file_id=file_id,
-                        video_path=video_path,
-                        width=width,
-                        height=height,
-                        description=description,
-                        source_url=source_url,
-                        likes=likes,
-                        reply_to_message_id=reply_to_message_id,
-                        placeholder_message_id=placeholder_message_id,
-                        has_spoiler=has_spoiler,
-                        without_description=without_description,
-                        music_deep_link=music_deep_link,
-                    )
-                successful_sends += 1
-                if result_file_id and not file_id:
-                    file_id = result_file_id
-            except TelegramBadRequest:
-                can_force_normalize = (
-                    inline_message_id is None
-                    and prepared_video.bypassed_ffmpeg
-                    and not forced_normalization_attempted
-                    and successful_sends == 0
+                split_outcome = await loop.run_in_executor(
+                    None,
+                    _split_video,
+                    video_path,
+                    duration,
                 )
-                if not can_force_normalize:
-                    raise
-                if part_dir:
-                    shutil.rmtree(part_dir, ignore_errors=True)
-                    part_dir = None
-                logging.warning(
-                    "Telegram rejected bypassed MP4; retrying after forced normalization"
+            except VideoSplitError as error:
+                metrics.split_attempts += error.attempts
+                raise
+        parts = split_outcome.parts
+        part_dir = split_outcome.part_dir
+        metrics.split_attempts += split_outcome.attempts
+        if len(parts) > 1:
+            if inline_message_id:
+                raise InlineSplitError
+            if (
+                can_attach_music_link(without_description)
+                and not music_deep_link_prepared
+            ):
+                _, music_deep_link = await prepare_music_caption_link(
+                    bot,
+                    source_url,
+                    format_id,
                 )
-                forced_normalization_attempted = True
-                with metrics.stage("prepare"):
-                    prepared_video = await loop.run_in_executor(
-                        None,
-                        partial(
-                            _prepare_telegram_video,
-                            video_path,
-                            force_normalize=True,
-                        ),
-                    )
-                ffmpeg_bypassed = prepared_video.bypassed_ffmpeg
-                continue
-
-            cache_update = None
-            if format_id is None and final_identity and file_id:
-                cache_update = VideoCacheUpdate(
-                    cache_key=media_cache_key(final_identity),
-                    file_id=file_id,
-                    storage_message_id=storage_message_id,
-                    description=description,
-                    source_url=source_url,
-                    likes=likes,
-                )
+                music_deep_link_prepared = True
+            for number, part in enumerate(parts, start=1):
+                part_description = f"Часть {number}/{len(parts)}"
+                if number == 1 and description:
+                    part_description = f"{part_description}\n\n{description}"
+                for attempt in range(2):
+                    try:
+                        with metrics.stage("delivery"):
+                            await _deliver_video(
+                                bot,
+                                chat_id,
+                                None,
+                                file_id=None,
+                                video_path=part,
+                                width=width,
+                                height=height,
+                                description=part_description,
+                                source_url=source_url if number == 1 else None,
+                                likes=likes if number == 1 else None,
+                                reply_to_message_id=reply_to_message_id,
+                                placeholder_message_id=placeholder_message_id,
+                                has_spoiler=has_spoiler,
+                                without_description=without_description,
+                                music_deep_link=(
+                                    music_deep_link if number == 1 else None
+                                ),
+                            )
+                        break
+                    except TelegramRetryAfter as error:
+                        if attempt:
+                            raise
+                        await asyncio.sleep(error.retry_after)
+                placeholder_message_id = None
+                part.unlink(missing_ok=True)
+            video_path.unlink(missing_ok=True)
             _remove_download_files(filename)
-            await _finish_video_job(job.id, cache_update)
+            await _finish_video_job(job.id, None)
             return
+
+        file_id: str | None = None
+        storage_message_id: int | None = None
+        if inline_message_id:
+            with metrics.stage("storage"):
+                file_id, storage_message_id = await _upload_to_storage(
+                    bot,
+                    video_path,
+                    width,
+                    height,
+                )
+
+        if (
+            can_attach_music_link(without_description)
+            and not music_deep_link_prepared
+        ):
+            _, music_deep_link = await prepare_music_caption_link(
+                bot,
+                source_url,
+                format_id,
+            )
+            music_deep_link_prepared = True
+        with metrics.stage("delivery"):
+            result_file_id = await _deliver_video(
+                bot,
+                chat_id,
+                inline_message_id,
+                file_id=file_id,
+                video_path=video_path,
+                width=width,
+                height=height,
+                description=description,
+                source_url=source_url,
+                likes=likes,
+                reply_to_message_id=reply_to_message_id,
+                placeholder_message_id=placeholder_message_id,
+                has_spoiler=has_spoiler,
+                without_description=without_description,
+                music_deep_link=music_deep_link,
+            )
+        if result_file_id and not file_id:
+            file_id = result_file_id
+        cache_update = None
+        if format_id is None and final_identity and file_id:
+            cache_update = VideoCacheUpdate(
+                cache_key=media_cache_key(final_identity),
+                file_id=file_id,
+                storage_message_id=storage_message_id,
+                description=description,
+                source_url=source_url,
+                likes=likes,
+            )
+        _remove_download_files(filename)
+        await _finish_video_job(job.id, cache_update)
+        return
 
     except MissingAudioError:
         logging.warning("Источник не отдал аудиодорожку: chat=%s url=%s", chat_id, tiktok_link)

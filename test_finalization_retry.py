@@ -102,6 +102,7 @@ class FinalizationRetryTests(unittest.IsolatedAsyncioTestCase):
             5.0,
             (),
             {"id": "123", "webpage_url": SOURCE_URL},
+            "h264-aac",
         )
         root = Path(self.temp_dir.name)
         video_path = root / f"{job.filename}.mp4"

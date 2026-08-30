@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import services.queue as queue
@@ -128,7 +129,7 @@ class VideoQualityTests(unittest.TestCase):
         self.assertIn("60 FPS", options[0].label)
         self.assertEqual(options[0].filesize, 32_000_000)
 
-    def test_tiktok_fallback_prefers_fps_then_resolution_and_matching_audio(self):
+    def test_tiktok_fallback_filters_non_h264_before_ranking_and_matching_audio(self):
         post = {
             "video": {
                 "bitrateInfo": [
@@ -191,12 +192,13 @@ class VideoQualityTests(unittest.TestCase):
 
         candidates = _tiktok_video_candidates(post)
 
-        self.assertEqual(candidates[0]["urls"], ["https://cdn/1080-60"])
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["urls"], ["https://cdn/720"])
         self.assertEqual(candidates[0]["fps"], 60)
-        self.assertEqual(candidates[0]["audio_id"], "audio-60")
+        self.assertEqual(candidates[0]["audio_id"], "audio-low")
         self.assertEqual(
             _tiktok_audio_urls(post["video"], candidates[0]["audio_id"]),
-            ["https://cdn/audio-60"],
+            ["https://cdn/audio-low"],
         )
 
     def test_tiktok_fallback_does_not_trade_sixty_fps_for_resolution(self):
@@ -229,8 +231,83 @@ class VideoQualityTests(unittest.TestCase):
 
         candidates = _tiktok_video_candidates(post)
 
+        self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0]["urls"], ["https://cdn/720-60"])
         self.assertEqual(candidates[0]["fps"], 60)
+
+    def test_tiktok_external_audio_is_not_muxed_until_downloaded_video_is_h264(self):
+        post = {
+            "post_type": "video",
+            "id": "123",
+            "video": {
+                "bitrateInfo": [{
+                    "CodecType": "h264",
+                    "PlayAddr": {"UrlList": ["https://cdn/video"]},
+                    "VideoExtra": '{"audio_file_id":"audio"}',
+                }],
+                "bitrateAudioInfo": [{
+                    "FileId": "audio",
+                    "UrlList": {"MainUrl": "https://cdn/audio"},
+                }],
+            },
+        }
+        hevc_probe = queue.MediaProbe(
+            has_video=True,
+            has_audio=False,
+            video_codec="hevc",
+        )
+        h264_probe = queue.MediaProbe(
+            has_video=True,
+            has_audio=True,
+            video_codec="h264",
+            audio_codec="aac",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "video.mp4"
+            with (
+                patch.object(queue, "_download_gallery_stream"),
+                patch.object(queue, "_probe_media", side_effect=[hevc_probe, h264_probe]),
+                patch.object(queue, "_mux_external_audio") as mux_audio,
+            ):
+                with self.assertRaises(queue.MediaPreparationError):
+                    queue._download_tiktok_post(object(), post, output)
+
+            mux_audio.assert_not_called()
+
+    def test_generic_gallery_rejects_non_h264_video_before_moving_it(self):
+        probe = queue.MediaProbe(
+            has_video=True,
+            has_audio=True,
+            video_codec="hevc",
+            audio_codec="aac",
+        )
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            queue,
+            "VIDEO_DIR",
+            Path(directory),
+        ):
+            output = Path(directory) / "job.mp4"
+
+            def gallery_cli(command, **_kwargs):
+                work_dir = Path(command[command.index("--directory") + 1])
+                (work_dir / "1_video.mp4").write_bytes(b"video")
+                return SimpleNamespace(returncode=0)
+
+            with (
+                patch.object(queue, "_gallery_tiktok_video_download", return_value=None),
+                patch.object(queue, "cookie_files_for_url", return_value=[]),
+                patch.object(queue.subprocess, "run", side_effect=gallery_cli),
+                patch.object(queue, "_probe_media", return_value=probe),
+            ):
+                with self.assertRaises(queue.NoFastH264FormatError):
+                    queue._gallery_download(
+                        "https://www.instagram.com/reel/AbC_123",
+                        output,
+                    )
+
+            self.assertFalse(output.exists())
 
     def test_quality_menu_is_only_needed_for_large_sources(self):
         self.assertFalse(needs_quality_choice([

@@ -207,6 +207,8 @@ class MediaInspectionTests(unittest.TestCase):
         probe = queue.MediaProbe(
             has_video=True,
             has_audio=True,
+            video_codec="h264",
+            audio_codec="aac",
             width=640,
             height=360,
             duration=5.0,
