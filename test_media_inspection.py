@@ -227,7 +227,11 @@ class MediaInspectionTests(unittest.TestCase):
                 return SimpleNamespace(returncode=0)
 
             with (
-                patch.object(queue, "_gallery_tiktok_video_download", return_value=None),
+                patch.object(
+                    queue,
+                    "_gallery_tiktok_video_download",
+                    side_effect=queue.NoFastH264FormatError("advanced HEVC"),
+                ),
                 patch.object(queue, "cookie_files_for_url", return_value=[]),
                 patch.object(queue.subprocess, "run", side_effect=gallery_cli),
                 patch.object(queue, "_probe_media", return_value=probe),
@@ -237,6 +241,32 @@ class MediaInspectionTests(unittest.TestCase):
 
         self.assertEqual(result[0], "AbC_123")
         youtube_dl.assert_not_called()
+
+    def test_gallery_cookie_variants_preserve_no_fast_after_later_generic_failure(self):
+        no_fast_error = queue.NoFastH264FormatError("downloaded HEVC")
+        context = (object(), {"post_type": "video"}, SOURCE_URL)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(
+                    queue,
+                    "cookie_files_for_url",
+                    return_value=[Path(directory) / "cookies.txt"],
+                ),
+                patch.object(queue, "_gallery_tiktok_context", return_value=context),
+                patch.object(
+                    queue,
+                    "_download_tiktok_post",
+                    side_effect=[no_fast_error, RuntimeError("cookie retry failed")],
+                ),
+            ):
+                with self.assertRaises(queue.NoFastH264FormatError) as captured:
+                    queue._gallery_tiktok_video_download(
+                        SOURCE_URL,
+                        Path(directory) / "video.mp4",
+                    )
+
+        self.assertIs(captured.exception, no_fast_error)
 
 
 class InfoSnapshotWorkerFallbackTests(unittest.IsolatedAsyncioTestCase):

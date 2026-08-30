@@ -1209,6 +1209,7 @@ def _download_tiktok_post(
     if not candidates:
         return None
     last_error: Exception | None = None
+    no_fast_error: NoFastH264FormatError | None = None
     video_metadata = post.get("video")
     raw_description = post.get("desc")
     for selected in candidates:
@@ -1257,6 +1258,8 @@ def _download_tiktok_post(
             )
         except Exception as error:
             last_error = error
+            if isinstance(error, NoFastH264FormatError) and no_fast_error is None:
+                no_fast_error = error
             output.unlink(missing_ok=True)
             logging.info(
                 "Поток TikTok %sx%s/%s FPS не подошёл: %s",
@@ -1268,10 +1271,9 @@ def _download_tiktok_post(
         finally:
             audio_path.unlink(missing_ok=True)
 
-    if isinstance(
-        last_error,
-        (VideoTooLargeError, MissingAudioError, NoFastH264FormatError),
-    ):
+    if no_fast_error is not None:
+        raise no_fast_error
+    if isinstance(last_error, (VideoTooLargeError, MissingAudioError)):
         raise last_error
     raise MediaPreparationError("Не удалось скачать ни один поток TikTok") from last_error
 
@@ -1282,6 +1284,7 @@ def _gallery_tiktok_video_download(
 ) -> tuple[str | None, int | None, int | None, str | None, float | None] | None:
     cookie_variants: list[Path | None] = [None, *cookie_files_for_url(url)]
     last_error: Exception | None = None
+    no_fast_error: NoFastH264FormatError | None = None
     for index, current_cookie_file in enumerate(cookie_variants):
         try:
             context = _gallery_tiktok_context(url, current_cookie_file)
@@ -1295,10 +1298,14 @@ def _gallery_tiktok_video_download(
             raise
         except Exception as error:
             last_error = error
+            if isinstance(error, NoFastH264FormatError) and no_fast_error is None:
+                no_fast_error = error
             output.unlink(missing_ok=True)
             if index + 1 < len(cookie_variants):
                 logging.info("gallery-dl: повторяем загрузку TikTok с cookies")
                 continue
+    if no_fast_error is not None:
+        raise no_fast_error
     if last_error is not None:
         raise last_error
     return None

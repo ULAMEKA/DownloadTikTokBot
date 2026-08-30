@@ -275,6 +275,84 @@ class VideoQualityTests(unittest.TestCase):
 
             mux_audio.assert_not_called()
 
+    def test_tiktok_candidates_preserve_no_fast_error_after_later_generic_failure(self):
+        post = {
+            "post_type": "video",
+            "video": {
+                "bitrateInfo": [
+                    {
+                        "BitrateFPS": 60,
+                        "CodecType": "h264",
+                        "PlayAddr": {"UrlList": ["https://cdn/first"]},
+                    },
+                    {
+                        "BitrateFPS": 30,
+                        "CodecType": "h264",
+                        "PlayAddr": {"UrlList": ["https://cdn/second"]},
+                    },
+                ],
+            },
+        }
+        no_fast_probe = queue.MediaProbe(
+            has_video=True,
+            has_audio=True,
+            video_codec="hevc",
+            audio_codec="aac",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(
+                    queue,
+                    "_download_gallery_stream",
+                    side_effect=[None, RuntimeError("second candidate failed")],
+                ),
+                patch.object(queue, "_probe_media", return_value=no_fast_probe),
+            ):
+                with self.assertRaises(queue.NoFastH264FormatError):
+                    queue._download_tiktok_post(
+                        object(),
+                        post,
+                        Path(directory) / "video.mp4",
+                    )
+
+    def test_tiktok_candidates_keep_generic_error_when_no_typed_error_occurs(self):
+        post = {
+            "post_type": "video",
+            "video": {
+                "bitrateInfo": [
+                    {
+                        "BitrateFPS": 60,
+                        "CodecType": "h264",
+                        "PlayAddr": {"UrlList": ["https://cdn/first"]},
+                    },
+                    {
+                        "BitrateFPS": 30,
+                        "CodecType": "h264",
+                        "PlayAddr": {"UrlList": ["https://cdn/second"]},
+                    },
+                ],
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            queue,
+            "_download_gallery_stream",
+            side_effect=[
+                RuntimeError("first candidate failed"),
+                RuntimeError("second candidate failed"),
+            ],
+        ):
+            with self.assertRaises(queue.MediaPreparationError) as captured:
+                queue._download_tiktok_post(
+                    object(),
+                    post,
+                    Path(directory) / "video.mp4",
+                )
+
+        self.assertNotIsInstance(captured.exception, queue.NoFastH264FormatError)
+        self.assertEqual(str(captured.exception.__cause__), "second candidate failed")
+
     def test_generic_gallery_rejects_non_h264_video_before_moving_it(self):
         probe = queue.MediaProbe(
             has_video=True,
