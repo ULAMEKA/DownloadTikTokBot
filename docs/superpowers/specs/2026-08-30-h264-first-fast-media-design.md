@@ -159,6 +159,10 @@ audio download → H.264/AAC slideshow. Если исходный трек не�
 - Existing cached `file_id` не подвергается probe или FFmpeg.
 - Direct H.264 send, cache invalidation, split, storage и music deep-link
   сохраняют существующие contracts.
+- Opt-in music recognition не доставляет исходное video пользователю и не
+  проходит source-video preparation. Его existing audio extraction path
+  сохраняется, включая возможность взять source с не-H.264 видеокодеком ради
+  аудиотрека; это не нарушает H.264-first policy delivered videos.
 - Forced video normalization retry после `TelegramBadRequest` удаляется.
   Разрешён только retry с fast remux/audio-only path, если первый fast path ещё
   не был применён и видео не было доставлено.
@@ -197,7 +201,9 @@ TDD добавляет или обновляет тесты для:
 10. Photo gallery with an external source track keeps the audio in the final
     slideshow; gallery without a track still produces the existing silent
     slideshow path.
-11. Existing cache, queue lifecycle, session, telemetry, split, music and
+11. Opt-in music recognition retains its audio extraction behavior for a
+    non-H.264 source and never routes that source through video preparation.
+12. Existing cache, queue lifecycle, session, telemetry, split, music and
     error regressions.
 
 The full safe suite remains:
