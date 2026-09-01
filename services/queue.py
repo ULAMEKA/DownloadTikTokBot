@@ -2776,6 +2776,9 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                     cache_status = "hit"
                     return
 
+        inspection: MediaInspection | None = None
+        inspection_error: Exception | None = None
+        info_path: Path | None = None
         with metrics.stage("inspect"):
             try:
                 snapshot = _load_info_snapshot(filename)
@@ -2785,21 +2788,27 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                 try:
                     inspection = await loop.run_in_executor(None, inspect_media, tiktok_link)
                 except Exception as error:
-                    raise MediaPreparationError("Не удалось получить метаданные") from error
-                info_path = write_info_snapshot(filename, inspection.info)
+                    inspection_error = error
+                else:
+                    info_path = write_info_snapshot(filename, inspection.info)
             else:
                 inspection = _inspection_from_snapshot(tiktok_link, snapshot)
                 info_path = _info_snapshot_path(filename)
-        source_url = inspection.source_url
-        likes = inspection.likes
+        if inspection is not None:
+            source_url = inspection.source_url
+            likes = inspection.likes
+        else:
+            source_url = tiktok_link
+            likes = None
         selector_error: NoFastH264FormatError | None = None
-        try:
-            download_format_id = require_fast_h264_format(inspection)
-        except NoFastH264FormatError as error:
-            selector_error = error
-            download_format_id = None
+        download_format_id: str | None = None
+        if inspection is not None:
+            try:
+                download_format_id = require_fast_h264_format(inspection)
+            except NoFastH264FormatError as error:
+                selector_error = error
 
-        if inspection.identity and format_id is None:
+        if inspection is not None and inspection.identity and format_id is None:
             with metrics.stage("cache"):
                 cached = await _find_worker_cached_video(source_url, inspection.identity)
             if cached is not None:
@@ -2833,6 +2842,8 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                     slideshow_path,
                 )
                 if gallery_result is None:
+                    if inspection_error is not None:
+                        raise MediaPreparationError("Fallback не скачал медиа") from inspection_error
                     if selector_error is not None:
                         raise selector_error
                     raise NoFastH264FormatError(
@@ -2870,7 +2881,7 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                     downloaded = gallery_result.metadata()
         downloaded_id, width, height, description, duration = downloaded
         final_identity = (
-            inspection.identity
+            (inspection.identity if inspection is not None else None)
             or media_identity_from_source(source_url, downloaded_id)
             or media_identity_from_source(tiktok_link, downloaded_id)
         )

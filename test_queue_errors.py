@@ -220,6 +220,7 @@ class QueueErrorMessageTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(queue, "_load_info_snapshot", return_value=None),
             patch.object(queue, "inspect_media", side_effect=RuntimeError("inspect failed")),
+            patch.object(queue, "_gallery_download", return_value=None) as gallery,
             patch.object(queue, "_discard_job", AsyncMock()),
             patch.object(queue, "_remove_download_files"),
             patch.object(queue.asyncio, "sleep", AsyncMock()),
@@ -227,9 +228,69 @@ class QueueErrorMessageTests(unittest.IsolatedAsyncioTestCase):
         ):
             await queue._process_video_job(bot, job)
 
+        gallery.assert_called_once()
         self.assertTrue(
             bot.message_args["text"].startswith("❌ Не удалось загрузить видео.\n\n")
         )
+
+    async def test_inspection_failure_uses_gallery_fallback(self):
+        source_url = "https://www.tiktok.com/@author/video/123"
+        job = queue.QueueJob(
+            1,
+            "123",
+            "456",
+            "failed-inspection-fallback",
+            source_url,
+            None,
+            None,
+            None,
+            None,
+        )
+        show_error = AsyncMock()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video_path = root / "failed-inspection-fallback.mp4"
+            video_path.write_bytes(b"video")
+            gallery_result = queue.GalleryDownloadResult(
+                media_id="123",
+                path=video_path,
+                probe=queue.MediaProbe(
+                    has_video=True,
+                    has_audio=True,
+                    video_codec="h264",
+                    audio_codec="aac",
+                    width=640,
+                    height=360,
+                    duration=5.0,
+                ),
+                width=640,
+                height=360,
+                description=None,
+                duration=5.0,
+            )
+            with (
+                patch.object(queue, "VIDEO_DIR", root),
+                patch.object(queue, "_find_worker_cached_video", AsyncMock(return_value=None)),
+                patch.object(queue, "_load_info_snapshot", return_value=None),
+                patch.object(queue, "inspect_media", side_effect=RuntimeError("inspect failed")),
+                patch.object(queue, "_gallery_download", return_value=gallery_result) as gallery,
+                patch.object(
+                    queue,
+                    "_prepare_telegram_video",
+                    side_effect=queue.MediaPreparationError("stop after fallback"),
+                ) as prepare,
+                patch.object(queue, "_discard_job", AsyncMock()),
+                patch.object(queue, "_show_download_error", show_error),
+                patch.object(queue, "_remove_download_files"),
+                patch.object(queue.asyncio, "sleep", AsyncMock()),
+                self.assertLogs(level="ERROR"),
+            ):
+                await queue._process_video_job(AsyncMock(), job)
+
+        gallery.assert_called_once_with(source_url, video_path)
+        prepare.assert_called_once_with(video_path)
+        show_error.assert_awaited_once()
 
     async def test_media_preparation_failure_reports_video_download_failure(self):
         source_url = "https://www.tiktok.com/@author/video/123"
