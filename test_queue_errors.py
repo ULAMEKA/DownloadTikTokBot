@@ -188,7 +188,9 @@ class QueueErrorMessageTests(unittest.IsolatedAsyncioTestCase):
         ):
             await queue._process_video_job(bot, job)
 
-        self.assertIn("совместимый H.264-вариант", bot.message_args["text"])
+        self.assertTrue(
+            bot.message_args["text"].startswith("❌ Не удалось загрузить видео.\n\n")
+        )
         self.assertIn('href="https://www.tiktok.com/@author/video/123"', bot.message_args["text"])
 
     async def test_inspection_failure_reports_video_download_failure(self):
@@ -318,7 +320,7 @@ class QueueErrorMessageTests(unittest.IsolatedAsyncioTestCase):
             "h264-aac",
         )
 
-        class QueueStopped(Exception):
+        class QueueStopped(BaseException):
             pass
 
         class BotStub:

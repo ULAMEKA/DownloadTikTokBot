@@ -34,6 +34,9 @@ class VideoCache(Base):
     music_tracks = Column(String, nullable=True)           # Найденные треки для повторной отправки из кеша
     source_url = Column(String, nullable=True)             # Каноническая ссылка на источник при записи в кеш
     likes = Column(Integer, nullable=True)                 # Снимок количества лайков при записи в кеш
+    # JSON-метаданные multipart-кеша: ordered file_ids plus storage message IDs.
+    # Legacy single-video rows continue using file_id when this is NULL.
+    file_ids = Column(String, nullable=True)
 
 
 class MusicRequest(Base):

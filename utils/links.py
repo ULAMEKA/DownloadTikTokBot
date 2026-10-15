@@ -7,7 +7,7 @@ from gallery_dl.extractor.tiktok import TiktokVmpostExtractor
 
 
 SUPPORTED_URL_RE = re.compile(
-    r"(https?://)?("
+    r"(?<![\w.])(https?://)?("
     r"(www\.|vm\.|vt\.)?tiktok\.com/[^\s<>()\[\]{}]+"
     r"|(www\.)?instagram\.com/reels?/[^\s<>()\[\]{}]+"
     r")"
@@ -86,3 +86,36 @@ def find_video_url(text: str) -> str | None:
         return clean_video_url(match.group(0))
     except ValueError:
         return None
+
+
+_SHORT_LINK_HOSTS = {"vm.tiktok.com", "vt.tiktok.com"}
+_TIKTOK_MEDIA_PATH_RE = re.compile(r"/(?:video|photo)/\d+/?$")
+_URL_PREFIXES = tuple(
+    f"{scheme}{host}/"
+    for scheme in ("https://", "http://", "")
+    for host in (
+        "www.tiktok.com", "tiktok.com", "vm.tiktok.com", "vt.tiktok.com",
+        "www.instagram.com/reel", "instagram.com/reel",
+    )
+)
+
+
+def is_downloadable_video_url(url: str) -> bool:
+    """Проверяет без сети, что очищенная ссылка указывает на конкретное видео."""
+    from services.media_cache import cache_media_identity
+
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    if host in _SHORT_LINK_HOSTS or parts.path.startswith("/t/"):
+        return True
+    if cache_media_identity(url) is not None:
+        return True
+    return host in {"tiktok.com", "www.tiktok.com"} and bool(
+        _TIKTOK_MEDIA_PATH_RE.search(parts.path)
+    )
+
+
+def is_partial_video_url(text: str) -> bool:
+    """True, если текст похож на ещё не дописанную ссылку на поддерживаемое видео."""
+    text = text.strip().lower()
+    return bool(text) and any(prefix.startswith(text) for prefix in _URL_PREFIXES)

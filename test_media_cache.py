@@ -130,6 +130,7 @@ class ProviderAwareCacheLookupTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(cached.file_id, "legacy-file")
+        self.assertEqual(cached.file_ids, ("legacy-file",))
         self.assertEqual(cached.cache_key, "h264-aac-v2:123")
 
     async def test_instagram_never_uses_legacy_tiktok_namespace(self):
@@ -143,6 +144,100 @@ class ProviderAwareCacheLookupTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIsNone(cached)
+
+    async def test_multipart_cache_round_trip_preserves_order_and_metadata(self):
+        identity = media_cache.MediaIdentity(media_cache.MediaProvider.INSTAGRAM, "AbC_123")
+        update = media_cache.VideoCacheUpdate(
+            cache_key=media_cache.media_cache_key(identity),
+            file_id="part-1",
+            storage_message_id=11,
+            description="desc",
+            source_url="https://www.instagram.com/reel/AbC_123/",
+            likes=7,
+            file_ids=("part-1", "part-2", "part-3"),
+            storage_message_ids=(11, 12, 13),
+        )
+
+        async with self.session_factory() as session:
+            await media_cache.upsert_cached_video(session, update)
+            await session.commit()
+
+        async with self.session_factory() as session:
+            cached = await media_cache.find_cached_video_by_identity(
+                session,
+                identity,
+                update.source_url,
+            )
+
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached.file_ids, ("part-1", "part-2", "part-3"))
+        self.assertEqual(cached.storage_message_ids, (11, 12, 13))
+
+    async def test_corrupt_multipart_payload_is_a_cache_miss_not_first_part_fallback(self):
+        identity = media_cache.MediaIdentity(media_cache.MediaProvider.INSTAGRAM, "AbC_123")
+        async with self.session_factory() as session:
+            session.add(
+                VideoCache(
+                    tiktok_id=media_cache.media_cache_key(identity),
+                    file_id="part-1",
+                    file_ids="{broken",
+                    storage_message_id=11,
+                    description=None,
+                    music_tracks=None,
+                    source_url=None,
+                    likes=None,
+                )
+            )
+            await session.commit()
+
+        async with self.session_factory() as session:
+            cached = await media_cache.find_cached_video_by_identity(
+                session,
+                identity,
+                "https://www.instagram.com/reel/AbC_123/",
+            )
+
+        self.assertIsNone(cached)
+
+    async def test_malformed_multipart_entries_are_cache_misses_without_filtering(self):
+        payloads = (
+            '{"file_ids":["part-1",7]}',
+            '{"file_ids":["part-1",""]}',
+            '{"file_ids":[]}',
+            '{"file_ids":null}',
+        )
+        async with self.session_factory() as session:
+            for number, file_ids in enumerate(payloads, start=20):
+                identity = media_cache.MediaIdentity(
+                    media_cache.MediaProvider.INSTAGRAM,
+                    f"AbC_{number}",
+                )
+                session.add(
+                    VideoCache(
+                        tiktok_id=media_cache.media_cache_key(identity),
+                        file_id="part-1",
+                        file_ids=file_ids,
+                        storage_message_id=11,
+                        description=None,
+                        music_tracks=None,
+                        source_url=None,
+                        likes=None,
+                    )
+                )
+            await session.commit()
+
+        async with self.session_factory() as session:
+            for number in range(20, 24):
+                with self.subTest(number=number):
+                    cached = await media_cache.find_cached_video_by_identity(
+                        session,
+                        media_cache.MediaIdentity(
+                            media_cache.MediaProvider.INSTAGRAM,
+                            f"AbC_{number}",
+                        ),
+                        f"https://www.instagram.com/reel/AbC_{number}/",
+                    )
+                    self.assertIsNone(cached)
 
 
 if __name__ == "__main__":

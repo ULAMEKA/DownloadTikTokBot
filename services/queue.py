@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Awaitable, Callable, TypeVar
+from typing import Awaitable, Callable, Sequence, TypeVar
 
 import imageio_ffmpeg
 import yt_dlp
@@ -31,17 +31,19 @@ from gallery_dl.extractor.tiktok import TiktokPostExtractor, TiktokVmpostExtract
 
 from db.session import SessionLocal
 from db.models import DownloadQueue, MusicRequest
-from caption import build_caption, source_link
+from caption import CAPTION_LIMIT, build_caption, source_link
 from promo import AD_DISPLAY_SECONDS
 from services.media_cache import (
     CachedVideo,
     MediaIdentity,
     MediaProvider,
     VideoCacheUpdate,
+    cache_media_identity,
     find_cached_video,
     find_cached_video_by_identity,
     invalidate_cached_video,
     is_invalid_cached_file_id_error,
+    media_identity_from_cache_key,
     media_cache_key,
     media_identity_from_source,
     upsert_cached_video,
@@ -70,6 +72,8 @@ _VIDEO_EXTENSIONS = {".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 DEFAULT_FORMAT = "bestvideo*+bestaudio/best"
 MAX_SOURCE_VIDEO_BYTES = 1_000_000_000
 MAX_TELEGRAM_PART_BYTES = 48_000_000
+MAX_MEDIA_GROUP_PARTS = 10
+MEDIA_GROUP_TIMEOUT_PER_PART_SECONDS = 120
 MAX_QUALITY_OPTIONS = 6
 MAX_ACTIVE_DOWNLOADS_PER_USER = 2
 MUSIC_CHUNK_SECONDS = 15
@@ -78,7 +82,10 @@ MUSIC_MESSAGE_LIMIT = 4096
 MUSIC_JOB_PREFIX = "music:"
 MUSIC_PAGE_PREFIX = "music_page:"
 MUSIC_START_PREFIX = "music_"
+VIDEO_START_PREFIX = "video_"
+TELEGRAM_START_PAYLOAD_LIMIT = 64
 QUEUE_WAKEUP_TIMEOUT_SECONDS = 60.0
+QUEUE_ERROR_BACKOFF_SECONDS = 1.0
 FINALIZATION_RETRY_INITIAL_SECONDS = 0.25
 FINALIZATION_RETRY_MAX_SECONDS = 5.0
 QUEUE_LIMIT_MESSAGE = (
@@ -340,12 +347,17 @@ class VideoSplitError(Exception):
         self.attempts = attempts
 
 
-class InlineSplitError(Exception):
-    pass
-
-
 class MissingAudioError(Exception):
     pass
+
+
+class PartialVideoDeliveryError(Exception):
+    """Первые части уже отправлены в чат, остальные доставить не удалось."""
+
+    def __init__(self, delivered: int, total: int) -> None:
+        super().__init__(f"Доставлено частей: {delivered}/{total}")
+        self.delivered = delivered
+        self.total = total
 
 
 class MediaPreparationError(Exception):
@@ -465,11 +477,25 @@ def release_inline_placeholder(inline_message_id: str) -> None:
 
 
 def _has_video(item: dict[str, object]) -> bool:
-    return item.get("vcodec") not in (None, "none")
+    codec = item.get("vcodec")
+    return codec is not None and not (
+        isinstance(codec, str) and codec.lower() == "none"
+    )
+
+
+def _has_unknown_video(item: dict[str, object]) -> bool:
+    codec = item.get("vcodec")
+    return codec is None or (
+        isinstance(codec, str)
+        and codec.strip().lower() in {"", "unknown", "n/a"}
+    )
 
 
 def _has_audio(item: dict[str, object]) -> bool:
-    return item.get("acodec") not in (None, "none")
+    codec = item.get("acodec")
+    return codec is not None and not (
+        isinstance(codec, str) and codec.lower() == "none"
+    )
 
 
 def _combined_source_may_have_audio(item: dict[str, object]) -> bool:
@@ -494,7 +520,11 @@ def _fast_h264_rank(item: dict[str, object]) -> tuple[float, int, int, int]:
     )
 
 
-def select_fast_h264_format(formats: object) -> str | None:
+def select_fast_h264_format(
+    formats: object,
+    *,
+    allow_unknown_mp4: bool = False,
+) -> str | None:
     if not isinstance(formats, list):
         return None
     typed = [item for item in formats if isinstance(item, dict)]
@@ -539,6 +569,25 @@ def select_fast_h264_format(formats: object) -> str | None:
         audio_id = audio_item.get("format_id") if audio_item else None
         if isinstance(audio_id, str):
             return f"{video_id}+{audio_id}"
+
+    if allow_unknown_mp4:
+        unknown_candidates = [
+            item
+            for item in typed
+            if _has_unknown_video(item)
+            and str(item.get("ext") or "").lower() == "mp4"
+            and isinstance(item.get("format_id"), str)
+        ]
+        selected = max(unknown_candidates, key=_fast_h264_rank, default=None)
+        if selected is not None:
+            video_id = selected.get("format_id")
+            if isinstance(video_id, str):
+                if _combined_source_may_have_audio(selected):
+                    return video_id
+                audio_item = best_aac or best_audio
+                audio_id = audio_item.get("format_id") if audio_item else None
+                if isinstance(audio_id, str):
+                    return f"{video_id}+{audio_id}"
     return None
 
 
@@ -644,7 +693,13 @@ def _inspection_from_snapshot(url: str, info: dict[str, object]) -> MediaInspect
         duration=_to_float(info.get("duration")),
         qualities=tuple(_quality_options(info.get("formats"))),
         info=info,
-        fast_format_id=select_fast_h264_format(info.get("formats")),
+        fast_format_id=select_fast_h264_format(
+            info.get("formats"),
+            allow_unknown_mp4=(
+                identity is not None
+                and identity.provider is MediaProvider.INSTAGRAM
+            ),
+        ),
     )
 
 
@@ -1771,6 +1826,26 @@ async def _upload_to_storage(
     return storage_msg.video.file_id, storage_msg.message_id
 
 
+async def _cleanup_storage_messages(
+    bot: Bot,
+    message_ids: Sequence[int],
+) -> None:
+    if not STORAGE_CHAT_ID:
+        return
+    for message_id in message_ids:
+        try:
+            await bot.delete_message(
+                chat_id=STORAGE_CHAT_ID,
+                message_id=message_id,
+            )
+        except Exception:
+            logging.info(
+                "Не удалось удалить незакешированное Storage-сообщение %s",
+                message_id,
+                exc_info=True,
+            )
+
+
 async def _deliver_video(
     bot: Bot,
     chat_id: str,
@@ -1908,6 +1983,203 @@ async def _deliver_video(
     return None
 
 
+def _part_description(
+    number: int,
+    total: int,
+    description: str | None,
+) -> str:
+    part_description = f"Часть {number}/{total}"
+    if number == 1 and description:
+        return f"{part_description}\n\n{description}"
+    return part_description
+
+
+def _part_caption(
+    *,
+    number: int,
+    total: int,
+    description: str | None,
+    source_url: str | None,
+    likes: int | None,
+    has_spoiler: bool,
+    without_description: bool,
+    music_deep_link: str | None,
+) -> str | None:
+    if without_description:
+        return None
+    return build_caption(
+        _part_description(number, total, description),
+        source_url if number == 1 else None,
+        with_source=True,
+        likes=likes if number == 1 else None,
+        has_spoiler=has_spoiler,
+        music_deep_link=music_deep_link if number == 1 else None,
+    )
+
+
+async def _deliver_video_parts(
+    bot: Bot,
+    *,
+    chat_id: str,
+    parts: Sequence[Path | str],
+    width: int | None,
+    height: int | None,
+    description: str | None,
+    source_url: str | None,
+    likes: int | None,
+    reply_to_message_id: int | None,
+    placeholder_message_id: int | None,
+    has_spoiler: bool,
+    without_description: bool,
+    music_deep_link: str | None,
+) -> tuple[str, ...] | None:
+    """Отправляет части альбомами; возвращает file_id всех частей для кеша (или None)."""
+    total = len(parts)
+    if total == 0:
+        return None
+
+    # С плейсхолдером первая часть заменяет его (сохраняя ответ на исходное
+    # сообщение в группе), остальные идут альбомами ответом на неё.
+    if placeholder_message_id:
+        batch_bounds = [(0, 1)] + [
+            (start, min(start + MAX_MEDIA_GROUP_PARTS, total))
+            for start in range(1, total, MAX_MEDIA_GROUP_PARTS)
+        ]
+        tail_reply_to: int | None = placeholder_message_id
+    else:
+        batch_bounds = [
+            (start, min(start + MAX_MEDIA_GROUP_PARTS, total))
+            for start in range(0, total, MAX_MEDIA_GROUP_PARTS)
+        ]
+        tail_reply_to = None
+
+    file_ids: list[str | None] = []
+    for batch_start, batch_end in batch_bounds:
+        batch = parts[batch_start:batch_end]
+        try:
+            file_ids.extend(await _deliver_video_parts_batch(
+                bot,
+                chat_id=chat_id,
+                batch=batch,
+                first_number=batch_start + 1,
+                total=total,
+                width=width,
+                height=height,
+                description=description,
+                source_url=source_url,
+                likes=likes,
+                reply_to_message_id=reply_to_message_id if batch_start == 0 else tail_reply_to,
+                placeholder_message_id=placeholder_message_id if batch_start == 0 else None,
+                has_spoiler=has_spoiler,
+                without_description=without_description,
+                music_deep_link=music_deep_link,
+            ))
+        except Exception as error:
+            if batch_start == 0:
+                raise
+            # Часть видео уже в чате вместо плейсхолдера — сообщаем вызывающему коду.
+            raise PartialVideoDeliveryError(batch_start, total) from error
+
+    if any(file_id is None for file_id in file_ids):
+        return None
+    return tuple(file_id for file_id in file_ids if file_id is not None)
+
+
+async def _deliver_video_parts_batch(
+    bot: Bot,
+    *,
+    chat_id: str,
+    batch: Sequence[Path | str],
+    first_number: int,
+    total: int,
+    width: int | None,
+    height: int | None,
+    description: str | None,
+    source_url: str | None,
+    likes: int | None,
+    reply_to_message_id: int | None,
+    placeholder_message_id: int | None,
+    has_spoiler: bool,
+    without_description: bool,
+    music_deep_link: str | None,
+) -> list[str | None]:
+    if len(batch) == 1:
+        part = batch[0]
+        for attempt in range(2):
+            try:
+                return [await _deliver_video(
+                    bot,
+                    chat_id,
+                    None,
+                    file_id=None if isinstance(part, Path) else part,
+                    video_path=part if isinstance(part, Path) else None,
+                    width=width,
+                    height=height,
+                    description=_part_description(first_number, total, description),
+                    source_url=source_url if first_number == 1 else None,
+                    likes=likes if first_number == 1 else None,
+                    reply_to_message_id=reply_to_message_id,
+                    placeholder_message_id=placeholder_message_id,
+                    has_spoiler=has_spoiler,
+                    without_description=without_description,
+                    music_deep_link=music_deep_link if first_number == 1 else None,
+                    wait_for_placeholder=True,
+                )]
+            except TelegramRetryAfter as error:
+                if attempt:
+                    raise
+                await asyncio.sleep(error.retry_after)
+
+    media: list[InputMediaVideo] = []
+    for offset, part in enumerate(batch):
+        number = first_number + offset
+        media.append(
+            InputMediaVideo(
+                media=FSInputFile(str(part)) if isinstance(part, Path) else part,
+                width=width,
+                height=height,
+                supports_streaming=True,
+                caption=_part_caption(
+                    number=number,
+                    total=total,
+                    description=description,
+                    source_url=source_url,
+                    likes=likes,
+                    has_spoiler=has_spoiler,
+                    without_description=without_description,
+                    music_deep_link=music_deep_link,
+                ),
+                parse_mode=ParseMode.HTML,
+                has_spoiler=has_spoiler,
+            )
+        )
+
+    messages: Sequence[object] = ()
+    for attempt in range(2):
+        try:
+            messages = await bot.send_media_group(
+                chat_id=chat_id,
+                media=media,
+                reply_to_message_id=reply_to_message_id,
+                allow_sending_without_reply=True,
+                # Альбом до 10 частей по 48 МБ грузится одним запросом — дефолтных 60 с мало.
+                request_timeout=MEDIA_GROUP_TIMEOUT_PER_PART_SECONDS * len(batch),
+            )
+            break
+        except TelegramRetryAfter as error:
+            if attempt:
+                raise
+            await asyncio.sleep(error.retry_after)
+
+    sent_file_ids: list[str | None] = []
+    for message in messages or ():
+        video = getattr(message, "video", None)
+        sent_file_ids.append(getattr(video, "file_id", None) if video else None)
+    if len(sent_file_ids) != len(batch):
+        return [None] * len(batch)
+    return sent_file_ids
+
+
 async def deliver_cached_video(
     bot: Bot,
     cached: CachedVideo,
@@ -1916,11 +2188,57 @@ async def deliver_cached_video(
     fallback_source_url: str,
     inline_message_id: str | None = None,
     reply_to_message_id: int | None = None,
+    placeholder_message_id: int | None = None,
     has_spoiler: bool = False,
     without_description: bool = False,
     music_deep_link: str | None = None,
+    wait_for_placeholder: bool = False,
 ) -> None:
     """Доставляет сохранённое Telegram-видео без локального файла и плейсхолдера."""
+    file_ids = cached.file_ids
+    if cached.is_multipart and inline_message_id:
+        identity = (
+            media_identity_from_cache_key(cached.cache_key)
+            or cache_media_identity(cached.source_url or fallback_source_url)
+        )
+        if identity is None:
+            raise MediaPreparationError("Не удалось определить cached media identity")
+        share_link = await create_video_share_link(bot, identity)
+        if share_link is None:
+            raise MediaPreparationError("Не удалось подготовить ссылку на cached media")
+        await _publish_inline_video_preview(
+            bot,
+            inline_message_id,
+            file_id=file_ids[0],
+            width=None,
+            height=None,
+            description=cached.description,
+            source_url=cached.source_url or fallback_source_url,
+            likes=cached.likes,
+            has_spoiler=has_spoiler,
+            without_description=without_description,
+            share_link=share_link,
+        )
+        return
+
+    if cached.is_multipart:
+        await _deliver_video_parts(
+            bot,
+            chat_id=chat_id,
+            parts=file_ids,
+            width=None,
+            height=None,
+            description=cached.description,
+            source_url=cached.source_url or fallback_source_url,
+            likes=cached.likes,
+            reply_to_message_id=reply_to_message_id,
+            placeholder_message_id=placeholder_message_id,
+            has_spoiler=has_spoiler,
+            without_description=without_description,
+            music_deep_link=music_deep_link,
+        )
+        return
+
     await _deliver_video(
         bot,
         chat_id,
@@ -1931,11 +2249,11 @@ async def deliver_cached_video(
         source_url=cached.source_url or fallback_source_url,
         likes=cached.likes,
         reply_to_message_id=reply_to_message_id,
-        placeholder_message_id=None,
+        placeholder_message_id=placeholder_message_id,
         has_spoiler=has_spoiler,
         without_description=without_description,
         music_deep_link=music_deep_link,
-        wait_for_placeholder=False,
+        wait_for_placeholder=wait_for_placeholder,
     )
 
 
@@ -1963,7 +2281,8 @@ async def try_deliver_cached_video(
 
     await session.rollback()
     music_deep_link: str | None = None
-    if can_attach_music_link(without_description):
+    is_multipart_inline = bool(inline_message_id and cached.is_multipart)
+    if can_attach_music_link(without_description) and not is_multipart_inline:
         _, music_deep_link = await prepare_music_caption_link(
             bot,
             cached.source_url or canonical_url,
@@ -1987,6 +2306,37 @@ async def try_deliver_cached_video(
             raise
         await invalidate_cached_video(session, cached.cache_key)
         return False
+    except MediaPreparationError as error:
+        if not is_multipart_inline:
+            raise
+        # Ссылку на полное видео подготовить не удалось (например, getMe недоступен) —
+        # пусть очередь попробует ещё раз вместо мгновенной ошибки.
+        logging.warning("Cached multipart inline delivery deferred to queue: %s", error)
+        return False
+    except PartialVideoDeliveryError as error:
+        if _is_invalid_file_id_cause(error):
+            await invalidate_cached_video(session, cached.cache_key)
+        await _show_download_error(
+            bot,
+            chat_id,
+            None,
+            None,
+            _partial_delivery_text(error),
+            canonical_url,
+        )
+        return True
+
+
+def _is_invalid_file_id_cause(error: BaseException) -> bool:
+    cause = error.__cause__
+    return isinstance(cause, TelegramBadRequest) and is_invalid_cached_file_id_error(cause)
+
+
+def _partial_delivery_text(error: PartialVideoDeliveryError) -> str:
+    return (
+        f"❌ Отправлено частей: {error.delivered} из {error.total}. "
+        "Остальные части доставить не удалось — отправьте ссылку ещё раз."
+    )
 
 
 def _remove_download_files(filename: str) -> None:
@@ -2463,6 +2813,108 @@ async def _get_music_bot_username(bot: Bot) -> str | None:
         return _music_bot_username_cache
 
 
+def _video_start_payload(identity: MediaIdentity) -> str | None:
+    payload = f"{VIDEO_START_PREFIX}{identity.provider.value}_{identity.media_id}"
+    if len(payload) > TELEGRAM_START_PAYLOAD_LIMIT:
+        return None
+    if re.fullmatch(r"[A-Za-z0-9_-]+", payload) is None:
+        return None
+    return payload
+
+
+async def create_video_share_link(
+    bot: Bot,
+    identity: MediaIdentity,
+) -> str | None:
+    payload = _video_start_payload(identity)
+    if payload is None:
+        logging.warning("Video share payload exceeds Telegram limit: %s", identity)
+        return None
+    username = await _get_music_bot_username(bot)
+    if not username:
+        return None
+    return f"https://t.me/{username}?start={payload}"
+
+
+def _inline_large_video_caption(
+    *,
+    description: str | None,
+    source_url: str | None,
+    likes: int | None,
+    has_spoiler: bool,
+    without_description: bool,
+) -> str | None:
+    if without_description:
+        return None
+    notice = (
+        "С вами поделились большим видео. "
+        "Кнопка ниже открывает всё видео, включая эту часть."
+    )
+    caption = build_caption(
+        description,
+        source_url,
+        with_source=True,
+        likes=likes,
+        has_spoiler=has_spoiler,
+    )
+    combined = f"{notice}\n\n{caption}" if caption else notice
+    if len(combined) <= CAPTION_LIMIT:
+        return combined
+    source_only = build_caption(
+        None,
+        source_url,
+        with_source=True,
+        likes=likes,
+        has_spoiler=has_spoiler,
+    )
+    source_combined = f"{notice}\n\n{source_only}" if source_only else notice
+    if len(source_combined) <= CAPTION_LIMIT:
+        return source_combined
+    return notice[:CAPTION_LIMIT]
+
+
+async def _publish_inline_video_preview(
+    bot: Bot,
+    inline_message_id: str,
+    *,
+    file_id: str,
+    width: int | None,
+    height: int | None,
+    description: str | None,
+    source_url: str | None,
+    likes: int | None,
+    has_spoiler: bool,
+    without_description: bool,
+    share_link: str,
+) -> None:
+    ready_at = _inline_placeholder_ready_at.pop(inline_message_id, 0)
+    await asyncio.sleep(max(0, ready_at - asyncio.get_running_loop().time()))
+    await bot.edit_message_media(
+        inline_message_id=inline_message_id,
+        media=InputMediaVideo(
+            media=file_id,
+            width=width,
+            height=height,
+            supports_streaming=True,
+            caption=_inline_large_video_caption(
+                description=description,
+                source_url=source_url,
+                likes=likes,
+                has_spoiler=has_spoiler,
+                without_description=without_description,
+            ),
+            parse_mode=ParseMode.HTML,
+            has_spoiler=has_spoiler,
+        ),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="Смотреть всё видео",
+                url=share_link,
+            )
+        ]]),
+    )
+
+
 async def create_music_deep_link(
     bot: Bot,
     tiktok_link: str,
@@ -2669,33 +3121,36 @@ async def _try_deliver_worker_cache(
 ) -> bool:
     source_url = cached.source_url or job.tiktok_link
     music_deep_link: str | None = None
-    if can_attach_music_link(without_description):
+    is_multipart_inline = bool(inline_message_id and cached.is_multipart)
+    if can_attach_music_link(without_description) and not is_multipart_inline:
         _, music_deep_link = await prepare_music_caption_link(
             bot,
             source_url,
             job.format_id,
         )
     try:
-        await _deliver_video(
+        await deliver_cached_video(
             bot,
-            chat_id,
-            inline_message_id,
-            file_id=cached.file_id,
-            video_path=None,
-            description=cached.description,
-            source_url=source_url,
-            likes=cached.likes,
+            cached,
+            chat_id=chat_id,
+            fallback_source_url=source_url,
+            inline_message_id=inline_message_id,
             reply_to_message_id=reply_to_message_id,
             placeholder_message_id=placeholder_message_id,
             has_spoiler=has_spoiler,
             without_description=without_description,
             music_deep_link=music_deep_link,
+            wait_for_placeholder=True,
         )
     except TelegramBadRequest as error:
         if not is_invalid_cached_file_id_error(error):
             raise
         await _invalidate_worker_cached_video(cached.cache_key)
         return False
+    except PartialVideoDeliveryError as error:
+        if _is_invalid_file_id_cause(error):
+            await _invalidate_worker_cached_video(cached.cache_key)
+        raise
 
     _remove_download_files(job.filename)
     await _finish_video_job(job.id, None)
@@ -2909,11 +3364,52 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                     "slideshow_encode",
                 )
             else:
-                prepared_video = await loop.run_in_executor(
-                    None,
-                    _prepare_telegram_video,
-                    video_path,
-                )
+                try:
+                    prepared_video = await loop.run_in_executor(
+                        None,
+                        _prepare_telegram_video,
+                        video_path,
+                    )
+                except NoFastH264FormatError as error:
+                    # Формат выбран без известного кодека (Instagram) и оказался не H.264:
+                    # пробуем gallery fallback, как если бы быстрого формата не было.
+                    if gallery_result is not None:
+                        raise
+                    logging.info("yt-dlp вариант несовместим, используем gallery fallback: %s", error)
+                    _remove_download_files(filename)
+                    metrics.download_backend = "gallery"
+                    metrics.download_fallback = "gallery"
+                    gallery_result = await loop.run_in_executor(
+                        None,
+                        _gallery_download,
+                        tiktok_link,
+                        slideshow_path,
+                    )
+                    if gallery_result is None:
+                        raise
+                    downloaded_id, width, height, description, duration = (
+                        gallery_result.metadata()
+                    )
+                    final_identity = final_identity or media_identity_from_source(
+                        tiktok_link,
+                        downloaded_id,
+                    )
+                    video_path = gallery_result.path
+                    if video_path.stat().st_size > MAX_SOURCE_VIDEO_BYTES:
+                        raise VideoTooLargeError from error
+                    if gallery_result.generated_slideshow:
+                        prepared_video = PreparedVideo(
+                            gallery_result.path,
+                            gallery_result.probe,
+                            False,
+                            "slideshow_encode",
+                        )
+                    else:
+                        prepared_video = await loop.run_in_executor(
+                            None,
+                            _prepare_telegram_video,
+                            video_path,
+                        )
         ffmpeg_bypassed = prepared_video.bypassed_ffmpeg
         metrics.preparation_mode = prepared_video.preparation_mode
         music_deep_link: str | None = None
@@ -2947,7 +3443,70 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
         metrics.split_attempts += split_outcome.attempts
         if len(parts) > 1:
             if inline_message_id:
-                raise InlineSplitError
+                if format_id is not None or final_identity is None:
+                    raise MediaPreparationError(
+                        "Большое inline-видео не имеет валидной cache identity"
+                    )
+                part_file_ids: list[str] = []
+                storage_message_ids: list[int] = []
+                try:
+                    with metrics.stage("storage"):
+                        for part in parts:
+                            part_file_id, storage_message_id = await _upload_to_storage(
+                                bot,
+                                part,
+                                width,
+                                height,
+                            )
+                            if not part_file_id:
+                                raise MediaPreparationError(
+                                    "Не удалось сохранить часть большого видео"
+                                )
+                            part_file_ids.append(part_file_id)
+                            if storage_message_id is not None:
+                                storage_message_ids.append(storage_message_id)
+                except Exception:
+                    await _cleanup_storage_messages(bot, storage_message_ids)
+                    raise
+                share_link = await create_video_share_link(bot, final_identity)
+                if share_link is None:
+                    await _cleanup_storage_messages(bot, storage_message_ids)
+                    raise MediaPreparationError(
+                        "Не удалось подготовить ссылку на большое видео"
+                    )
+                cache_update = VideoCacheUpdate(
+                    cache_key=media_cache_key(final_identity),
+                    file_id=part_file_ids[0],
+                    storage_message_id=(
+                        storage_message_ids[0] if storage_message_ids else None
+                    ),
+                    description=description,
+                    source_url=source_url,
+                    likes=likes,
+                    file_ids=tuple(part_file_ids),
+                    storage_message_ids=tuple(storage_message_ids),
+                )
+                try:
+                    await _finish_video_job(job.id, cache_update)
+                except Exception:
+                    await _cleanup_storage_messages(bot, storage_message_ids)
+                    raise
+                _remove_download_files(filename)
+                with metrics.stage("delivery"):
+                    await _publish_inline_video_preview(
+                        bot,
+                        inline_message_id,
+                        file_id=part_file_ids[0],
+                        width=width,
+                        height=height,
+                        description=description,
+                        source_url=source_url,
+                        likes=likes,
+                        has_spoiler=has_spoiler,
+                        without_description=without_description,
+                        share_link=share_link,
+                    )
+                return
             if (
                 can_attach_music_link(without_description)
                 and not music_deep_link_prepared
@@ -2958,42 +3517,39 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                     format_id,
                 )
                 music_deep_link_prepared = True
-            for number, part in enumerate(parts, start=1):
-                part_description = f"Часть {number}/{len(parts)}"
-                if number == 1 and description:
-                    part_description = f"{part_description}\n\n{description}"
-                for attempt in range(2):
-                    try:
-                        with metrics.stage("delivery"):
-                            await _deliver_video(
-                                bot,
-                                chat_id,
-                                None,
-                                file_id=None,
-                                video_path=part,
-                                width=width,
-                                height=height,
-                                description=part_description,
-                                source_url=source_url if number == 1 else None,
-                                likes=likes if number == 1 else None,
-                                reply_to_message_id=reply_to_message_id,
-                                placeholder_message_id=placeholder_message_id,
-                                has_spoiler=has_spoiler,
-                                without_description=without_description,
-                                music_deep_link=(
-                                    music_deep_link if number == 1 else None
-                                ),
-                            )
-                        break
-                    except TelegramRetryAfter as error:
-                        if attempt:
-                            raise
-                        await asyncio.sleep(error.retry_after)
-                placeholder_message_id = None
+            with metrics.stage("delivery"):
+                delivered_file_ids = await _deliver_video_parts(
+                    bot,
+                    chat_id=chat_id,
+                    parts=parts,
+                    width=width,
+                    height=height,
+                    description=description,
+                    source_url=source_url,
+                    likes=likes,
+                    reply_to_message_id=reply_to_message_id,
+                    placeholder_message_id=placeholder_message_id,
+                    has_spoiler=has_spoiler,
+                    without_description=without_description,
+                    music_deep_link=music_deep_link,
+                )
+            placeholder_message_id = None
+            for part in parts:
                 part.unlink(missing_ok=True)
             video_path.unlink(missing_ok=True)
             _remove_download_files(filename)
-            await _finish_video_job(job.id, None)
+            multipart_cache_update = None
+            if format_id is None and final_identity and delivered_file_ids:
+                multipart_cache_update = VideoCacheUpdate(
+                    cache_key=media_cache_key(final_identity),
+                    file_id=delivered_file_ids[0],
+                    storage_message_id=None,
+                    description=description,
+                    source_url=source_url,
+                    likes=likes,
+                    file_ids=delivered_file_ids,
+                )
+            await _finish_video_job(job.id, multipart_cache_update)
             return
 
         file_id: str | None = None
@@ -3051,6 +3607,28 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
         await _finish_video_job(job.id, cache_update)
         return
 
+    except PartialVideoDeliveryError as error:
+        logging.warning(
+            "Видео доставлено частично: chat=%s url=%s %s/%s",
+            chat_id,
+            tiktok_link,
+            error.delivered,
+            error.total,
+            exc_info=error.__cause__,
+        )
+        _remove_download_files(filename)
+        with metrics.stage("delivery"):
+            # Плейсхолдер уже заменён первыми частями — пишем отдельным сообщением.
+            await _show_download_error(
+                bot,
+                chat_id,
+                None,
+                None,
+                _partial_delivery_text(error),
+                source_url,
+            )
+        await _discard_job(job.id)
+
     except MissingAudioError:
         logging.warning("Источник не отдал аудиодорожку: chat=%s url=%s", chat_id, tiktok_link)
         _remove_download_files(filename)
@@ -3075,8 +3653,7 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                 chat_id,
                 inline_message_id,
                 placeholder_message_id,
-                "❌ Источник не отдал совместимый H.264-вариант без долгого перекодирования.\n"
-                "Попробуйте другое видео.",
+                "❌ Не удалось загрузить видео.",
                 source_url,
             )
         await _discard_job(job.id)
@@ -3105,19 +3682,6 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
                 inline_message_id,
                 placeholder_message_id,
                 "❌ Видео больше 1 ГБ. Попробуйте другое видео или повторите позже.",
-                source_url,
-            )
-        await _discard_job(job.id)
-
-    except InlineSplitError:
-        _remove_download_files(filename)
-        with metrics.stage("delivery"):
-            await _show_download_error(
-                bot,
-                chat_id,
-                inline_message_id,
-                placeholder_message_id,
-                "❌ Большие видео отправляются частями только в личном чате с ботом.",
                 source_url,
             )
         await _discard_job(job.id)
@@ -3182,12 +3746,40 @@ async def _process_video_job(bot: Bot, job: QueueJob) -> None:
 async def process_queue(bot: Bot) -> None:
     """Фоновый цикл обработки очереди загрузок."""
     while True:
-        job = await _wait_for_next_job()
+        job: QueueJob | None = None
+        try:
+            job = await _wait_for_next_job()
+            if job.is_music:
+                await _process_music_job(
+                    bot,
+                    job,
+                    job.inline_message_id.removeprefix(MUSIC_JOB_PREFIX),
+                )
+            else:
+                await _process_video_job(bot, job)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Одна сломанная задача (сеть, БД) не должна навсегда останавливать очередь.
+            logging.exception("Необработанная ошибка в цикле очереди: job=%s", job and job.id)
+            if job is not None:
+                await _drop_failed_job(job)
+            await asyncio.sleep(QUEUE_ERROR_BACKOFF_SECONDS)
+
+
+async def _drop_failed_job(job: QueueJob) -> None:
+    """Убирает упавшую задачу из головы очереди, чтобы она не повторялась бесконечно."""
+    try:
         if job.is_music:
-            await _process_music_job(
-                bot,
-                job,
+            await _finish_music_job(
+                job.id,
                 job.inline_message_id.removeprefix(MUSIC_JOB_PREFIX),
+                None,
+                retry=True,
             )
         else:
-            await _process_video_job(bot, job)
+            if job.filename:
+                _remove_download_files(job.filename)
+            await _discard_job(job.id)
+    except Exception:
+        logging.exception("Не удалось убрать упавшую задачу из очереди: job=%s", job.id)

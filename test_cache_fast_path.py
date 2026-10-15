@@ -44,6 +44,99 @@ class CachedDeliveryTests(unittest.IsolatedAsyncioTestCase):
         sleep_mock.assert_not_awaited()
         self.assertEqual(bot.edit_message_media.await_args.kwargs["media"].media, "file-id")
 
+    async def test_cached_multipart_private_delivery_sends_all_parts_in_order(self):
+        file_ids = tuple(f"part-{number}" for number in range(1, 17))
+        cached = CachedVideo(
+            "h264-aac-v2:instagram:AbC_123",
+            "part-1",
+            "desc",
+            "https://www.instagram.com/reel/AbC_123/",
+            7,
+            file_ids=file_ids,
+        )
+        bot = SimpleNamespace(
+            send_media_group=AsyncMock(return_value=[]),
+            send_video=AsyncMock(return_value=SimpleNamespace(video=None)),
+        )
+
+        await queue.deliver_cached_video(
+            bot,
+            cached,
+            chat_id="1",
+            fallback_source_url=cached.source_url,
+            reply_to_message_id=55,
+        )
+
+        self.assertEqual(
+            [len(call.kwargs["media"]) for call in bot.send_media_group.await_args_list],
+            [10, 6],
+        )
+        self.assertEqual(
+            [media.media for call in bot.send_media_group.await_args_list for media in call.kwargs["media"]],
+            list(file_ids),
+        )
+        self.assertEqual(bot.send_media_group.await_args_list[0].kwargs["reply_to_message_id"], 55)
+        self.assertIsNone(bot.send_media_group.await_args_list[1].kwargs["reply_to_message_id"])
+        self.assertIn("Часть 1/16", bot.send_media_group.await_args_list[0].kwargs["media"][0].caption)
+        self.assertIn("Часть 16/16", bot.send_media_group.await_args_list[1].kwargs["media"][-1].caption)
+        bot.send_video.assert_not_awaited()
+
+    async def test_cached_multipart_private_delivery_uses_send_video_for_single_tail(self):
+        file_ids = tuple(f"part-{number}" for number in range(1, 12))
+        cached = CachedVideo(
+            "h264-aac-v2:instagram:AbC_123",
+            "part-1",
+            "desc",
+            "https://www.instagram.com/reel/AbC_123/",
+            7,
+            file_ids=file_ids,
+        )
+        bot = SimpleNamespace(
+            send_media_group=AsyncMock(return_value=[]),
+            send_video=AsyncMock(return_value=SimpleNamespace(video=None)),
+        )
+
+        await queue.deliver_cached_video(
+            bot,
+            cached,
+            chat_id="1",
+            fallback_source_url=cached.source_url,
+        )
+
+        self.assertEqual(len(bot.send_media_group.await_args.kwargs["media"]), 10)
+        self.assertEqual(bot.send_video.await_args.kwargs["video"], "part-11")
+
+    async def test_cached_multipart_inline_delivery_publishes_share_link(self):
+        cached = CachedVideo(
+            "h264-aac-v2:instagram:AbC_123",
+            "part-1",
+            "desc",
+            "https://www.instagram.com/reel/AbC_123/",
+            7,
+            file_ids=("part-1", "part-2"),
+        )
+        bot = SimpleNamespace(
+            get_me=AsyncMock(return_value=SimpleNamespace(username="download_bot")),
+            edit_message_media=AsyncMock(),
+        )
+        session = AsyncMock()
+
+        with patch.object(queue, "find_cached_video", AsyncMock(return_value=cached)):
+            delivered = await queue.try_deliver_cached_video(
+                bot,
+                session,
+                cached.source_url,
+                chat_id="42",
+                inline_message_id="inline-id",
+            )
+
+        self.assertTrue(delivered)
+        bot.edit_message_media.assert_awaited_once()
+        media = bot.edit_message_media.await_args.kwargs["media"]
+        self.assertEqual(media.media, "part-1")
+        markup = bot.edit_message_media.await_args.kwargs["reply_markup"]
+        self.assertIn("video_instagram_AbC_123", markup.inline_keyboard[0][0].url)
+
     async def test_invalid_file_id_is_deleted_and_returns_miss(self):
         """Fails if a known-invalid cached file id is kept after Telegram rejects it."""
         session = AsyncMock()

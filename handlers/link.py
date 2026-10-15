@@ -30,7 +30,12 @@ from services.queue import (
     video_queue_position,
     write_info_snapshot,
 )
-from utils.links import SUPPORTED_URL_RE, canonicalize_video_url, find_video_url
+from utils.links import (
+    SUPPORTED_URL_RE,
+    canonicalize_video_url,
+    find_video_url,
+    is_downloadable_video_url,
+)
 
 link = Router()
 
@@ -213,10 +218,13 @@ async def _start_pending_download(
         await callback.answer()
 
 
-@link.message(F.text.regexp(SUPPORTED_URL_RE.pattern), F.chat.type == ChatType.PRIVATE)
+@link.message(F.text.regexp(SUPPORTED_URL_RE, mode="search"), F.chat.type == ChatType.PRIVATE)
 async def handle_video_link_private(message: Message):
     url = await _video_url_from_text(message.text or "")
     if url is None:
+        return
+    if not is_downloadable_video_url(url):
+        await message.answer("Не удаётся загрузить видео.")
         return
 
     token = uuid.uuid4().hex
@@ -453,10 +461,11 @@ async def handle_video_stats(callback: CallbackQuery):
     await callback.answer("Статистика показана на момент загрузки")
 
 
-@link.message(F.text.regexp(SUPPORTED_URL_RE.pattern))
+@link.message(F.text.regexp(SUPPORTED_URL_RE, mode="search"))
 async def handle_video_link_group(message: Message, session: AsyncSession, bot: Bot):
     url = await _video_url_from_text(message.text or "")
-    if url is None:
+    # В группе молча пропускаем профили и прочие ссылки не на конкретное видео.
+    if url is None or not is_downloadable_video_url(url):
         return
 
     if await try_deliver_cached_video(

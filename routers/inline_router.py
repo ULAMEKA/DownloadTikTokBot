@@ -8,6 +8,7 @@ from aiogram.types import (
     CallbackQuery,
     InlineQuery,
     InlineQueryResultArticle,
+    InlineQueryResultsButton,
     InputMediaPhoto,
     InputTextMessageContent,
     InlineKeyboardMarkup,
@@ -28,9 +29,17 @@ from services.queue import (
     try_deliver_cached_video,
     video_queue_position,
 )
-from utils.links import canonicalize_video_url, find_video_url
+from utils.links import (
+    canonicalize_video_url,
+    find_video_url,
+    is_downloadable_video_url,
+    is_partial_video_url,
+)
 
 inline_router = Router()
+
+INLINE_EMPTY_QUERY_HINT = "Введите ссылку на видео, чтобы отправить видео в чат"
+INLINE_UNSUPPORTED_HINT = "Не удаётся загрузить видео."
 
 
 async def _canonical_url(text: str) -> str | None:
@@ -115,8 +124,18 @@ async def _render_inline_download_error(
 async def handle_inline_query(query: InlineQuery):
     text = query.query.strip()
 
-    if find_video_url(text) is None:
-        await query.answer([], cache_time=5)
+    url = find_video_url(text)
+    if url is None or not is_downloadable_video_url(url):
+        # Пустой запрос или ссылка ещё набирается — подсказываем, а не пугаем ошибкой.
+        if url is None and (not text or is_partial_video_url(text)):
+            hint = INLINE_EMPTY_QUERY_HINT
+        else:
+            hint = INLINE_UNSUPPORTED_HINT
+        await query.answer(
+            [],
+            cache_time=5,
+            button=InlineQueryResultsButton(text=hint, start_parameter="inline_help"),
+        )
         return
 
     caption = loading_placeholder_caption()

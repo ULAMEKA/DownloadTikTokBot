@@ -26,12 +26,22 @@ dp.inline_query.middleware(DBSessionMiddleware())
 dp.chosen_inline_result.middleware(DBSessionMiddleware())
 
 
+def _log_queue_task_exit(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        logging.error("Цикл очереди остановился", exc_info=error)
+
+
 async def main():
     # Схему БД создаёт отдельный скрипт init_db.py — запусти его вручную
     # перед первым стартом (или после изменения схемы). Здесь таблицы
     # считаются уже существующими.
     await bot.delete_webhook(drop_pending_updates=True)
-    asyncio.create_task(process_queue(bot))
+    # Держим ссылку на задачу: иначе GC может собрать её, а падение останется незамеченным.
+    queue_task = asyncio.create_task(process_queue(bot))
+    queue_task.add_done_callback(_log_queue_task_exit)
     dp.include_routers(
         commands_router,
         link,

@@ -410,6 +410,7 @@ class MusicRecognitionTests(unittest.TestCase):
         self.assertIn("music_tracks", columns)
         self.assertIn("source_url", columns)
         self.assertIn("likes", columns)
+        self.assertIn("file_ids", columns)
         self.assertIn("MusicRequest", tables)
         self.assertIn("status_message_id", music_columns)
         self.assertIn("inline_message_id", music_columns)

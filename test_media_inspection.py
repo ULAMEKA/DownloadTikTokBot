@@ -90,6 +90,120 @@ class MediaInspectionTests(unittest.TestCase):
 
         self.assertEqual(inspection.fast_format_id, "h264-aac")
 
+    def test_instagram_unknown_mp4_fallback_selects_high_quality_candidate(self):
+        info = {
+            "id": "Dac5mHoN9x-",
+            "webpage_url": "https://www.instagram.com/reel/Dac5mHoN9x-/",
+            "formats": [
+                {
+                    "format_id": "unknown-mp4",
+                    "ext": "mp4",
+                    "vcodec": None,
+                    "acodec": None,
+                    "width": None,
+                    "height": None,
+                    "fps": None,
+                },
+                {
+                    "format_id": "audio",
+                    "ext": "m4a",
+                    "vcodec": "none",
+                    "acodec": "mp4a.40.5",
+                    "abr": 128,
+                },
+            ],
+        }
+
+        inspection = queue._inspection_from_snapshot(
+            "https://www.instagram.com/reel/Dac5mHoN9x-/",
+            info,
+        )
+
+        self.assertEqual(inspection.fast_format_id, "unknown-mp4")
+
+    def test_instagram_explicit_h264_is_preferred_over_unknown_mp4(self):
+        formats = [
+            {
+                "format_id": "unknown-high",
+                "ext": "mp4",
+                "vcodec": "unknown",
+                "acodec": None,
+                "width": 1080,
+                "height": 1920,
+                "fps": 60,
+            },
+            {
+                "format_id": "h264",
+                "ext": "mp4",
+                "vcodec": "avc1.64002a",
+                "acodec": "aac",
+                "width": 720,
+                "height": 1280,
+                "fps": 30,
+            },
+        ]
+
+        self.assertEqual(
+            queue.select_fast_h264_format(formats, allow_unknown_mp4=True),
+            "h264",
+        )
+
+    def test_instagram_unknown_candidates_keep_fps_resolution_bitrate_order(self):
+        formats = [
+            {
+                "format_id": "unknown-low",
+                "ext": "mp4",
+                "vcodec": None,
+                "acodec": None,
+                "width": 720,
+                "height": 1280,
+                "fps": 30,
+                "tbr": 800,
+            },
+            {
+                "format_id": "unknown-high",
+                "ext": "mp4",
+                "vcodec": "unknown",
+                "acodec": None,
+                "width": 1080,
+                "height": 1920,
+                "fps": 60,
+                "tbr": 1200,
+            },
+        ]
+
+        self.assertEqual(
+            queue.select_fast_h264_format(formats, allow_unknown_mp4=True),
+            "unknown-high",
+        )
+
+    def test_unknown_mp4_fallback_is_not_enabled_for_tiktok(self):
+        formats = [
+            {
+                "format_id": "unknown-mp4",
+                "ext": "mp4",
+                "vcodec": None,
+                "acodec": "aac",
+            }
+        ]
+
+        self.assertIsNone(queue.select_fast_h264_format(formats))
+
+    def test_post_download_known_bad_codec_is_rejected_after_probe(self):
+        probe = queue.MediaProbe(
+            has_video=True,
+            has_audio=True,
+            video_codec="vp9",
+            audio_codec="aac",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "video.mp4"
+            path.write_bytes(b"video")
+            with patch.object(queue, "_probe_media", return_value=probe):
+                with self.assertRaises(queue.NoFastH264FormatError):
+                    queue._prepare_telegram_video(path)
+
     def test_require_fast_h264_format_rejects_snapshot_without_h264(self):
         inspection = queue.MediaInspection(
             identity=None,

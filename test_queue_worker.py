@@ -846,6 +846,95 @@ class DeliveryRoutingTests(unittest.IsolatedAsyncioTestCase):
                 result.discard.assert_not_awaited()
                 result.show_error.assert_not_awaited()
 
+    async def test_worker_cache_private_multipart_uses_ordered_album_batches(self):
+        job = self._job()
+        cached = queue.CachedVideo(
+            "h264-aac-v2:instagram:AbC_123",
+            "part-1",
+            "description",
+            "https://www.instagram.com/reel/AbC_123/",
+            7,
+            file_ids=tuple(f"part-{number}" for number in range(1, 17)),
+        )
+        bot = SimpleNamespace(
+            send_media_group=AsyncMock(return_value=[]),
+            send_video=AsyncMock(),
+        )
+
+        with (
+            patch.object(queue, "prepare_music_caption_link", AsyncMock()) as music,
+            patch.object(queue, "_finish_video_job", AsyncMock()) as finish,
+            patch.object(queue, "_remove_download_files"),
+        ):
+            delivered = await queue._try_deliver_worker_cache(
+                bot,
+                job,
+                cached,
+                chat_id=job.chat_id,
+                inline_message_id=None,
+                reply_to_message_id=321,
+                placeholder_message_id=None,
+                has_spoiler=False,
+                without_description=True,
+            )
+
+        self.assertTrue(delivered)
+        music.assert_not_awaited()
+        self.assertEqual(
+            [len(call.kwargs["media"]) for call in bot.send_media_group.await_args_list],
+            [10, 6],
+        )
+        self.assertEqual(
+            [media.media for call in bot.send_media_group.await_args_list for media in call.kwargs["media"]],
+            list(cached.file_ids),
+        )
+        self.assertEqual(bot.send_media_group.await_args_list[0].kwargs["reply_to_message_id"], 321)
+        self.assertIsNone(bot.send_media_group.await_args_list[1].kwargs["reply_to_message_id"])
+        bot.send_video.assert_not_awaited()
+        finish.assert_awaited_once_with(job.id, None)
+
+    async def test_worker_cache_inline_multipart_publishes_full_video_button(self):
+        job = self._job("inline-id")
+        cached = queue.CachedVideo(
+            "h264-aac-v2:instagram:AbC_123",
+            "part-1",
+            "description",
+            "https://www.instagram.com/reel/AbC_123/",
+            7,
+            file_ids=("part-1", "part-2"),
+        )
+        bot = SimpleNamespace(edit_message_media=AsyncMock())
+
+        with (
+            patch.object(queue, "prepare_music_caption_link", AsyncMock()) as music,
+            patch.object(
+                queue,
+                "create_video_share_link",
+                AsyncMock(return_value="https://t.me/download_bot?start=video_instagram_AbC_123"),
+            ),
+            patch.object(queue, "_finish_video_job", AsyncMock()) as finish,
+            patch.object(queue, "_remove_download_files"),
+        ):
+            delivered = await queue._try_deliver_worker_cache(
+                bot,
+                job,
+                cached,
+                chat_id=job.chat_id,
+                inline_message_id="inline-id",
+                reply_to_message_id=None,
+                placeholder_message_id=None,
+                has_spoiler=False,
+                without_description=False,
+            )
+
+        self.assertTrue(delivered)
+        music.assert_not_awaited()
+        media = bot.edit_message_media.await_args.kwargs["media"]
+        self.assertEqual(media.media, "part-1")
+        markup = bot.edit_message_media.await_args.kwargs["reply_markup"]
+        self.assertIn("video_instagram_AbC_123", markup.inline_keyboard[0][0].url)
+        finish.assert_awaited_once_with(job.id, None)
+
     async def test_inline_miss_uploads_to_storage_once_and_edits_by_file_id(self):
         result = await self._run_single_delivery("inline-message-id")
 
