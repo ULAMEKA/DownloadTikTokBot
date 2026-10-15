@@ -10,3 +10,4 @@ bot.log
 videos/
 assets/ad_placeholder.file_id
 *.cookies.txt
+.omc/
